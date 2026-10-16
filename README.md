@@ -1,5 +1,13 @@
 # PoppyKit server
 
+Designed to be integrated into an existing company's backend. The SDK implements
+Poppy protocol handling through adapters; the company owns its account system,
+authorization policy, persistence, agent runtime and business tools. No hosted
+PoppyKit service or particular model provider is required.
+
+The reference login service and OpenAI-powered agent belong in
+[poppykit-demo](https://github.com/LMol-4/poppykit-demo), not the core SDK.
+
 Company-side TypeScript SDK for authentication verification and agent conversations.
 
 Status: initial project scaffold. No SDK or CLI implementation is published yet.
