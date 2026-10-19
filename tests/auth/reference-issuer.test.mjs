@@ -125,6 +125,9 @@ test('session assertion defects, reuse and cross-role jti reuse are invalid_gran
   };
   for (const [name, assertion] of Object.entries(cases)) await assert.doesNotReject(async () => expectError(await env.send({ assertion }), 'invalid_grant'), name);
   expectError(await env.send({ assertion: undefined }), 'invalid_grant');
+  expectError(await env.send({ assertion: await env.assertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_grant');
+  expectError(await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_client');
+  assert.equal((await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'client-authentication+jwt' } }) })).status, 200);
   const sameJti = randomUUID();
   expectError(await env.send({ assertion: await env.assertion({ jti: sameJti }), client_assertion: await env.clientAssertion({ jti: sameJti }) }), 'invalid_grant');
   const assertion = await env.assertion(); const clientJti = randomUUID();
@@ -134,7 +137,7 @@ test('session assertion defects, reuse and cross-role jti reuse are invalid_gran
   const reusedClient = await env.clientAssertion();
   assert.equal((await env.send({ client_assertion: reusedClient })).status, 200);
   expectError(await env.send({ client_assertion: reusedClient }), 'invalid_grant');
-  assert.equal(Object.keys(env.store.state.sessions).length, 2);
+  assert.equal(Object.keys(env.store.state.sessions).length, 3);
 });
 
 test('replay retention survives a restart and expires with the assertion', async () => {

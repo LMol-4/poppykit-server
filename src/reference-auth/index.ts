@@ -97,7 +97,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   }
 
   async function verifyAssertion(jwt: string, keys: JSONWebKeySet): Promise<AssertionClaims> {
-    const { payload } = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ASSERTION_ALGORITHMS });
+    const { payload, protectedHeader } = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ASSERTION_ALGORITHMS });
+    if (protectedHeader.typ === 'poppy-browser+jwt') throw new TypeError('browser assertion'); // spec 5: not accepted here
     return parseAssertionClaims(JSON.parse(new TextDecoder().decode(payload)));
   }
   const current = (claims: AssertionClaims) => claims.exp * 1000 > now() && claims.iat <= now() / 1000 + CLOCK_SKEW_SECONDS;
