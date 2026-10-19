@@ -83,7 +83,9 @@ function remember<V>(map: Map<string, V>, key: string, value: V, max: number, ex
   for (const [k, v] of map) if (expired(v)) map.delete(k);
   for (const k of map.keys()) { if (map.size <= max) break; map.delete(k); }
 }
-// Defaults: 1000 entries per map; at most 16 cold fetches in flight and 120 started per 60 s (excess is rejected, not queued).
+// Defaults: 1000 entries per map; at most 16 cold fetch operations in flight and 120 started per 60 s (excess is rejected, not queued).
+// Invariant: maxFetchesPerMinute * 5 (300 s TTL cap) must stay below maxEntries, or a flood can evict live authDocuments/refreshes entries.
+// shortcut: limits are global per resolver, not per caller, and cap total cold-fetch throughput; move per-caller limiting to the server HTTP layer before production use.
 export function createMetadataResolver(transport: HttpTransport, options: { now?: () => number; maxEntries?: number; maxConcurrentFetches?: number; maxFetchesPerMinute?: number } = {}): MetadataResolver {
   const now = options.now ?? Date.now; const maxEntries = options.maxEntries ?? 1000;
   const maxConcurrent = options.maxConcurrentFetches ?? 16; const maxPerMinute = options.maxFetchesPerMinute ?? 120;
@@ -99,7 +101,7 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
     if (!task) {
       while (starts.length && now() - starts[0] >= 60000) starts.shift();
       if (pending.size >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
-      starts.push(now());
+      starts.push(now()); if (refresh) remember(refreshes, target, now(), maxEntries, at => now() - at >= 60000);
       task = (async () => {
         const response = await transport.fetch(new Request(target), { mode });
         if (response.status !== 200) throw new ValidationError('metadata.status');
@@ -140,7 +142,7 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
           for (const secret of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) if (secret in item) throw new ValidationError('jwk.private');
         }
       };
-      if (settings.refresh) { const last = refreshes.get(uri); if (last !== undefined && now() - last < 60000) throw new ValidationError('jwks.refresh_limited'); remember(refreshes, uri, now(), maxEntries, at => now() - at >= 60000); }
+      if (settings.refresh) { const last = refreshes.get(uri); if (last !== undefined && now() - last < 60000) throw new ValidationError('jwks.refresh_limited'); }
       const found = await get(uri, validate, 'discovery', settings.refresh); return found.value as JsonObject;
     }
   };
