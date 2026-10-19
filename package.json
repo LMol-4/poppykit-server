@@ -30,6 +30,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./reference-auth": {
+      "types": "./dist/reference-auth/index.d.ts",
+      "import": "./dist/reference-auth/index.js"
     }
   },
   "dependencies": {
