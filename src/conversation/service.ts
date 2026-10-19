@@ -390,6 +390,8 @@ export function createConversationService(options: ConversationOptions): Convers
     for (;;) {
       const stored = own((await store.read()).conversations, conversationId);
       if (!stored) throw new PublicationError('stale_work');
+      // Conversations stored before staff support have none until the customer's next accepted message.
+      if (stored.authority === undefined) throw new Error('Conversation has no stored customer authority');
       // Leaving the queue or handing back uses no account, so it stays possible after revocation.
       const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {

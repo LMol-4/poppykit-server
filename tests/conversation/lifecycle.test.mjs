@@ -257,6 +257,19 @@ test('staff operations: operator authorization is mandatory and stored customer 
   assert.equal((await t.read(queued)).body.events.at(-1).status, 'closed', 'no-staff after close is a no-op');
 });
 
+test('staff operations on a conversation stored without an authority fail clearly until the next message', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  t.store.set(state => { delete state.conversations[id].authority; });
+  for (const action of [() => t.service.joinHuman(operator, id), () => t.service.noHumanAvailable(operator, id, 'Nobody.'), () => t.service.returnToAgent(operator, id)]) {
+    await assert.rejects(action(), { message: 'Conversation has no stored customer authority' });
+  }
+  assert.equal(t.calls.filter(call => call.kind === 'accepted').length, 0, 'policy never sees an undefined authority');
+  await t.send(id, { id: 'msg_2', sender: 'agent', text: 'Still there?' });
+  assert.equal((await t.service.joinHuman(operator, id)).conversationId, id);
+});
+
 test('company handoff and close through a work reference', async () => {
   const t = setup();
   const id = (await t.start(hello)).body.conversation_id;
