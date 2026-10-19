@@ -158,7 +158,7 @@ export function createConversationService(options: ConversationOptions): Convers
   }
   function requestHandoff(draft: ConversationStoreState, conversation: ConversationRecord): void {
     if (conversation.status === 'queued' || conversation.responder === 'human') return;
-    // The handed-off request is for a person now, so automation drops it rather than retrying it.
+    // Deliberately cancels the whole pre-handoff backlog: the user asked for a person (7.9), so automation drops it rather than retrying it.
     fence(draft, conversation.id, 'cancelled');
     setState(conversation, 'queued');
   }
