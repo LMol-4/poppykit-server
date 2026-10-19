@@ -148,7 +148,7 @@ test('replay retention survives a restart and expires with the assertion', async
   const env = await setup(); await env.challenge();
   const assertion = await env.assertion();
   assert.equal((await env.send({ assertion })).status, 200);
-  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], metadata: env.metadata, store: env.store, now: () => env.clock.now });
+  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
   env.issuer = restarted;
   expectError(await env.send({ assertion }), 'invalid_grant');
   env.clock.now += 61_000; env.nonce = undefined; await env.challenge();
@@ -209,7 +209,7 @@ test('session, scope, resource and request shape checks', async () => {
   expectError(await env.send({ session_id: '__proto__' }), 'invalid_session');
   expectError(await env.send({ scope: 'poppy:read' }), 'invalid_scope');
   expectError(await env.send({ resource: 'https://api.shop.test/other' }), 'invalid_target');
-  expectError(await env.send({ grant_type: 'refresh_token' }), 'unsupported_grant_type');
+  expectError(await env.send({ grant_type: 'password' }), 'unsupported_grant_type');
   expectError(await env.send({ grant_type: undefined }), 'invalid_request');
   const duplicated = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', dpop: await env.proof() }, body: 'grant_type=a&grant_type=b' }));
   assert.equal(duplicated.status, 400); assert.deepEqual(await duplicated.json(), { error: 'invalid_request' });
