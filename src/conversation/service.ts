@@ -187,8 +187,9 @@ export function createConversationService(options: ConversationOptions): Convers
       if (conversationId !== undefined) owned(draft, principal, conversationId);
       const existing = own(draft.messages, key);
       if (existing) {
-        if (existing.fingerprint !== fingerprint) throw new HttpError(409, { error: 'message_id_conflict' });
+        // Ownership first, so a foreign account learns nothing from a conflict.
         owned(draft, principal, existing.conversationId);
+        if (existing.fingerprint !== fingerprint) throw new HttpError(409, { error: 'message_id_conflict' });
         return existing.receipt;
       }
       let conversation: ConversationRecord;

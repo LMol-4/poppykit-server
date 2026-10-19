@@ -178,6 +178,8 @@ test('account-bound conversation: same account reads with poppy:read, signed-out
   assert.equal(signedOut.status, 403);
   assert.deepEqual(signedOut.body, { error: 'sign_in_required' });
   assert.equal((await t.read(body.conversation_id, { as: 'aliceOtherAccount' })).status, 404);
+  // Changed reuse of the first message ID by another account is 404, not a revealing 409.
+  assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'aliceOtherAccount' })).status, 404);
   // Retrying the original first message on a now-bound conversation is checked against current ownership too.
   assert.equal((await t.start(hello)).status, 403);
 });
