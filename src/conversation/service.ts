@@ -153,17 +153,17 @@ export function createConversationService(options: ConversationOptions): Convers
     return conversation;
   }
 
-  // Runs change under withCurrent; target() names the conversation whose binding decides the scopes.
-  async function current<T>(principal: Principal, target: (state: ConversationStoreState) => string | undefined, history: boolean,
+  // Runs change under withCurrent; target() and history() decide the scopes from the state being checked.
+  async function current<T>(principal: Principal, target: (state: ConversationStoreState) => string | undefined, history: (state: ConversationStoreState) => boolean,
     change: (draft: ConversationStoreState) => T): Promise<T> {
     for (;;) {
       const before = await store.read();
       const id = target(before);
-      const scopes = scopesFor(before, principal, id === undefined ? undefined : own(before.conversations, id), history);
+      const scopes = scopesFor(before, principal, id === undefined ? undefined : own(before.conversations, id), history(before));
       const result = await policy.withCurrent(principal, scopes, () => store.transaction(draft => {
         const now = target(draft);
         // Binding only ever gains an account, so a rerun with the wider scopes settles it.
-        if (scopesFor(draft, principal, now === undefined ? undefined : own(draft.conversations, now), history).length > scopes.length) return { rescope: true } as const;
+        if (scopesFor(draft, principal, now === undefined ? undefined : own(draft.conversations, now), history(draft)).length > scopes.length) return { rescope: true } as const;
         return { value: change(draft) };
       }));
       if (!('rescope' in result)) return result.value;
@@ -180,8 +180,10 @@ export function createConversationService(options: ConversationOptions): Convers
     const fingerprint = canonical({ target: conversationId ?? null, request: body });
     const authority = JSON.parse(JSON.stringify({ principal, acceptedAt: clock.now(), revocationPolicy })) as AcceptedAuthority;
     const target = (state: ConversationStoreState) => conversationId ?? own(state.messages, key)?.conversationId;
+    // A retry returns the saved receipt, which is a history page if the original request waited.
+    const history = (state: ConversationStoreState) => waiting || 'events' in (own(state.messages, key)?.receipt.body ?? {});
 
-    const receipt = await current(principal, target, waiting, draft => {
+    const receipt = await current(principal, target, history, draft => {
       if (conversationId !== undefined) owned(draft, principal, conversationId);
       const existing = own(draft.messages, key);
       if (existing) {
@@ -220,7 +222,7 @@ export function createConversationService(options: ConversationOptions): Convers
   async function events(principal: Principal, url: URL, conversationId: string): Promise<Response> {
     const read = parseReadOptions(url, maxWaitSeconds);
     // shortcut: GET returns at once instead of holding for wait; J15 adds capped long polls.
-    const body = await current(principal, () => conversationId, true, draft => page(owned(draft, principal, conversationId), read.cursor));
+    const body = await current(principal, () => conversationId, () => true, draft => page(owned(draft, principal, conversationId), read.cursor));
     return json(200, body);
   }
 

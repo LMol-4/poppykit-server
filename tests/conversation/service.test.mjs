@@ -7,6 +7,7 @@ const base = { issuer: 'https://auth.example.test', clientId: 'https://agent.exa
 const principals = {
   alice: { ...base, userId: 'u_alice' },
   aliceSignedIn: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
+  aliceNoScopes: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['poppy:read'] },
   bob: { ...base, userId: 'u_bob' },
   otherClient: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice' },
@@ -259,6 +260,20 @@ test('POST with wait returns a page receipt that a retry repeats unchanged', asy
   await t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'Shipped yesterday.' });
   const retry = await t.start(hello, { query: '?wait=5' });
   assert.deepEqual([retry.status, retry.body], [res.status, res.body]);
+});
+
+test('retry without wait of a waited POST still needs poppy:read on an account-bound conversation', async () => {
+  const t = setup();
+  const waited = await t.start(hello, { query: '?wait=0' });
+  const plain = await t.send(waited.body.conversation_id, { id: 'msg_2', sender: 'agent', text: 'more' });
+  t.store.set(state => { state.bindings[waited.body.conversation_id].accountId = 'acct_1'; });
+  const denied = await t.start(hello, { as: 'aliceNoScopes' });
+  assert.deepEqual([denied.status, denied.body], [403, { error: 'insufficient_scope' }]);
+  const allowed = await t.start(hello, { as: 'aliceSignedIn' });
+  assert.deepEqual([allowed.status, allowed.body], [201, waited.body]);
+  // A three-field receipt holds no history, so no read scope is needed.
+  const ack = await t.send(waited.body.conversation_id, { id: 'msg_2', sender: 'agent', text: 'more' }, { as: 'aliceNoScopes' });
+  assert.deepEqual([ack.status, ack.body], [plain.status, plain.body]);
 });
 
 test('routing: wrong origin, path, method and missing auth', async () => {
