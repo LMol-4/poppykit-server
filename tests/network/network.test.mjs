@@ -251,9 +251,12 @@ test('cold-fetch slot is released after a failed fetch', async () => {
   await assert.rejects(slow.resolveClient('https://c.example/id'), /metadata.status/);
 });
 test('rate-limited refresh does not burn the refresh slot', async () => {
-  const clock = { t: 0 }; const resolver = createMetadataResolver({ async fetch() { return Response.json({ keys: [] }); } }, { now: () => clock.t, maxFetchesPerMinute: 1 });
-  await resolver.resolveJwks('https://x.example/k'); await assert.rejects(resolver.resolveJwks('https://y.example/k', { refresh: true }), /rate_limited/);
-  clock.t = 60000; await resolver.resolveJwks('https://y.example/k', { refresh: true });
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const resolver = createMetadataResolver({ async fetch() { await gate; return Response.json({ keys: [] }); } }, { now: () => 0, maxConcurrentFetches: 1 });
+  const x = resolver.resolveJwks('https://x.example/k');
+  await assert.rejects(resolver.resolveJwks('https://y.example/k', { refresh: true }), /metadata.rate_limited/);
+  release(); await x;
+  await resolver.resolveJwks('https://y.example/k', { refresh: true }); // same clock time: only a burned slot would block this
 });
 test('authDocuments inner and outer maps are bounded; live entries still conflict', async () => {
   const issuers = { 'a1.example': 'i1', 'a2.example': 'i2', 'a3.example': 'i3', 'a4.example': 'i1', 'b1.example': 'j', 'b2.example': 'j', 'b3.example': 'j', 'b4.example': 'j' };
