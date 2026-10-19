@@ -158,7 +158,8 @@ export function createConversationService(options: ConversationOptions): Convers
   }
   function requestHandoff(draft: ConversationStoreState, conversation: ConversationRecord): void {
     if (conversation.status === 'queued' || conversation.responder === 'human') return;
-    fence(draft, conversation.id, 'pending');
+    // The handed-off request is for a person now, so automation drops it rather than retrying it.
+    fence(draft, conversation.id, 'cancelled');
     setState(conversation, 'queued');
   }
   // Closing a parent closes its open Direct Conversation first; closing a child reopens its parent for messages.
@@ -287,8 +288,8 @@ export function createConversationService(options: ConversationOptions): Convers
       const message = body.message;
       if (message.context) conversation.context = { ...conversation.context, ...message.context };
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
-      // A context-only message asks nothing; while a person responds they read new messages themselves.
-      if (('text' in message || 'data' in message) && conversation.responder === 'agent') {
+      // A context-only message asks nothing; while queued for or answered by a person, messages are for that person.
+      if (('text' in message || 'data' in message) && conversation.responder === 'agent' && conversation.status !== 'queued') {
         draft.work.push({ id: randomId('wrk_'), conversationId: conversation.id, message, authority, phase: 'pending', outputs: {} });
         if (conversation.status === 'idle') setState(conversation, 'working');
       }

@@ -125,7 +125,7 @@ test('handoff and close routes check ownership like every other route', async ()
   assert.equal((await t.close(id, { as: 'carolSameAccount' })).status, 200);
 });
 
-test('handoff queues, fences the agent, keeps accepting messages; a repeat changes nothing; no staff returns to the agent', async () => {
+test('handoff queues and cancels the agent attempt; a repeat changes nothing; no staff returns to idle without retrying it', async () => {
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;
   const claim = await t.service.claim();
@@ -135,18 +135,17 @@ test('handoff queues, fences the agent, keeps accepting messages; a repeat chang
   const events = (await t.read(id)).body.events.length;
   assert.deepEqual((await t.handoff(id)).body, res.body);
   assert.equal((await t.read(id)).body.events.length, events);
-  assert.deepEqual((await t.send(id, { id: 'msg_2', sender: 'agent', text: 'More detail for the person.' })).body.status, 'queued');
   assert.equal(await t.service.claim(), null, 'no automated claims while queued');
   await t.service.noHumanAvailable(operator, id, 'Nobody is available right now.');
   await t.service.noHumanAvailable(operator, id, 'Nobody is available right now.');
   const page = (await t.read(id)).body;
-  assert.deepEqual([page.status, page.responder], ['working', 'agent']);
+  assert.deepEqual([page.status, page.responder], ['idle', 'agent']);
   const tail = page.events.slice(-2);
   assert.deepEqual([tail[0].message.text, tail[0].message.sender, tail[0].message.role], ['Nobody is available right now.', 'agent', 'company']);
-  assert.deepEqual([tail[1].type, tail[1].status], ['state', 'working']);
+  assert.deepEqual([tail[1].type, tail[1].status, tail[1].responder], ['state', 'idle', 'agent']);
   assert.equal(page.events.filter(event => event.message?.text === 'Nobody is available right now.').length, 1, 'idempotent');
-  const next = await t.service.claim();
-  assert.equal(next.workId, claim.workId, 'the fenced attempt is retried by automation');
+  assert.equal(await t.service.claim(), null, 'the handed-off message is not retried by automation');
+  assert.equal((await t.store.read()).work[0].phase, 'cancelled');
 });
 
 test('a person joins, publishes as human, then returns the conversation to the agent', async () => {
