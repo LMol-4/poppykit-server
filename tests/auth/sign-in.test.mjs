@@ -209,7 +209,6 @@ test('refresh rotates the Account Token under a stable lineage without extending
   assert.deepEqual([rotated.body.scope, rotated.body.signed_in, rotated.body.refresh_token_expires_in], ['poppy:read', true, 2_592_000 - 43_200]);
   assert.deepEqual(Object.keys(env.store.state.grants), [grantId]);
   assert.equal((await env.introspect(rotated.body.access_token)).principal.grantId, grantId);
-  expectError(await env.refresh(signedIn.body.refresh_token, { session_id: session.session_id }), 'invalid_grant');
 
   // Without session_id a new signed-in Session starts; resources are chosen per request, not fixed by the grant.
   const fresh = await env.refresh(rotated.body.refresh_token, { resource: RESOURCE });
@@ -227,14 +226,20 @@ test('refresh rotates the Account Token under a stable lineage without extending
   expectError(await env.refresh(general.body.refresh_token, { client_id: OTHER_CLIENT, client_assertion: await env.clientAssertion({ iss: OTHER_CLIENT, sub: OTHER_CLIENT }) }), 'invalid_grant');
   expectError(await env.refresh(undefined), 'invalid_request');
 
-  // Concurrent use of one Account Token: exactly one successor.
+  // Concurrent use of one Account Token: exactly one successor, and the loser's reuse revokes the lineage.
   const results = await Promise.all([env.refresh(general.body.refresh_token), env.refresh(general.body.refresh_token)]);
   assert.deepEqual(results.map(result => result.status).sort(), [200, 400]);
+  const winner = results.find(result => result.status === 200).body;
+  expectError(await env.refresh(winner.refresh_token), 'invalid_grant');
+  await assert.rejects(env.introspect(winner.access_token), { code: 'invalid_token' });
 
-  // The lineage ends at its original expiry however often it rotates.
-  const latest = results.find(result => result.status === 200).body.refresh_token;
-  env.clock.now = NOW + 30 * DAY;
-  expectError(await env.refresh(latest), 'invalid_grant');
+  // A lineage ends at its original expiry however often it rotates.
+  const later = await env.signIn((await env.session()).session_id);
+  env.clock.now += 29 * DAY;
+  const step = await env.refresh(later.body.refresh_token);
+  assert.equal(step.body.refresh_token_expires_in, 86_400);
+  env.clock.now += DAY;
+  expectError(await env.refresh(step.body.refresh_token), 'invalid_grant');
 });
 
 test('revocation signs out the lineage; a rotated token revokes it too; unknown and foreign tokens change nothing', async () => {
@@ -363,4 +368,22 @@ test('issuer state of another version is refused, not misread', async () => {
   await assert.rejects(env.introspect(session.access_token), /unsupported issuer state version/);
   await assert.rejects(env.issuer.disconnect(CLIENT, 'acct_1'), /unsupported issuer state version/);
   await assert.rejects(env.issuer.beginAuthorization(authorizeRequest(), BINDING), /unsupported issuer state version/);
+});
+
+test('retrying the previous Account Token after a lost rotation response signs the Session out', async () => {
+  const env = await signInSetup();
+  const session = await env.session();
+  const t1 = (await env.signIn(session.session_id)).body.refresh_token;
+  const lost = await env.refresh(t1, { session_id: session.session_id }); // the response never reaches the client
+  assert.equal(lost.status, 200);
+  expectError(await env.refresh(t1, { session_id: session.session_id }), 'invalid_grant');
+  const renewed = await env.send({ session_id: session.session_id });
+  assert.equal(renewed.status, 200); assert.equal(renewed.body.signed_in, false);
+  expectError(await env.refresh(lost.body.refresh_token), 'invalid_grant');
+  await assert.rejects(env.introspect(lost.body.access_token), { code: 'invalid_token' });
+  // Another client presenting the token changes nothing.
+  const t3 = (await env.signIn((await env.session()).session_id)).body.refresh_token;
+  const t4 = (await env.refresh(t3)).body.refresh_token;
+  expectError(await env.refresh(t3, { client_id: OTHER_CLIENT, client_assertion: await env.clientAssertion({ iss: OTHER_CLIENT, sub: OTHER_CLIENT }) }), 'invalid_grant');
+  assert.equal((await env.refresh(t4)).status, 200);
 });

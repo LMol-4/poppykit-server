@@ -321,11 +321,14 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const presented = tokenHash(refreshToken!);
       const grantId = own(draft.refreshTokens, presented);
       const lineage = grantId === undefined ? undefined : own(draft.grants, grantId);
+      // Reuse of the previous Account Token (e.g. a retry after a lost response) revokes the lineage, so its Sessions
+      // continue signed out instead of staying bound to a successor nobody holds (RFC 9700 4.14.2).
+      if (lineage && lineage.clientId === clientId && presented === lineage.previousHash) { revokeGrant(draft, grantId!); return null; }
       // A rotated Account Token never issues another successor.
       if (!lineage || !grantLive(lineage, at) || lineage.clientId !== clientId || lineage.refreshHash !== presented) throw new TokenError('invalid_grant');
       return sessionId === undefined ? signIn(...create(lineage.userId), grantId!) : signIn(sessionId, existing(lineage.userId), grantId!);
     });
-    // A reused code revoked its lineage in the commit above.
+    // A reused code or previous Account Token revoked its lineage in the commit above.
     if (body === null) throw new TokenError('invalid_grant');
     return json(200, body);
   }
