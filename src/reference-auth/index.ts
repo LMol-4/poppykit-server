@@ -61,6 +61,21 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...headers } });
 }
 
+// Unauthenticated public endpoint: stop reading once the byte limit is passed.
+async function readForm(request: Request): Promise<string> {
+  if (Number(request.headers.get('content-length') ?? 0) > MAX_FORM_BYTES) throw new TokenError('invalid_request');
+  if (!request.body) return '';
+  const reader = request.body.getReader(); const chunks: Uint8Array[] = []; let length = 0;
+  try {
+    while (true) {
+      const item = await reader.read(); if (item.done) break;
+      length += item.value.length; if (length > MAX_FORM_BYTES) throw new TokenError('invalid_request');
+      chunks.push(item.value);
+    }
+  } finally { await reader.cancel().catch(() => {}); }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 export function createReferenceIssuer(options: ReferenceIssuerOptions): ReferenceIssuer {
   const { issuer, metadata, store, now } = options;
   if (secureUrl(issuer).search) throw new TypeError('issuer');
@@ -89,9 +104,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
 
   async function issue(request: Request): Promise<Response> {
     if (request.method !== 'POST' || !/^application\/x-www-form-urlencoded\s*(;|$)/i.test(request.headers.get('content-type') ?? '')) throw new TokenError('invalid_request');
-    // shortcut: body is read before the size check, so the host must also cap request bodies.
-    const body = await request.text();
-    if (body.length > MAX_FORM_BYTES) throw new TokenError('invalid_request');
+    const body = await readForm(request);
     const params = new Map<string, string>();
     for (const [key, value] of new URLSearchParams(body)) { if (params.has(key)) throw new TokenError('invalid_request'); params.set(key, value); }
     const grantType = params.get('grant_type');

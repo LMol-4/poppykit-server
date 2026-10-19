@@ -209,6 +209,15 @@ test('session, scope, resource and request shape checks', async () => {
   const json = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
   assert.equal(json.status, 400);
 
+  const declared = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '65537' }, body: 'grant_type=x' }));
+  assert.equal(declared.status, 400); assert.deepEqual(await declared.json(), { error: 'invalid_request' });
+  let pulled = 0; // endless stream: the reader must stop on its own once the limit is passed
+  const endless = new ReadableStream({ pull(controller) { pulled++; controller.enqueue(new Uint8Array(16384).fill(97)); } });
+  const streamed = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: endless, duplex: 'half' }));
+  assert.equal(streamed.status, 400); assert.deepEqual(await streamed.json(), { error: 'invalid_request' }); assert.ok(pulled <= 6);
+  const multibyte = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'é'.repeat(40000) }));
+  assert.equal(multibyte.status, 400, 'limit counts bytes, not UTF-16 units');
+
   const scoped = await env.send({ resource: RESOURCE });
   assert.equal(scoped.status, 200);
   const authority = env.issuer.authority;
