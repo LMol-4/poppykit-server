@@ -31,6 +31,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./adapter-contract": {
+      "types": "./dist/adapter-contract.d.ts",
+      "import": "./dist/adapter-contract.js"
+    },
     "./reference-auth": {
       "types": "./dist/reference-auth/index.d.ts",
       "import": "./dist/reference-auth/index.js"

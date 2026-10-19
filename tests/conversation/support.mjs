@@ -16,7 +16,7 @@ export function memoryStore(initial) {
         const result = change(draft);
         if (result && typeof result.then === 'function') throw new Error('async transaction callback');
         assert.deepStrictEqual(JSON.parse(JSON.stringify(draft)), draft, 'state must be strict JSON');
-        state = draft; store.transactions++;
+        state = structuredClone(draft); store.transactions++;
         return result === undefined ? undefined : structuredClone(result);
       });
       queue = run.catch(() => {});
