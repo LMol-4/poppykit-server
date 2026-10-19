@@ -291,6 +291,19 @@ test('routing: wrong origin, path, method and missing auth', async () => {
   assert.doesNotMatch(await anon.text(), /tok_abc/);
 });
 
+test('only 4xx/5xx coded errors become responses; others are re-thrown', async () => {
+  const t = setup();
+  for (const status of [200, 302, 600, 401.5]) {
+    t.policy.deny = Object.assign(new Error('odd'), { code: 'x', status, headers: new Headers() });
+    await assert.rejects(t.start(hello), { message: 'odd' });
+  }
+  t.policy.deny = new Error('boom');
+  await assert.rejects(t.start(hello), { message: 'boom' });
+  t.policy.deny = Object.assign(new Error('limited'), { code: 'rate_limited', status: 429, headers: new Headers({ 'Retry-After': '5' }) });
+  const limited = await t.start(hello);
+  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '5']);
+});
+
 test('construction rejects invalid options', () => {
   const store = memoryStore(initialConversationState());
   const base = { endpoint, store, authenticator: {}, policy: {}, clock: { now: () => 0 } };

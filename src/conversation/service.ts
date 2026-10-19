@@ -51,6 +51,7 @@ export interface ConversationOptions {
 export interface WorkRef { workId: string; fence: string }
 export interface WorkClaim extends WorkRef { conversationId: string; message: Message; context: JsonObject }
 export interface ConversationService {
+  /** Protocol errors become responses; anything else is re-thrown, so hosts must catch it and answer 500. */
   handle(request: Request): Promise<Response>;
   claim(): Promise<WorkClaim | null>;
   renew(work: WorkRef): Promise<void>;
@@ -261,8 +262,10 @@ export function createConversationService(options: ConversationOptions): Convers
         if (error instanceof ValidationError) return json(400, { error: 'invalid_request' });
         const auth = error as { code?: unknown; status?: unknown; headers?: unknown };
         // AuthorityError from the authenticator or policy: status/code/headers only, never the raw message.
-        if (error instanceof Error && typeof auth.code === 'string' && typeof auth.status === 'number') {
-          return json(auth.status, { error: auth.code }, auth.headers instanceof Headers ? auth.headers : {});
+        // shortcut: structural match until J04 merges; then narrow to instanceof AuthorityError.
+        const status = typeof auth.status === 'number' && Number.isInteger(auth.status) ? auth.status : 0;
+        if (error instanceof Error && typeof auth.code === 'string' && status >= 400 && status <= 599) {
+          return json(status, { error: auth.code }, auth.headers instanceof Headers ? auth.headers : {});
         }
         throw error;
       }
