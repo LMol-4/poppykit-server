@@ -2,19 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { ValidationError, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
-
-// shortcut: structural copies of the server-auth-interface types; import them from src/auth once J04 merges.
-interface Principal {
-  issuer: string; clientId: string; userId: string; sessionId: string;
-  accountId?: string; grantId?: string; scopes: string[]; tokenExpiresAt: number; sessionVersion: number;
-}
-type WorkRevocationPolicy = 'stop-account-work' | 'allow-accepted-work-to-finish';
-interface AcceptedAuthority { principal: Principal; acceptedAt: number; revocationPolicy: WorkRevocationPolicy }
-interface AuthorityPolicy {
-  withCurrent<T>(principal: Principal, scopes: readonly string[], action: () => Promise<T>): Promise<T>;
-  withAccepted<T>(authority: AcceptedAuthority, scopes: readonly string[], action: () => Promise<T>): Promise<T>;
-}
-interface RequestAuthenticator { authenticate(request: Request): Promise<Principal> }
+import { AuthorityError } from '../auth/authority.js';
+import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
 
 interface StateStore<State> {
   read(): Promise<State>;
@@ -260,13 +249,8 @@ export function createConversationService(options: ConversationOptions): Convers
       } catch (error) {
         if (error instanceof HttpError) return json(error.status, error.body, error.headers);
         if (error instanceof ValidationError) return json(400, { error: 'invalid_request' });
-        const auth = error as { code?: unknown; status?: unknown; headers?: unknown };
-        // AuthorityError from the authenticator or policy: status/code/headers only, never the raw message.
-        // shortcut: structural match until J04 merges; then narrow to instanceof AuthorityError.
-        const status = typeof auth.status === 'number' && Number.isInteger(auth.status) ? auth.status : 0;
-        if (error instanceof Error && typeof auth.code === 'string' && status >= 400 && status <= 599) {
-          return json(status, { error: auth.code }, auth.headers instanceof Headers ? auth.headers : {});
-        }
+        // Status/code/headers only, never the raw message.
+        if (error instanceof AuthorityError) return json(error.status, { error: error.code }, error.headers);
         throw error;
       }
     },

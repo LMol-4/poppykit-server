@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createConversationService, initialConversationState, PublicationError } from '../../dist/index.js';
+import { AuthorityError, createConversationService, initialConversationState, PublicationError } from '../../dist/index.js';
 
 const endpoint = 'https://api.example.test/poppy/conversations';
 const base = { issuer: 'https://auth.example.test', clientId: 'https://agent.example.test/client', sessionId: 's1', scopes: [], tokenExpiresAt: 9e12, sessionVersion: 1 };
@@ -45,7 +45,7 @@ function setup(options = {}) {
   const authenticator = {
     async authenticate(request) {
       const token = /^DPoP (\w+)$/.exec(request.headers.get('authorization') ?? '')?.[1];
-      if (!token || !principals[token]) throw Object.assign(new Error('secret detail tok_abc'), { code: 'invalid_token', status: 401, headers: new Headers({ 'WWW-Authenticate': 'DPoP error="invalid_token"' }) });
+      if (!token || !principals[token]) throw new AuthorityError('invalid_token');
       return principals[token];
     },
   };
@@ -54,7 +54,7 @@ function setup(options = {}) {
     async withCurrent(principal, scopes, action) {
       calls.push({ kind: 'current', userId: principal.userId, scopes: [...scopes] });
       if (policy.deny) throw policy.deny;
-      if (!scopes.every(scope => principal.scopes.includes(scope))) throw Object.assign(new Error('scope'), { code: 'insufficient_scope', status: 403, headers: new Headers() });
+      if (!scopes.every(scope => principal.scopes.includes(scope))) throw new AuthorityError('insufficient_scope', { scope: scopes.join(' ') });
       return action();
     },
     async withAccepted(authority, scopes, action) {
@@ -149,8 +149,8 @@ test('retry reauthenticates and is denied when current policy denies', async () 
   const unauthenticated = await t.start(hello, { as: 'nobody' });
   assert.equal(unauthenticated.status, 401);
   assert.deepEqual(unauthenticated.body, { error: 'invalid_token' });
-  assert.equal(unauthenticated.headers.get('www-authenticate'), 'DPoP error="invalid_token"');
-  t.policy.deny = Object.assign(new Error('revoked'), { code: 'invalid_token', status: 401, headers: new Headers() });
+  assert.equal(unauthenticated.headers.get('www-authenticate'), 'DPoP error="invalid_token", algs="ES256"');
+  t.policy.deny = new AuthorityError('invalid_token');
   const denied = await t.start(hello);
   assert.equal(denied.status, 401);
 });
@@ -291,17 +291,18 @@ test('routing: wrong origin, path, method and missing auth', async () => {
   assert.doesNotMatch(await anon.text(), /tok_abc/);
 });
 
-test('only 4xx/5xx coded errors become responses; others are re-thrown', async () => {
+test('only AuthorityError becomes an auth response; other errors are re-thrown', async () => {
   const t = setup();
-  for (const status of [200, 302, 600, 401.5]) {
-    t.policy.deny = Object.assign(new Error('odd'), { code: 'x', status, headers: new Headers() });
-    await assert.rejects(t.start(hello), { message: 'odd' });
-  }
+  // Look-alike coded errors are not trusted to choose a status or headers.
+  t.policy.deny = Object.assign(new Error('limited'), { code: 'rate_limited', status: 429, headers: new Headers({ 'Retry-After': '5' }) });
+  await assert.rejects(t.start(hello), { message: 'limited' });
   t.policy.deny = new Error('boom');
   await assert.rejects(t.start(hello), { message: 'boom' });
-  t.policy.deny = Object.assign(new Error('limited'), { code: 'rate_limited', status: 429, headers: new Headers({ 'Retry-After': '5' }) });
-  const limited = await t.start(hello);
-  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '5']);
+  t.policy.deny = new AuthorityError('insufficient_scope', { scope: 'poppy:read' });
+  const denied = await t.start(hello);
+  assert.deepEqual([denied.status, denied.body], [403, { error: 'insufficient_scope' }]);
+  assert.equal(denied.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="poppy:read", algs="ES256"');
+  assert.equal((await t.store.read()).work.length, 0);
 });
 
 test('construction rejects invalid options', () => {
@@ -366,8 +367,8 @@ test('withAccepted denial blocks publication and leaves state unchanged', async 
   const t = setup();
   const { body } = await t.start(hello);
   const claim = await t.service.claim();
-  t.policy.deny = Object.assign(new Error('revoked'), { code: 'invalid_token', status: 401, headers: new Headers() });
-  await assert.rejects(t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'x' }), { message: 'revoked' });
+  t.policy.deny = new AuthorityError('invalid_token');
+  await assert.rejects(t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'x' }), AuthorityError);
   t.policy.deny = null;
   assert.equal((await t.store.read()).conversations[body.conversation_id].events.length, 2);
 });
