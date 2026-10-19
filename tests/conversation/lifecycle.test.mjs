@@ -322,8 +322,9 @@ test('long poll: holds until an event arrives, then delivers it', async () => {
   const id = (await t.start(hello)).body.conversation_id;
   const cursor = (await t.read(id)).body.cursor;
   const claim = await t.service.claim();
+  const holding = t.store.untilReads(t.store.reads + 2); // initial authorized read, then the hold's first poll
   const held = t.read(id, { query: `?cursor=${cursor}&wait=30` });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await holding;
   await t.service.reply(claim, 'out_1', reply('msg_r'));
   const res = await held;
   assert.equal(res.status, 200);
@@ -335,10 +336,11 @@ test('long poll: times out with an empty page at the capped deadline, and return
   const id = (await t.start(hello)).body.conversation_id;
   const cursor = (await t.read(id)).body.cursor;
   let settled = false;
+  const reads = t.store.reads;
   const held = t.read(id, { query: `?cursor=${cursor}&wait=999` }).finally(() => { settled = true; });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await t.store.untilReads(reads + 2);
   t.clock.advance(29_999);
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await t.store.untilReads(reads + 3); // the hold polled again, so it had not reached its deadline
   assert.equal(settled, false, 'held up to the 30 s cap');
   t.clock.advance(1);
   const res = await held;
@@ -352,8 +354,9 @@ test('long poll: a reader revoked during the hold gets no data', async () => {
   const id = (await t.start(hello)).body.conversation_id;
   const cursor = (await t.read(id)).body.cursor;
   const claim = await t.service.claim();
+  const holding = t.store.untilReads(t.store.reads + 2); // initial authorized read, then the hold's first poll
   const held = t.read(id, { query: `?cursor=${cursor}&wait=30` });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await holding;
   t.policy.denyCurrent = new AuthorityError('invalid_token');
   await t.service.reply(claim, 'out_1', reply('msg_r'));
   const res = await held;
@@ -366,8 +369,9 @@ test('long poll: foreign readers are refused before any hold; an aborted wait on
   assert.equal((await t.read(id, { as: 'bob', query: '?wait=30' })).status, 404);
   const cursor = (await t.read(id)).body.cursor;
   const controller = new AbortController();
+  const holding = t.store.untilReads(t.store.reads + 2);
   const held = t.read(id, { query: `?cursor=${cursor}&wait=30`, signal: controller.signal });
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await holding;
   controller.abort();
   const res = await held;
   assert.deepEqual([res.status, res.body.events], [200, []]);

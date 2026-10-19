@@ -9,7 +9,15 @@ export function memoryStore(initial) {
   const store = {
     transactions: 0,
     afterRead: null, // test hook: runs once between a read and the next transaction
-    async read() { const copy = structuredClone(state); const hook = store.afterRead; store.afterRead = null; await hook?.(state); return copy; },
+    reads: 0, readWaiters: [],
+    async read() {
+      const copy = structuredClone(state);
+      store.reads++;
+      store.readWaiters = store.readWaiters.filter(waiter => store.reads < waiter.count || void waiter.resolve());
+      const hook = store.afterRead; store.afterRead = null; await hook?.(state); return copy;
+    },
+    // Resolves once the store has served `count` reads in total: lets a test act exactly when a long poll is holding.
+    untilReads(count) { return new Promise(resolve => { if (store.reads >= count) resolve(); else store.readWaiters.push({ count, resolve }); }); },
     transaction(change) {
       const run = queue.then(() => {
         const draft = structuredClone(state);

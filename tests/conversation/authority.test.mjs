@@ -122,8 +122,9 @@ test('held long poll: a disconnect during the hold releases no data', async () =
   const id = (await t.call('POST', '', { message })).body.conversation_id;
   const cursor = (await t.call('GET', `/${id}/events`)).body.cursor;
   const claim = await t.service.claim();
+  const holding = t.store.untilReads(t.store.reads + 2); // initial authorized read, then the hold's first poll
   const held = t.call('GET', `/${id}/events?cursor=${cursor}&wait=30`);
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await holding;
   await t.issuer.disconnect(CLIENT, 'acct_1');
   await t.service.reply(claim, 'out_1', reply);
   assert.deepEqual(await held, { status: 401, body: { error: 'invalid_token' } });
