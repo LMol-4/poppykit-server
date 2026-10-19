@@ -145,8 +145,8 @@ export function createConversationService(options: ConversationOptions): Convers
     if (!conversation || conversation.issuer !== principal.issuer || conversation.clientId !== principal.clientId) throw notFound();
     const accountId = own(state.bindings, conversation.bindingId)?.accountId;
     if (accountId === undefined ? conversation.userId === principal.userId : principal.accountId === accountId) return conversation;
-    // Spec 7.11: the same User without that account is told to sign in; anyone else learns nothing.
-    if (accountId !== undefined && principal.accountId === undefined && conversation.userId === principal.userId) throw new AuthorityError('sign_in_required');
+    // Spec 7.11: the same User not signed in to the bound account (signed out or another account) is told to sign in; anyone else learns nothing.
+    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError('sign_in_required');
     throw notFound();
   }
 

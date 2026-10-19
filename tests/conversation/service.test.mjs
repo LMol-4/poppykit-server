@@ -11,6 +11,7 @@ const principals = {
   aliceNoScopes: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['poppy:read'] },
   bob: { ...base, userId: 'u_bob' },
+  bobOtherAccount: { ...base, userId: 'u_bob', accountId: 'acct_2', scopes: ['poppy:read'] },
   carolSameAccount: { ...base, userId: 'u_carol', accountId: 'acct_1', scopes: ['poppy:read'] },
   otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
   otherClientNoScopes: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: [] },
@@ -148,7 +149,7 @@ test('foreign user or client cannot read, send to, or learn of a conversation', 
   assert.equal((await t.read('constructor')).status, 404);
 });
 
-test('account-bound conversation: same account reads with poppy:read, signed-out gets sign_in_required, other account 404', async () => {
+test('account-bound conversation: same account reads with poppy:read; same User signed out or on another account gets sign_in_required; others 404', async () => {
   const t = setup();
   const { body } = await t.start(hello);
   t.store.set(state => { state.bindings[body.conversation_id].accountId = 'acct_1'; });
@@ -158,9 +159,18 @@ test('account-bound conversation: same account reads with poppy:read, signed-out
   const signedOut = await t.read(body.conversation_id);
   assert.equal(signedOut.status, 403);
   assert.deepEqual(signedOut.body, { error: 'sign_in_required' });
-  assert.equal((await t.read(body.conversation_id, { as: 'aliceOtherAccount' })).status, 404);
-  // Changed reuse of the first message ID by another account is 404, not a revealing 409.
-  assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'aliceOtherAccount' })).status, 404);
+  // Spec 7.11 and 4.2: the same User on account B is not signed in to account A.
+  const otherAccount = await t.read(body.conversation_id, { as: 'aliceOtherAccount' });
+  assert.deepEqual([otherAccount.status, otherAccount.body], [403, { error: 'sign_in_required' }]);
+  // A different User on account B is a stranger: 404, also for an unknown ID.
+  for (const id of [body.conversation_id, 'cnv_unknown']) {
+    assert.deepEqual(await t.read(id, { as: 'bobOtherAccount' }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
+  }
+  // A different client on account A without poppy:read: 404, as for an unknown ID.
+  assert.equal((await t.read(body.conversation_id, { as: 'otherClientNoScopes' })).status, 404);
+  // Changed reuse of the first message ID is checked for ownership before any 409.
+  assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'aliceOtherAccount' })).status, 403);
+  assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'bobOtherAccount' })).status, 201, 'message IDs are per User');
   // Retrying the original first message on a now-bound conversation is checked against current ownership too.
   assert.equal((await t.start(hello)).status, 403);
 });
@@ -438,7 +448,8 @@ test('requireAccount binds the shared parent/child ownership once and checks the
   assert.deepEqual(await t.service.requireAccount(claim, []), { accountId: 'acct_1' });
   assert.equal((await t.read(child, { as: 'carolSameAccount' })).status, 200);
   assert.equal((await t.read(child)).status, 403);
-  assert.equal((await t.read(child, { as: 'aliceOtherAccount' })).status, 404);
+  assert.equal((await t.read(child, { as: 'aliceOtherAccount' })).status, 403);
+  assert.equal((await t.read(child, { as: 'bobOtherAccount' })).status, 404);
 });
 
 test('requireAccount refuses signed-out work, missing scopes and stale fences without binding', async () => {
@@ -479,7 +490,7 @@ test('account use committed between a read and its transaction: the read sees th
   // A different account's message racing the binding is refused and leaves no trace.
   t.store.afterRead = null;
   const before = (await t.store.read()).conversations[parent].events.length;
-  assert.equal((await t.send(parent, { id: 'msg_o', sender: 'agent', text: 'x' }, { as: 'aliceOtherAccount' })).status, 404);
+  assert.equal((await t.send(parent, { id: 'msg_o', sender: 'agent', text: 'x' }, { as: 'aliceOtherAccount' })).status, 403);
   assert.equal((await t.store.read()).conversations[parent].events.length, before);
   // A worker's history read racing a first account use is rescoped to poppy:read.
   const t2 = setup();
