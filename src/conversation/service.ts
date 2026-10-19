@@ -138,9 +138,9 @@ export function createConversationService(options: ConversationOptions): Convers
   function ack(conversation: ConversationRecord): JsonObject {
     return { conversation_id: conversation.id, status: conversation.status, responder: conversation.responder };
   }
-  // Account-bound history needs poppy:read; sending alone does not read history.
-  const scopesFor = (state: ConversationStoreState, conversation: ConversationRecord | undefined, history: boolean) =>
-    conversation && history && own(state.bindings, conversation.bindingId)?.accountId !== undefined ? ['poppy:read'] : [];
+  // Account-bound history needs poppy:read; sending alone does not read history. Other readers fail ownership first.
+  const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
+    conversation && history && principal.accountId !== undefined && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
 
   function owned(state: ConversationStoreState, principal: Principal, id: string): ConversationRecord {
     const conversation = own(state.conversations, id);
@@ -159,11 +159,11 @@ export function createConversationService(options: ConversationOptions): Convers
     for (;;) {
       const before = await store.read();
       const id = target(before);
-      const scopes = scopesFor(before, id === undefined ? undefined : own(before.conversations, id), history);
+      const scopes = scopesFor(before, principal, id === undefined ? undefined : own(before.conversations, id), history);
       const result = await policy.withCurrent(principal, scopes, () => store.transaction(draft => {
         const now = target(draft);
         // Binding only ever gains an account, so a rerun with the wider scopes settles it.
-        if (scopesFor(draft, now === undefined ? undefined : own(draft.conversations, now), history).length > scopes.length) return { rescope: true } as const;
+        if (scopesFor(draft, principal, now === undefined ? undefined : own(draft.conversations, now), history).length > scopes.length) return { rescope: true } as const;
         return { value: change(draft) };
       }));
       if (!('rescope' in result)) return result.value;
@@ -289,10 +289,10 @@ export function createConversationService(options: ConversationOptions): Convers
       return publish(ref, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
     },
 
-    reply(ref, outputId, message) {
+    async reply(ref, outputId, message) {
       const parsed = parseMessage(message, { company: true });
       const payload = canonical({ reply: parsed });
-      return publish(ref, (_draft, work, conversation) => {
+      await publish(ref, (_draft, work, conversation) => {
         const previous = own(work.outputs, outputId);
         if (previous !== undefined) {
           if (previous !== payload) throw new PublicationError('output_conflict');
