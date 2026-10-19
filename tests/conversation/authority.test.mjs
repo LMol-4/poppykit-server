@@ -25,7 +25,7 @@ function setup(revocationPolicy) {
   const authenticator = { async authenticate() { return current; } };
   const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
-  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy });
+  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1 });
   const call = async (method, path, body) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body && JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
@@ -115,4 +115,17 @@ test('revoked read: a revocation committed after authentication but before the f
   // The reader has authenticated and taken its pre-check snapshot; the revocation lands before delivery.
   t.store.afterRead = () => t.issuer.disconnect(CLIENT, 'acct_1');
   assert.deepEqual(await t.call('GET', `/${id}/events`), { status: 401, body: { error: 'invalid_token' } });
+});
+
+test('held long poll: a disconnect during the hold releases no data', async () => {
+  const t = setup('allow-accepted-work-to-finish');
+  const id = (await t.call('POST', '', { message })).body.conversation_id;
+  const cursor = (await t.call('GET', `/${id}/events`)).body.cursor;
+  const claim = await t.service.claim();
+  const held = t.call('GET', `/${id}/events?cursor=${cursor}&wait=30`);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await t.issuer.disconnect(CLIENT, 'acct_1');
+  await t.service.reply(claim, 'out_1', reply);
+  assert.deepEqual(await held, { status: 401, body: { error: 'invalid_token' } });
+  assert.equal(t.coordinator.held, false, 'the hold never held the coordinator');
 });
