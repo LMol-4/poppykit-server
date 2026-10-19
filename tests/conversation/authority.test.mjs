@@ -21,14 +21,16 @@ function setup(revocationPolicy) {
   const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, poppyDomains: ['shop.test'], metadata: {}, store: issuerStore, coordinator, now: clock.now });
   const principal = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['poppy:read'], tokenExpiresAt: NOW + HOUR, sessionVersion: 1, issuerGeneration: initial.generation };
   // Stands in for token verification, which J10 extends to signed-in tokens.
-  const authenticator = { async authenticate() { return principal; } };
+  let current = principal;
+  const authenticator = { async authenticate() { return current; } };
+  const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
   const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy });
   const call = async (method, path, body) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body && JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
   };
-  return { clock, issuer, store, service, call, coordinator };
+  return { clock, issuer, issuerStore, store, service, call, coordinator, signOut };
 }
 const message = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?' };
 const reply = { id: 'msg_r1', sender: 'agent', text: 'Shipped.' };
@@ -61,6 +63,38 @@ test('stop-account-work: after revocation no account work, publication or read g
   assert.deepEqual(await t.store.read(), before);
   assert.deepEqual(await t.call('GET', `/${id}/events`), { status: 401, body: { error: 'invalid_token' } });
   assert.equal((await t.call('POST', `/${id}/messages`, { message: { ...message, id: 'msg_2' } })).status, 401);
+});
+
+test('stop-account-work: revoked work can still fail or suspend, so the conversation is not stuck working', async () => {
+  for (const outcome of ['failed', 'suspended']) {
+    const t = setup();
+    const id = (await t.call('POST', '', { message })).body.conversation_id;
+    const claim = await t.service.claim();
+    await t.issuer.disconnect(CLIENT, 'acct_1');
+    await assert.rejects(t.service.reply(claim, 'out_1', reply), { code: 'invalid_token' });
+    await t.service.finish(claim, outcome);
+    let state = await t.store.read();
+    assert.deepEqual([state.work[0].phase, state.conversations[id].status], [outcome, 'idle']);
+    await assert.rejects(t.service.finish(claim, outcome), { code: 'stale_work' }, 'the fence still applies');
+    // After sign-out the conversation continues signed out (spec 4.9): the next message is accepted and claimable.
+    t.signOut();
+    assert.equal((await t.call('POST', `/${id}/messages`, { message: { ...message, id: 'msg_2' } })).status, 202);
+    const next = await t.service.claim();
+    assert.equal(next.message.id, 'msg_2');
+    await t.service.reply(next, 'out_1', reply);
+    await t.service.finish(next, 'completed');
+    state = await t.store.read();
+    assert.equal(state.conversations[id].status, 'idle');
+  }
+});
+
+test('failing revoked work still respects a reset generation', async () => {
+  const t = setup();
+  await t.call('POST', '', { message });
+  const claim = await t.service.claim();
+  await t.issuer.disconnect(CLIENT, 'acct_1');
+  t.issuerStore.set(state => { state.generation = 'after-reset'; });
+  await assert.rejects(t.service.finish(claim, 'failed'), { code: 'invalid_token' });
 });
 
 test('allow-accepted-work-to-finish: accepted work completes but the revoked reader still sees nothing', async () => {

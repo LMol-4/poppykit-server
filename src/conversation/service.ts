@@ -239,14 +239,16 @@ export function createConversationService(options: ConversationOptions): Convers
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
   // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
-    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T): Promise<T> {
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, ending = false): Promise<T> {
     for (;;) {
       const before = await store.read();
       const stored = before.work.find(work => work.id === ref.workId);
       if (!stored) throw new PublicationError('stale_work');
       const granted = scopes(before, stored);
+      // Failing or suspending uses no account and must stay possible after revocation, or the work is reclaimed forever.
+      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
-        return await policy.withAccepted(stored.authority, granted, () => store.transaction(draft => {
+        return await policy.withAccepted(authority, granted, () => store.transaction(draft => {
           const work = draft.work.find(item => item.id === ref.workId);
           if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
           if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
@@ -340,7 +342,7 @@ export function createConversationService(options: ConversationOptions): Convers
         }
         const busy = draft.work.some(item => item.conversationId === conversation.id && (item.phase === 'pending' || item.phase === 'claimed'));
         if (!busy && conversation.status === 'working') setState(conversation, 'idle');
-      });
+      }, outcome !== 'completed');
     },
   };
 }
