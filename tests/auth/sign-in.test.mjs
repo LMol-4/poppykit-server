@@ -106,6 +106,7 @@ test('PKCE mismatch, wrong redirect, wrong client and expired codes are invalid_
   };
   for (const [name, fields] of Object.entries(cases)) await assert.doesNotReject(async () => expectError(await env.exchange(session.session_id, grant, fields), 'invalid_grant'), name);
   for (const name of ['code', 'redirect_uri', 'code_verifier', 'session_id']) expectError(await env.exchange(session.session_id, grant, { [name]: undefined }), 'invalid_request');
+  for (const code_verifier of ['a'.repeat(42), 'a'.repeat(129), `${'a'.repeat(42)}+`, `${'a'.repeat(42)} `]) expectError(await env.exchange(session.session_id, grant, { code_verifier }), 'invalid_request');
   expectError(await env.exchange('ses_missing', grant), 'invalid_session');
   expectError(await env.exchange(session.session_id, grant, { scope: 'poppy:admin' }), 'invalid_scope');
   assert.deepEqual(env.store.state.grants, {}, 'no failed exchange created a grant');

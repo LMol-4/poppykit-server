@@ -227,6 +227,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     } else if (grantType === 'authorization_code') {
       // Direct Sign-In always names the Session to sign in (spec 4.5).
       if (!code || !redirectUri || !codeVerifier || sessionId === undefined) throw new TokenError('invalid_request');
+      // RFC 7636 4.1: 43-128 unreserved characters.
+      if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) throw new TokenError('invalid_request');
     } else if (!refreshToken) throw new TokenError('invalid_request');
     // scope narrows only (spec 4.3, 4.8); an empty request asks for nothing and is refused.
     const requested = scope === undefined || grantType === JWT_BEARER ? undefined : [...new Set(scope.split(' ').filter(Boolean))];
