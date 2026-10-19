@@ -127,6 +127,9 @@ test('session assertion defects, reuse and cross-role jti reuse are invalid_gran
   expectError(await env.send({ assertion: undefined }), 'invalid_grant');
   expectError(await env.send({ assertion: await env.assertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_grant');
   expectError(await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_client');
+  for (const typ of ['application/poppy-browser+jwt', 'Poppy-Browser+JWT', 'APPLICATION/poppy-browser+jwt']) {
+    expectError(await env.send({ assertion: await env.assertion({}, { header: { typ } }) }), 'invalid_grant');
+  }
   assert.equal((await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'client-authentication+jwt' } }) })).status, 200);
   const sameJti = randomUUID();
   expectError(await env.send({ assertion: await env.assertion({ jti: sameJti }), client_assertion: await env.clientAssertion({ jti: sameJti }) }), 'invalid_grant');
@@ -211,6 +214,13 @@ test('session, scope, resource and request shape checks', async () => {
   assert.equal(duplicated.status, 400); assert.deepEqual(await duplicated.json(), { error: 'invalid_request' });
   const json = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
   assert.equal(json.status, 400);
+  // Rejected before reading: the unread body stream is cancelled, not left open.
+  for (const [contentType, length] of [['application/json', undefined], ['application/x-www-form-urlencoded', '65537']]) {
+    let cancelled = false;
+    const body = new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(1)); }, cancel() { cancelled = true; } });
+    const rejected = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': contentType, ...(length ? { 'content-length': length } : {}) }, body, duplex: 'half' }));
+    assert.equal(rejected.status, 400); assert.ok(cancelled, contentType);
+  }
 
   const declared = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '65537' }, body: 'grant_type=x' }));
   assert.equal(declared.status, 400); assert.deepEqual(await declared.json(), { error: 'invalid_request' });

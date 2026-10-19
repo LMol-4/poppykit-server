@@ -98,7 +98,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
 
   async function verifyAssertion(jwt: string, keys: JSONWebKeySet): Promise<AssertionClaims> {
     const { payload, protectedHeader } = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ASSERTION_ALGORITHMS });
-    if (protectedHeader.typ === 'poppy-browser+jwt') throw new TypeError('browser assertion'); // spec 5: not accepted here
+    // Media types are case-insensitive and may carry the application/ prefix (RFC 7515 4.1.9).
+    if (protectedHeader.typ?.toLowerCase().replace(/^application\//, '') === 'poppy-browser+jwt') throw new TypeError('browser assertion'); // spec 5: not accepted here
     return parseAssertionClaims(JSON.parse(new TextDecoder().decode(payload)));
   }
   const current = (claims: AssertionClaims) => claims.exp * 1000 > now() && claims.iat <= now() / 1000 + CLOCK_SKEW_SECONDS;
@@ -182,6 +183,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   return {
     async token(request) {
       try { return await issue(request); } catch (error) {
+        // Early rejects leave the body unread; release the stream instead of leaving it open.
+        if (!request.bodyUsed) await request.body?.cancel().catch(() => {});
         const code = error instanceof TokenError || error instanceof AuthorityError ? error.code : undefined;
         if (!code) throw error;
         return json(code === 'invalid_client' ? 401 : 400, { error: code }, error instanceof TokenError && error.nonce ? { 'DPoP-Nonce': error.nonce } : {});
