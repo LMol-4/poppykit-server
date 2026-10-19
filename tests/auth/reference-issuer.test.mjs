@@ -5,6 +5,7 @@ import { SignJWT } from 'jose';
 import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { createRequestAuthenticator } from '../../dist/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
+import { memoryCoordinator } from '../conversation/support.mjs';
 
 const ISSUER = 'https://auth.shop.test';
 const TOKEN_ENDPOINT = 'https://auth.shop.test/oauth/token';
@@ -33,7 +34,7 @@ async function setup(overrides = {}) {
     async resolveClient(id) { env.calls.client++; if (id !== CLIENT) throw new Error('unknown client'); return { client_id: CLIENT, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [], token_endpoint_auth_method: 'private_key_jwt' }; },
     async resolveJwks(uri, settings = {}) { assert.equal(uri, JWKS_URI); if (settings.refresh) { env.calls.refresh++; return structuredClone(env.refreshedJwks); } env.calls.jwks++; await env.onJwks?.(); return structuredClone(env.jwks); },
   };
-  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], resources: [RESOURCE], metadata: env.metadata, store: env.store, now: () => clock.now, ...overrides });
+  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, ...overrides });
   env.assertion = (claims = {}, { key = identity, header = {} } = {}) => {
     const iat = Math.floor(clock.now / 1000);
     return new SignJWT({ iss: CLIENT, sub: 'usr_1', aud: ISSUER, iat, exp: iat + 60, jti: randomUUID(), ...claims }).setProtectedHeader({ alg: 'ES256', kid: 'k1', ...header }).sign(key.privateKey);
@@ -127,6 +128,9 @@ test('session assertion defects, reuse and cross-role jti reuse are invalid_gran
   expectError(await env.send({ assertion: undefined }), 'invalid_grant');
   expectError(await env.send({ assertion: await env.assertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_grant');
   expectError(await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_client');
+  for (const typ of ['application/poppy-browser+jwt', 'Poppy-Browser+JWT', 'APPLICATION/poppy-browser+jwt']) {
+    expectError(await env.send({ assertion: await env.assertion({}, { header: { typ } }) }), 'invalid_grant');
+  }
   assert.equal((await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'client-authentication+jwt' } }) })).status, 200);
   const sameJti = randomUUID();
   expectError(await env.send({ assertion: await env.assertion({ jti: sameJti }), client_assertion: await env.clientAssertion({ jti: sameJti }) }), 'invalid_grant');
@@ -211,6 +215,13 @@ test('session, scope, resource and request shape checks', async () => {
   assert.equal(duplicated.status, 400); assert.deepEqual(await duplicated.json(), { error: 'invalid_request' });
   const json = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
   assert.equal(json.status, 400);
+  // Rejected before reading: the unread body stream is cancelled, not left open.
+  for (const [contentType, length] of [['application/json', undefined], ['application/x-www-form-urlencoded', '65537']]) {
+    let cancelled = false;
+    const body = new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(1)); }, cancel() { cancelled = true; } });
+    const rejected = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': contentType, ...(length ? { 'content-length': length } : {}) }, body, duplex: 'half' }));
+    assert.equal(rejected.status, 400); assert.ok(cancelled, contentType);
+  }
 
   const declared = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '65537' }, body: 'grant_type=x' }));
   assert.equal(declared.status, 400); assert.deepEqual(await declared.json(), { error: 'invalid_request' });

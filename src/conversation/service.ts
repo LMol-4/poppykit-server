@@ -2,19 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { ValidationError, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
-
-// shortcut: structural copies of the server-auth-interface types; import them from src/auth once J04 merges.
-interface Principal {
-  issuer: string; clientId: string; userId: string; sessionId: string;
-  accountId?: string; grantId?: string; scopes: string[]; tokenExpiresAt: number; sessionVersion: number;
-}
-type WorkRevocationPolicy = 'stop-account-work' | 'allow-accepted-work-to-finish';
-interface AcceptedAuthority { principal: Principal; acceptedAt: number; revocationPolicy: WorkRevocationPolicy }
-interface AuthorityPolicy {
-  withCurrent<T>(principal: Principal, scopes: readonly string[], action: () => Promise<T>): Promise<T>;
-  withAccepted<T>(authority: AcceptedAuthority, scopes: readonly string[], action: () => Promise<T>): Promise<T>;
-}
-interface RequestAuthenticator { authenticate(request: Request): Promise<Principal> }
+import { AuthorityError } from '../auth/authority.js';
+import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
 
 interface StateStore<State> {
   read(): Promise<State>;
@@ -55,6 +44,10 @@ export interface ConversationService {
   handle(request: Request): Promise<Response>;
   claim(): Promise<WorkClaim | null>;
   renew(work: WorkRef): Promise<void>;
+  /** Conversation history for a model or handler; account-bound history needs the bound account and poppy:read. */
+  history(work: WorkRef): Promise<ConversationEvent[]>;
+  /** Account-use gate: call before any account read or tool. Checks accepted authority, then binds the shared ownership once. */
+  requireAccount(work: WorkRef, scopes: readonly string[]): Promise<{ accountId: string }>;
   reply(work: WorkRef, outputId: string, message: Message): Promise<void>;
   finish(work: WorkRef, outcome: 'completed' | 'suspended' | 'failed'): Promise<void>;
 }
@@ -74,6 +67,7 @@ export function initialConversationState(): ConversationStoreState {
 class HttpError extends Error {
   constructor(readonly status: number, readonly body: JsonObject, readonly headers: HeadersInit = {}) { super(String(body.error)); }
 }
+class Rescope extends Error {}
 const notFound = () => new HttpError(404, { error: 'conversation_not_found' });
 
 function json(status: number, body: unknown, headers: HeadersInit = {}): Response {
@@ -141,17 +135,19 @@ export function createConversationService(options: ConversationOptions): Convers
   }
   // Account-bound history needs poppy:read; sending alone does not read history. Other readers fail ownership first.
   const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
-    conversation && history && principal.accountId !== undefined && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
+    // Only an owner may see a scope error; for anyone else ownership fails first with 404, so existence never leaks.
+    conversation && history && conversation.issuer === principal.issuer && conversation.clientId === principal.clientId && principal.accountId !== undefined
+      && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
 
+  // Spec 7.2: owned by client_id + User ID until account use, then by client_id + account instead.
   function owned(state: ConversationStoreState, principal: Principal, id: string): ConversationRecord {
     const conversation = own(state.conversations, id);
-    if (!conversation || conversation.issuer !== principal.issuer || conversation.clientId !== principal.clientId || conversation.userId !== principal.userId) throw notFound();
+    if (!conversation || conversation.issuer !== principal.issuer || conversation.clientId !== principal.clientId) throw notFound();
     const accountId = own(state.bindings, conversation.bindingId)?.accountId;
-    if (accountId !== undefined && principal.accountId !== accountId) {
-      if (principal.accountId === undefined) throw new HttpError(403, { error: 'sign_in_required' }, { 'WWW-Authenticate': 'DPoP error="sign_in_required"' });
-      throw notFound();
-    }
-    return conversation;
+    if (accountId === undefined ? conversation.userId === principal.userId : principal.accountId === accountId) return conversation;
+    // Spec 7.11: the same User not signed in to the bound account (signed out or another account) is told to sign in; anyone else learns nothing.
+    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError('sign_in_required');
+    throw notFound();
   }
 
   // Runs change under withCurrent; target() and history() decide the scopes from the state being checked.
@@ -243,15 +239,30 @@ export function createConversationService(options: ConversationOptions): Convers
   }
 
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
-  async function publish(ref: WorkRef, change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => void): Promise<void> {
-    const stored = (await store.read()).work.find(work => work.id === ref.workId);
-    if (!stored) throw new PublicationError('stale_work');
-    await policy.withAccepted(stored.authority, [], () => store.transaction(draft => {
-      const work = draft.work.find(item => item.id === ref.workId);
-      if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
-      change(draft, work, draft.conversations[work.conversationId]);
-    }));
+  // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
+  async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, ending = false): Promise<T> {
+    for (;;) {
+      const before = await store.read();
+      const stored = before.work.find(work => work.id === ref.workId);
+      if (!stored) throw new PublicationError('stale_work');
+      const granted = scopes(before, stored);
+      // Failing or suspending uses no account and must stay possible after revocation, or the work is reclaimed forever.
+      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      try {
+        return await policy.withAccepted(authority, granted, () => store.transaction(draft => {
+          const work = draft.work.find(item => item.id === ref.workId);
+          if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
+          if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
+          return change(draft, work, draft.conversations[work.conversationId]);
+        }));
+      } catch (error) {
+        if (!(error instanceof Rescope)) throw error;
+      }
+    }
   }
+  const noScopes = () => [];
+  const boundAccount = (state: ConversationStoreState, work: WorkRecord) => own(state.bindings, state.conversations[work.conversationId].bindingId)?.accountId;
 
   return {
     async handle(request) {
@@ -260,13 +271,8 @@ export function createConversationService(options: ConversationOptions): Convers
       } catch (error) {
         if (error instanceof HttpError) return json(error.status, error.body, error.headers);
         if (error instanceof ValidationError) return json(400, { error: 'invalid_request' });
-        const auth = error as { code?: unknown; status?: unknown; headers?: unknown };
-        // AuthorityError from the authenticator or policy: status/code/headers only, never the raw message.
-        // shortcut: structural match until J04 merges; then narrow to instanceof AuthorityError.
-        const status = typeof auth.status === 'number' && Number.isInteger(auth.status) ? auth.status : 0;
-        if (error instanceof Error && typeof auth.code === 'string' && status >= 400 && status <= 599) {
-          return json(status, { error: auth.code }, auth.headers instanceof Headers ? auth.headers : {});
-        }
+        // Status/code/headers only, never the raw message.
+        if (error instanceof AuthorityError) return json(error.status, { error: error.code }, error.headers);
         throw error;
       }
     },
@@ -292,13 +298,32 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     renew(ref) {
-      return publish(ref, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
+      return publish(ref, noScopes, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
+    },
+
+    history(ref) {
+      return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : ['poppy:read'], (draft, work, conversation) => {
+        const accountId = boundAccount(draft, work);
+        if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('sign_in_required');
+        return conversation.events;
+      });
+    },
+
+    requireAccount(ref, scopes) {
+      return publish(ref, () => [...scopes], (draft, work, conversation) => {
+        const accountId = work.authority.principal.accountId;
+        const binding = draft.bindings[conversation.bindingId];
+        // Parent and child share this record, so the first account use wins for both and no other account can.
+        if (accountId === undefined || (binding.accountId ?? accountId) !== accountId) throw new AuthorityError('sign_in_required');
+        binding.accountId = accountId;
+        return { accountId };
+      });
     },
 
     async reply(ref, outputId, message) {
       const parsed = parseMessage(message, { company: true });
       const payload = canonical({ reply: parsed });
-      await publish(ref, (_draft, work, conversation) => {
+      await publish(ref, noScopes, (_draft, work, conversation) => {
         const previous = own(work.outputs, outputId);
         if (previous !== undefined) {
           if (previous !== payload) throw new PublicationError('output_conflict');
@@ -310,7 +335,7 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     finish(ref, outcome) {
-      return publish(ref, (draft, work, conversation) => {
+      return publish(ref, noScopes, (draft, work, conversation) => {
         work.phase = outcome;
         delete work.fence;
         delete work.leaseUntil;
@@ -319,7 +344,7 @@ export function createConversationService(options: ConversationOptions): Convers
         }
         const busy = draft.work.some(item => item.conversationId === conversation.id && (item.phase === 'pending' || item.phase === 'claimed'));
         if (!busy && conversation.status === 'working') setState(conversation, 'idle');
-      });
+      }, outcome !== 'completed');
     },
   };
 }
