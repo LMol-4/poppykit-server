@@ -353,3 +353,13 @@ test('only the current and previous Account Token hashes are retained per lineag
   assert.equal((await env.revoke(first)).status, 200);
   assert.equal((await env.refresh(token)).status, 200, 'a forgotten token cannot revoke the lineage');
 });
+
+test('issuer state of another version is refused, not misread', async () => {
+  const env = await signInSetup();
+  const session = await env.session();
+  env.store.state = { ...env.store.state, version: 1 };
+  await assert.rejects(env.send({ session_id: session.session_id }), /unsupported issuer state version/);
+  await assert.rejects(env.introspect(session.access_token), /unsupported issuer state version/);
+  await assert.rejects(env.issuer.disconnect(CLIENT, 'acct_1'), /unsupported issuer state version/);
+  await assert.rejects(env.issuer.beginAuthorization(authorizeRequest(), BINDING), /unsupported issuer state version/);
+});

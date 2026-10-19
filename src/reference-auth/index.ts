@@ -84,6 +84,12 @@ function callback(redirectUri: string, fields: Record<string, string>): string {
   return url.href;
 }
 
+// Shape changes bump the version; other versions are refused instead of misread.
+function checked(state: IssuerState): IssuerState {
+  if (state.version !== 2) throw new Error('unsupported issuer state version');
+  return state;
+}
+
 export function initialIssuerState(): IssuerState {
   return { version: 2, generation: random(16), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, accessTokens: {}, replay: {}, nonces: [] };
 }
@@ -137,7 +143,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
   // Every issuer mutation is ordered with conversation work by the shared coordinator.
-  const commit = <T>(change: (draft: IssuerState) => T) => options.coordinator.run(() => store.transaction(change));
+  const read = async () => checked(await store.read());
+  const commit = <T>(change: (draft: IssuerState) => T) => options.coordinator.run(() => store.transaction(draft => change(checked(draft))));
 
   // Reuse the current nonce while it has more than half its life left, so challenges cannot grow state.
   async function currentNonce(state: IssuerState): Promise<string> {
@@ -227,7 +234,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Resources are exact configured identifiers, chosen per token request; grants are never narrowed to one.
     if (resource !== undefined && !resources.includes(resource)) throw new TokenError('invalid_target');
 
-    const state = await store.read(); const generation = state.generation;
+    const state = await read(); const generation = state.generation;
     // htu is checked against the configured token endpoint, never the incoming Request URL.
     const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
     // Nonce challenge precedes any network fetch and any replay consumption.
@@ -327,7 +334,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const { clientId, clientAssertion } = clientCredentials(params);
     const token = params.get('token');
     if (!token) throw new TokenError('invalid_request');
-    const { generation } = await store.read();
+    const { generation } = await read();
     const { client } = await authenticateClient(clientId, clientAssertion);
     await commit(draft => {
       if (draft.generation !== generation) return; // reset already removed every grant
@@ -366,7 +373,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   // Order: coordinator -> issuer snapshot -> caller's conversation transaction, released in run's finally.
   const policy: AuthorityPolicy = {
     withCurrent: (principal, scopes, action) => options.coordinator.run(async () => {
-      const state = await store.read();
+      const state = await read();
       const session = own(state.sessions, principal.sessionId);
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
         || session.userId !== principal.userId || session.version !== principal.sessionVersion || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
@@ -374,7 +381,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       return action();
     }),
     withAccepted: (authority, scopes, action) => options.coordinator.run(async () => {
-      const state = await store.read();
+      const state = await read();
       const { principal } = authority;
       // Admission token expiry is ignored: accepted work outlives its token. A reset (new generation) never is.
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation) throw new AuthorityError('invalid_token');
@@ -396,7 +403,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const params = uniqueParams(new URL(request.url).searchParams, () => new AuthorizationError('invalid_request'));
       const clientId = params.get('client_id'); const redirectUri = params.get('redirect_uri');
       if (!clientId || !redirectUri) throw new AuthorizationError('invalid_request');
-      const { generation } = await store.read();
+      const { generation } = await read();
       let client;
       try { client = await metadata.resolveClient(clientId); } catch { throw new AuthorizationError('invalid_client'); }
       // Exact string match against the client's metadata (spec 4.5).
@@ -453,7 +460,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       issuer,
       revocationVisibility: 'immediate: every introspection and policy check reads the shared issuer store; policy checks are ordered by the shared coordinator',
       async introspect(token, resource) {
-        const state = await store.read(); const at = now();
+        const state = await read(); const at = now();
         const record = own(state.accessTokens, tokenHash(token));
         const session = record && own(state.sessions, record.sessionId);
         if (!record || !session || !(session.expiresAt > at) || record.expiresAt <= at || record.resource !== (resource ?? null)) throw new AuthorityError('invalid_token');
