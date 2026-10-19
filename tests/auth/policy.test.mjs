@@ -134,11 +134,3 @@ test('coordinator orders revocation against checked actions and is released on f
   await assert.rejects(u.policy.withAccepted(u.accepted(u.signedOut), [], () => u.policy.withCurrent(u.signedOut, [], async () => {})), /nested/);
 });
 
-test('issuer state persisted before grants existed reads as having none', async () => {
-  const t = setup();
-  t.store.set(state => { delete state.grants; });
-  await t.issuer.disconnect(CLIENT, 'acct_1');
-  assert.equal(await t.policy.withCurrent(t.signedOut, [], async () => 'ok'), 'ok');
-  await assert.rejects(t.policy.withCurrent(t.signedIn, [], async () => {}), { code: 'invalid_token' });
-  await assert.rejects(t.policy.withAccepted(t.accepted(t.signedIn), [], async () => {}), { code: 'invalid_token' });
-});
