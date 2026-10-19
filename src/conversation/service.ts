@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ValidationError, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
-import type { ConversationEvent, ConversationRequest, JsonObject, Message, RecordedMessage, Sender, Status } from '../protocol/wire.js';
+import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
@@ -19,7 +19,7 @@ export interface ConversationRecord {
 }
 export interface WorkRecord {
   id: string; conversationId: string; message: Message; authority: AcceptedAuthority;
-  phase: 'pending' | 'claimed' | 'completed' | 'suspended' | 'failed' | 'cancelled';
+  phase: 'held' | 'pending' | 'claimed' | 'completed' | 'suspended' | 'failed' | 'cancelled'; // held: for a person, not automation
   fence?: string; leaseUntil?: number;
   human?: true; // a staff attempt: no lease, never claimed by automation
   outputs: Record<string, string>; // outputId -> canonical payload
@@ -162,21 +162,15 @@ export function createConversationService(options: ConversationOptions): Convers
     fence(draft, conversation.id, 'cancelled');
     setState(conversation, 'queued');
   }
-  // User messages after event index `after` that nobody answered become automated work, under the latest authority.
-  function requeueUnanswered(draft: ConversationStoreState, conversation: ConversationRecord, after: number): void {
-    for (const event of conversation.events.slice(after + 1)) {
-      if (event.type !== 'message') continue;
-      const { role, ...message } = event.message as RecordedMessage;
-      if (role === 'user' && ('text' in message || 'data' in message)) {
-        draft.work.push({ id: randomId('wrk_'), conversationId: conversation.id, message, authority: conversation.authority, phase: 'pending', outputs: {} });
-      }
-    }
-  }
+  const release = (draft: ConversationStoreState, id: string) => {
+    for (const work of draft.work) if (work.conversationId === id && work.phase === 'held') work.phase = 'pending';
+  };
   // Closing a parent closes its open Direct Conversation first; closing a child reopens its parent for messages.
   function closeConversation(draft: ConversationStoreState, conversation: ConversationRecord): void {
     if (conversation.status === 'closed') return;
     if (conversation.childId !== undefined) closeConversation(draft, draft.conversations[conversation.childId]);
     fence(draft, conversation.id, 'cancelled');
+    for (const work of draft.work) if (work.conversationId === conversation.id && work.phase === 'held') work.phase = 'cancelled';
     setState(conversation, 'closed');
     const parent = conversation.parentId === undefined ? undefined : draft.conversations[conversation.parentId];
     if (parent?.childId === conversation.id) {
@@ -299,10 +293,12 @@ export function createConversationService(options: ConversationOptions): Convers
       const message = body.message;
       if (message.context) conversation.context = { ...conversation.context, ...message.context };
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
-      // A context-only message asks nothing; while queued for or answered by a person, messages are for that person.
-      if (('text' in message || 'data' in message) && conversation.responder === 'agent' && conversation.status !== 'queued') {
-        draft.work.push({ id: randomId('wrk_'), conversationId: conversation.id, message, authority, phase: 'pending', outputs: {} });
-        if (conversation.status === 'idle') setState(conversation, 'working');
+      // A context-only message asks nothing. Work always records this message's own accepted authority; while queued
+      // for or answered by a person it is held for them and reaches automation only if they never answer it.
+      if ('text' in message || 'data' in message) {
+        const held = conversation.responder === 'human' || conversation.status === 'queued';
+        draft.work.push({ id: randomId('wrk_'), conversationId: conversation.id, message, authority, phase: held ? 'held' : 'pending', outputs: {} });
+        if (!held && conversation.status === 'idle') setState(conversation, 'working');
       }
       // A read from the cursor always finds the message just accepted, so 7.5 returns at once and the receipt
       // commits with the acceptance: there is no accepted-but-unanswered state for a crash to leave behind.
@@ -470,7 +466,7 @@ export function createConversationService(options: ConversationOptions): Convers
     async reply(ref, outputId, message) {
       const parsed = parseMessage(message, { company: true });
       const payload = canonical({ reply: parsed });
-      await publish(ref, noScopes, (_draft, work, conversation) => {
+      await publish(ref, noScopes, (draft, work, conversation) => {
         if (parsed.sender !== conversation.responder) throw new ValidationError('message.sender');
         const previous = own(work.outputs, outputId);
         if (previous !== undefined) {
@@ -478,6 +474,8 @@ export function createConversationService(options: ConversationOptions): Convers
           return;
         }
         work.outputs[outputId] = payload;
+        // A person's reply answers the messages held for them so far.
+        if (work.human) for (const item of draft.work) if (item.conversationId === conversation.id && item.phase === 'held') item.phase = 'cancelled';
         addEvent(conversation, { type: 'message', message: { ...parsed, role: 'company' } as JsonObject });
       });
     },
@@ -527,7 +525,7 @@ export function createConversationService(options: ConversationOptions): Convers
         // Parent publication waits until its Direct Conversation closes.
         if (conversation.childId !== undefined) throw new PublicationError('stale_work');
         // Messages sent while queued were meant for a person; the agent answers them now.
-        requeueUnanswered(draft, conversation, conversation.events.findLastIndex(event => event.type === 'state' && event.status === 'queued'));
+        release(draft, conversationId);
         addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: reason } });
         setState(conversation, idleOrWorking(draft, conversationId), 'agent');
       });
@@ -537,7 +535,7 @@ export function createConversationService(options: ConversationOptions): Convers
       return staff(operator, conversationId, true, (draft, conversation) => {
         if (conversation.responder !== 'human' || conversation.status === 'closed') return;
         fence(draft, conversationId, 'cancelled');
-        requeueUnanswered(draft, conversation, conversation.events.findLastIndex(event => event.type === 'message' && (event.message as RecordedMessage).role === 'company'));
+        release(draft, conversationId);
         setState(conversation, idleOrWorking(draft, conversationId), 'agent');
       });
     },

@@ -166,6 +166,52 @@ test('messages sent while queued wait for the person; with no staff the agent an
   assert.equal((await t.read(id)).body.status, 'idle');
 });
 
+// A signed-out message A, then a signed-in message B: A's work must keep A's own accepted authority.
+async function heldAuthorityCase(t, id, handBack) {
+  await t.send(id, { id: 'msg_a', sender: 'agent', text: 'Signed-out question.' });
+  await t.send(id, { id: 'msg_b', sender: 'agent', text: 'Signed-in question.' }, { as: 'aliceSignedIn' });
+  assert.equal(await t.service.claim(), null, 'held work is not claimable');
+  await handBack();
+  const a = await t.service.claim();
+  assert.equal(a.message.id, 'msg_a');
+  // Signed out: no account to bind, and no read scope either.
+  await assert.rejects(t.service.requireAccount(a, []), { code: 'sign_in_required' });
+  await assert.rejects(t.service.requireAccount(a, ['poppy:read']), { code: 'insufficient_scope' });
+  await t.service.finish(a, 'completed');
+  const b = await t.service.claim();
+  assert.equal(b.message.id, 'msg_b');
+  assert.deepEqual(await t.service.requireAccount(b, ['poppy:read']), { accountId: 'acct_1' });
+}
+
+test("no-staff: work held while queued keeps every message's own accepted authority", async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  await heldAuthorityCase(t, id, () => t.service.noHumanAvailable(operator, id, 'Nobody.'));
+});
+
+test("return to agent: work held while a person responds keeps every message's own accepted authority", async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  await t.service.joinHuman(operator, id);
+  await heldAuthorityCase(t, id, () => t.service.returnToAgent(operator, id));
+});
+
+test('return to agent does not resume completed or suspended work', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.service.finish(await t.service.claim(), 'completed');
+  await t.send(id, { id: 'msg_2', sender: 'agent', text: 'Needs sign-in.' });
+  await t.service.finish(await t.service.claim(), 'suspended');
+  await t.handoff(id);
+  await t.service.joinHuman(operator, id);
+  await t.service.returnToAgent(operator, id);
+  assert.equal((await t.read(id)).body.status, 'idle');
+  assert.equal(await t.service.claim(), null);
+  assert.deepEqual((await t.store.read()).work.map(work => work.phase), ['completed', 'suspended', 'cancelled']);
+});
+
 test('no-staff cannot publish into a parent while its Direct Conversation is open', async () => {
   const t = staffSetup();
   const parent = (await t.start(hello)).body.conversation_id;
