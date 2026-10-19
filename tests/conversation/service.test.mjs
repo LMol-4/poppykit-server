@@ -10,6 +10,8 @@ const principals = {
   aliceNoScopes: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['poppy:read'] },
   bob: { ...base, userId: 'u_bob' },
+  carolSameAccount: { ...base, userId: 'u_carol', accountId: 'acct_1', scopes: ['poppy:read'] },
+  otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
   otherClient: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice' },
 };
 
@@ -182,6 +184,30 @@ test('account-bound conversation: same account reads with poppy:read, signed-out
   assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'aliceOtherAccount' })).status, 404);
   // Retrying the original first message on a now-bound conversation is checked against current ownership too.
   assert.equal((await t.start(hello)).status, 403);
+});
+
+test('ownership moves from User ID to account once bound (spec 7.2)', async () => {
+  const t = setup();
+  const { body } = await t.start(hello);
+  const id = body.conversation_id;
+  const next = n => ({ id: `msg_${n}`, sender: 'agent', text: 'more' });
+  // Unbound: client_id + User ID, so another User on the same account is a stranger.
+  assert.equal((await t.read(id, { as: 'carolSameAccount' })).status, 404);
+  assert.equal((await t.send(id, next('c1'), { as: 'carolSameAccount' })).status, 404);
+  t.store.set(state => { state.bindings[id].accountId = 'acct_1'; });
+  // Bound: client_id + account; the User ID no longer has to match.
+  assert.equal((await t.read(id, { as: 'carolSameAccount' })).status, 200);
+  assert.equal((await t.send(id, next('c2'), { as: 'carolSameAccount' })).status, 202);
+  assert.equal((await t.read(id, { as: 'aliceSignedIn' })).status, 200);
+  // Same account through another client, or a signed-out stranger: indistinguishable 404.
+  for (const as of ['otherClientSameAccount', 'bob', 'otherClient']) {
+    assert.deepEqual(await t.read(id, { as }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
+    assert.equal((await t.send(id, next(`x_${as}`), { as })).status, 404);
+  }
+  const signedOut = await t.read(id);
+  assert.deepEqual([signedOut.status, signedOut.body], [403, { error: 'sign_in_required' }]);
+  assert.equal(signedOut.headers.get('www-authenticate'), 'DPoP error="sign_in_required", algs="ES256"');
+  assert.equal((await t.send(id, next('a2'))).status, 403);
 });
 
 test('multi-page idle history uses real cursors and six-field pages', async () => {

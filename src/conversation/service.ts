@@ -132,15 +132,15 @@ export function createConversationService(options: ConversationOptions): Convers
   const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
     conversation && history && principal.accountId !== undefined && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
 
+  // Spec 7.2: owned by client_id + User ID until account use, then by client_id + account instead.
   function owned(state: ConversationStoreState, principal: Principal, id: string): ConversationRecord {
     const conversation = own(state.conversations, id);
-    if (!conversation || conversation.issuer !== principal.issuer || conversation.clientId !== principal.clientId || conversation.userId !== principal.userId) throw notFound();
+    if (!conversation || conversation.issuer !== principal.issuer || conversation.clientId !== principal.clientId) throw notFound();
     const accountId = own(state.bindings, conversation.bindingId)?.accountId;
-    if (accountId !== undefined && principal.accountId !== accountId) {
-      if (principal.accountId === undefined) throw new HttpError(403, { error: 'sign_in_required' }, { 'WWW-Authenticate': 'DPoP error="sign_in_required"' });
-      throw notFound();
-    }
-    return conversation;
+    if (accountId === undefined ? conversation.userId === principal.userId : principal.accountId === accountId) return conversation;
+    // Spec 7.11: the same User without that account is told to sign in; anyone else learns nothing.
+    if (accountId !== undefined && principal.accountId === undefined && conversation.userId === principal.userId) throw new AuthorityError('sign_in_required');
+    throw notFound();
   }
 
   // Runs change under withCurrent; target() and history() decide the scopes from the state being checked.
