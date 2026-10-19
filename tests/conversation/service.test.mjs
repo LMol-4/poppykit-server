@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AuthorityError, createConversationService, initialConversationState, PublicationError } from '../../dist/index.js';
+import { memoryStore } from './support.mjs';
 
 const endpoint = 'https://api.example.test/poppy/conversations';
 const base = { issuer: 'https://auth.example.test', clientId: 'https://agent.example.test/client', sessionId: 's1', scopes: [], tokenExpiresAt: 9e12, sessionVersion: 1 };
@@ -14,31 +15,6 @@ const principals = {
   otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
   otherClient: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice' },
 };
-
-// Strict JSON in-memory store: detached values, rollback on throw, rejects undefined fields and async callbacks.
-function memoryStore(initial) {
-  let state = structuredClone(initial);
-  let queue = Promise.resolve();
-  const store = {
-    transactions: 0,
-    afterRead: null, // test hook: runs once between a read and the next transaction
-    async read() { const copy = structuredClone(state); const hook = store.afterRead; store.afterRead = null; hook?.(state); return copy; },
-    transaction(change) {
-      const run = queue.then(() => {
-        const draft = structuredClone(state);
-        const result = change(draft);
-        if (result && typeof result.then === 'function') throw new Error('async transaction callback');
-        assert.deepStrictEqual(JSON.parse(JSON.stringify(draft)), draft, 'state must be strict JSON');
-        state = draft; store.transactions++;
-        return result === undefined ? undefined : structuredClone(result);
-      });
-      queue = run.catch(() => {});
-      return run;
-    },
-    set(mutate) { mutate(state); },
-  };
-  return store;
-}
 
 function setup(options = {}) {
   let now = Date.UTC(2026, 9, 19, 12);
@@ -63,6 +39,7 @@ function setup(options = {}) {
     async withAccepted(authority, scopes, action) {
       calls.push({ kind: 'accepted', userId: authority.principal.userId, scopes: [...scopes] });
       if (policy.deny) throw policy.deny;
+      if (!scopes.every(scope => authority.principal.scopes.includes(scope))) throw new AuthorityError('insufficient_scope', { scope: scopes.join(' ') });
       return action();
     },
   };
@@ -430,4 +407,99 @@ test('work is serial per conversation and finish keeps working while more is pen
   assert.equal(page.events.at(-2).message.role, 'company');
   await t.service.finish(second, 'suspended');
   assert.equal(await t.service.claim(), null, 'suspended work is not resumed automatically');
+});
+
+// J15 creates Direct Conversations; until then a child sharing the parent's binding is seeded as J15 will store it.
+function seedChild(t, parentId, principal) {
+  const id = `cnv_child_${principal.accountId ?? 'out'}`;
+  t.store.set(state => {
+    const parent = state.conversations[parentId];
+    state.conversations[id] = { ...structuredClone(parent), id, events: [] };
+    state.work.push({ id: `wrk_${id}`, conversationId: id, message: { id: `msg_${id}`, sender: 'human', text: 'hi' }, authority: { principal, acceptedAt: 0, revocationPolicy: 'stop-account-work' }, phase: 'pending', outputs: {} });
+  });
+  return id;
+}
+const bindingOf = async (t, id) => { const state = await t.store.read(); return state.bindings[state.conversations[id].bindingId]; };
+
+test('requireAccount binds the shared parent/child ownership once and checks the accepted scopes', async () => {
+  const t = setup();
+  const parent = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
+  const child = seedChild(t, parent, principals.aliceSignedIn);
+  const claim = await t.service.claim();
+  t.calls.length = 0;
+  assert.deepEqual(await t.service.requireAccount(claim, ['poppy:read']), { accountId: 'acct_1' });
+  assert.deepEqual(t.calls, [{ kind: 'accepted', userId: 'u_alice', scopes: ['poppy:read'] }]);
+  assert.deepEqual(await bindingOf(t, child), { accountId: 'acct_1' });
+  // Idempotent for the same account; the child sees the binding without its own account use.
+  assert.deepEqual(await t.service.requireAccount(claim, []), { accountId: 'acct_1' });
+  assert.equal((await t.read(child, { as: 'carolSameAccount' })).status, 200);
+  assert.equal((await t.read(child)).status, 403);
+  assert.equal((await t.read(child, { as: 'aliceOtherAccount' })).status, 404);
+});
+
+test('requireAccount refuses signed-out work, missing scopes and stale fences without binding', async () => {
+  const t = setup();
+  const signedOut = (await t.start(hello)).body.conversation_id;
+  const noScopes = (await t.start({ ...hello, id: 'msg_n' }, { as: 'aliceNoScopes' })).body.conversation_id;
+  const first = await t.service.claim();
+  const second = await t.service.claim();
+  await assert.rejects(t.service.requireAccount(first, []), { code: 'sign_in_required' });
+  await assert.rejects(t.service.requireAccount(second, ['poppy:read']), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.requireAccount({ ...second, fence: 'stale' }, []), { code: 'stale_work' });
+  for (const id of [signedOut, noScopes]) assert.deepEqual(await bindingOf(t, id), {});
+});
+
+test('racing account uses on parent and child: exactly one account wins', async () => {
+  for (const order of [0, 1]) {
+    const t = setup();
+    const parent = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
+    seedChild(t, parent, principals.aliceOtherAccount);
+    const claims = [await t.service.claim(), await t.service.claim()];
+    if (order) claims.reverse();
+    const results = await Promise.allSettled(claims.map(claim => t.service.requireAccount(claim, ['poppy:read'])));
+    const won = results.filter(result => result.status === 'fulfilled');
+    assert.equal(won.length, 1);
+    assert.equal(results.find(result => result.status === 'rejected').reason.code, 'sign_in_required');
+    assert.deepEqual(await bindingOf(t, parent), { accountId: won[0].value.accountId });
+  }
+});
+
+test('account use committed between a read and its transaction: the read sees the binding', async () => {
+  const t = setup();
+  const parent = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
+  const child = seedChild(t, parent, principals.aliceSignedIn);
+  const parentClaim = await t.service.claim();
+  // The signed-out read snapshots an unbound child, then the parent's worker binds before the read commits.
+  t.store.afterRead = () => t.service.requireAccount(parentClaim, []);
+  assert.deepEqual((await t.read(child)).body, { error: 'sign_in_required' });
+  // A different account's message racing the binding is refused and leaves no trace.
+  t.store.afterRead = null;
+  const before = (await t.store.read()).conversations[parent].events.length;
+  assert.equal((await t.send(parent, { id: 'msg_o', sender: 'agent', text: 'x' }, { as: 'aliceOtherAccount' })).status, 404);
+  assert.equal((await t.store.read()).conversations[parent].events.length, before);
+  // A worker's history read racing a first account use is rescoped to poppy:read.
+  const t2 = setup();
+  const id = (await t2.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
+  const claim = await t2.service.claim();
+  t2.store.afterRead = state => { state.bindings[id].accountId = 'acct_1'; };
+  t2.calls.length = 0;
+  assert.equal((await t2.service.history(claim)).length, 2);
+  assert.deepEqual(t2.calls.map(call => call.scopes), [[], ['poppy:read']]);
+});
+
+test('history: unbound needs no scope; bound needs the bound account and poppy:read', async () => {
+  const t = setup();
+  const out = (await t.start(hello)).body.conversation_id;
+  const noScopes = (await t.start({ ...hello, id: 'msg_n' }, { as: 'aliceNoScopes' })).body.conversation_id;
+  const [outClaim, noScopesClaim] = [await t.service.claim(), await t.service.claim()];
+  assert.deepEqual((await t.service.history(outClaim)).map(event => event.type), ['message', 'state']);
+  t.store.set(state => { state.bindings[out].accountId = 'acct_1'; state.bindings[noScopes].accountId = 'acct_1'; });
+  // Signed-out work holds no read scope; signed-in work without poppy:read is over its ceiling.
+  await assert.rejects(t.service.history(outClaim), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.history(noScopesClaim), { code: 'insufficient_scope' });
+  const other = (await t.start({ ...hello, id: 'msg_x' }, { as: 'aliceOtherAccount' })).body.conversation_id;
+  const otherClaim = await t.service.claim();
+  assert.equal(otherClaim.conversationId, other);
+  t.store.set(state => { state.bindings[other].accountId = 'acct_1'; });
+  await assert.rejects(t.service.history(otherClaim), { code: 'sign_in_required' });
 });

@@ -44,6 +44,10 @@ export interface ConversationService {
   handle(request: Request): Promise<Response>;
   claim(): Promise<WorkClaim | null>;
   renew(work: WorkRef): Promise<void>;
+  /** Conversation history for a model or handler; account-bound history needs the bound account and poppy:read. */
+  history(work: WorkRef): Promise<ConversationEvent[]>;
+  /** Account-use gate: call before any account read or tool. Checks accepted authority, then binds the shared ownership once. */
+  requireAccount(work: WorkRef, scopes: readonly string[]): Promise<{ accountId: string }>;
   reply(work: WorkRef, outputId: string, message: Message): Promise<void>;
   finish(work: WorkRef, outcome: 'completed' | 'suspended' | 'failed'): Promise<void>;
 }
@@ -63,6 +67,7 @@ export function initialConversationState(): ConversationStoreState {
 class HttpError extends Error {
   constructor(readonly status: number, readonly body: JsonObject, readonly headers: HeadersInit = {}) { super(String(body.error)); }
 }
+class Rescope extends Error {}
 const notFound = () => new HttpError(404, { error: 'conversation_not_found' });
 
 function json(status: number, body: unknown, headers: HeadersInit = {}): Response {
@@ -232,15 +237,28 @@ export function createConversationService(options: ConversationOptions): Convers
   }
 
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
-  async function publish(ref: WorkRef, change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => void): Promise<void> {
-    const stored = (await store.read()).work.find(work => work.id === ref.workId);
-    if (!stored) throw new PublicationError('stale_work');
-    await policy.withAccepted(stored.authority, [], () => store.transaction(draft => {
-      const work = draft.work.find(item => item.id === ref.workId);
-      if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
-      change(draft, work, draft.conversations[work.conversationId]);
-    }));
+  // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
+  async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T): Promise<T> {
+    for (;;) {
+      const before = await store.read();
+      const stored = before.work.find(work => work.id === ref.workId);
+      if (!stored) throw new PublicationError('stale_work');
+      const granted = scopes(before, stored);
+      try {
+        return await policy.withAccepted(stored.authority, granted, () => store.transaction(draft => {
+          const work = draft.work.find(item => item.id === ref.workId);
+          if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
+          if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
+          return change(draft, work, draft.conversations[work.conversationId]);
+        }));
+      } catch (error) {
+        if (!(error instanceof Rescope)) throw error;
+      }
+    }
   }
+  const noScopes = () => [];
+  const boundAccount = (state: ConversationStoreState, work: WorkRecord) => own(state.bindings, state.conversations[work.conversationId].bindingId)?.accountId;
 
   return {
     async handle(request) {
@@ -276,13 +294,32 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     renew(ref) {
-      return publish(ref, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
+      return publish(ref, noScopes, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
+    },
+
+    history(ref) {
+      return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : ['poppy:read'], (draft, work, conversation) => {
+        const accountId = boundAccount(draft, work);
+        if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('sign_in_required');
+        return conversation.events;
+      });
+    },
+
+    requireAccount(ref, scopes) {
+      return publish(ref, () => [...scopes], (draft, work, conversation) => {
+        const accountId = work.authority.principal.accountId;
+        const binding = draft.bindings[conversation.bindingId];
+        // Parent and child share this record, so the first account use wins for both and no other account can.
+        if (accountId === undefined || (binding.accountId ?? accountId) !== accountId) throw new AuthorityError('sign_in_required');
+        binding.accountId = accountId;
+        return { accountId };
+      });
     },
 
     async reply(ref, outputId, message) {
       const parsed = parseMessage(message, { company: true });
       const payload = canonical({ reply: parsed });
-      await publish(ref, (_draft, work, conversation) => {
+      await publish(ref, noScopes, (_draft, work, conversation) => {
         const previous = own(work.outputs, outputId);
         if (previous !== undefined) {
           if (previous !== payload) throw new PublicationError('output_conflict');
@@ -294,7 +331,7 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     finish(ref, outcome) {
-      return publish(ref, (draft, work, conversation) => {
+      return publish(ref, noScopes, (draft, work, conversation) => {
         work.phase = outcome;
         delete work.fence;
         delete work.leaseUntil;
