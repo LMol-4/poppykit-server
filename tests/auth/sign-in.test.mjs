@@ -342,3 +342,14 @@ test('pending authorizations are capped until older ones expire', async () => {
   await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
   await assert.rejects(setup({ maxPendingAuthorizations: 0 }), TypeError);
 });
+
+test('only the current and previous Account Token hashes are retained per lineage', async () => {
+  const env = await signInSetup();
+  let token = (await env.signIn((await env.session()).session_id)).body.refresh_token;
+  const first = token;
+  for (let i = 0; i < 5; i++) token = (await env.refresh(token)).body.refresh_token;
+  assert.equal(Object.keys(env.store.state.refreshTokens).length, 2);
+  expectError(await env.refresh(first), 'invalid_grant');
+  assert.equal((await env.revoke(first)).status, 200);
+  assert.equal((await env.refresh(token)).status, 200, 'a forgotten token cannot revoke the lineage');
+});

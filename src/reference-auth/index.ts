@@ -16,7 +16,7 @@ export interface StateStore<State> {
 // accountId is sticky (spec 4.4): it stays after sign-out; grantId is the active sign-in, null when signed out.
 interface SessionRecord { clientId: string; userId: string; version: number; createdAt: number; expiresAt: number; accountId: string | null; grantId: string | null }
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
-interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string }
+interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
 interface AccessTokenRecord { sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
 interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
@@ -27,7 +27,7 @@ export interface IssuerState {
   generation: string;
   sessions: Record<string, SessionRecord>;
   grants: Record<string, GrantRecord>;
-  refreshTokens: Record<string, string>; // Account Token hash -> grant ID, current and rotated
+  refreshTokens: Record<string, string>; // Account Token hash -> grant ID, current and previous only
   authorizations: Record<string, AuthorizationRecord>;
   codes: Record<string, CodeRecord>;
   accessTokens: Record<string, AccessTokenRecord>;
@@ -283,7 +283,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const scopes = requested ?? lineage.scopes;
         if (!scopes.every(item => lineage.scopes.includes(item))) throw new TokenError('invalid_scope');
         const successor = random(32);
-        lineage.refreshHash = tokenHash(successor); draft.refreshTokens[lineage.refreshHash] = grantId;
+        // Older hashes are forgotten: the previous one is enough to revoke after a lost rotation response.
+        delete draft.refreshTokens[lineage.previousHash];
+        lineage.previousHash = lineage.refreshHash; lineage.refreshHash = tokenHash(successor); draft.refreshTokens[lineage.refreshHash] = grantId;
         record.accountId = lineage.accountId; record.grantId = grantId;
         return { ...grant(id, record, grantId, scopes), refresh_token: successor, refresh_token_expires_in: Math.floor((lineage.expiresAt - at) / 1000) };
       };
@@ -303,7 +305,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         if (record.redirectUri !== redirectUri || tokenHash(codeVerifier!) !== record.codeChallenge) throw new TokenError('invalid_grant');
         const target = existing();
         const grantId = `grt_${random(16)}`;
-        draft.grants[grantId] = { clientId, userId: target.userId, accountId: record.accountId, scopes: record.scopes, expiresAt: at + accountLifetimeMs, revoked: false, refreshHash: '' };
+        draft.grants[grantId] = { clientId, userId: target.userId, accountId: record.accountId, scopes: record.scopes, expiresAt: at + accountLifetimeMs, revoked: false, refreshHash: '', previousHash: '' };
         record.grantId = grantId;
         return signIn(sessionId!, target, grantId);
       }
