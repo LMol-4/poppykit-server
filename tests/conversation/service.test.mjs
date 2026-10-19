@@ -13,6 +13,7 @@ const principals = {
   bob: { ...base, userId: 'u_bob' },
   carolSameAccount: { ...base, userId: 'u_carol', accountId: 'acct_1', scopes: ['poppy:read'] },
   otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
+  otherClientNoScopes: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   otherClient: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice' },
 };
 
@@ -182,6 +183,9 @@ test('ownership moves from User ID to account once bound (spec 7.2)', async () =
     assert.deepEqual(await t.read(id, { as }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
     assert.equal((await t.send(id, next(`x_${as}`), { as })).status, 404);
   }
+  // Without poppy:read, another client on the same account still sees 404 for a real ID, as for an unknown one.
+  assert.deepEqual(await t.read(id, { as: 'otherClientNoScopes' }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
+  assert.deepEqual(await t.read('cnv_unknown', { as: 'otherClientNoScopes' }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
   const signedOut = await t.read(id);
   assert.deepEqual([signedOut.status, signedOut.body], [403, { error: 'sign_in_required' }]);
   assert.equal(signedOut.headers.get('www-authenticate'), 'DPoP error="sign_in_required", algs="ES256"');

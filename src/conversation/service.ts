@@ -135,7 +135,9 @@ export function createConversationService(options: ConversationOptions): Convers
   }
   // Account-bound history needs poppy:read; sending alone does not read history. Other readers fail ownership first.
   const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
-    conversation && history && principal.accountId !== undefined && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
+    // Only an owner may see a scope error; for anyone else ownership fails first with 404, so existence never leaks.
+    conversation && history && conversation.issuer === principal.issuer && conversation.clientId === principal.clientId && principal.accountId !== undefined
+      && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
 
   // Spec 7.2: owned by client_id + User ID until account use, then by client_id + account instead.
   function owned(state: ConversationStoreState, principal: Principal, id: string): ConversationRecord {
