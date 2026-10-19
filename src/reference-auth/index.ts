@@ -6,7 +6,7 @@ import type { AssertionClaims } from '../protocol/wire.js';
 import type { MetadataResolver } from '../network/discovery.js';
 import { secureUrl } from '../network/transport.js';
 import { AuthorityError } from '../auth/authority.js';
-import type { ExternalAuthorityAdapter } from '../auth/authority.js';
+import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
 import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, verifyDpopProof } from '../auth/dpop.js';
 
 export interface StateStore<State> {
@@ -14,12 +14,15 @@ export interface StateStore<State> {
   transaction<T>(change: (draft: State) => T): Promise<T>;
 }
 interface SessionRecord { clientId: string; userId: string; version: number; createdAt: number }
+// Stable lineage of one account sign-in; J10 creates grants at sign-in and keeps the ID across rotation.
+interface GrantRecord { clientId: string; accountId: string; expiresAt: number; revoked: boolean }
 interface AccessTokenRecord { sessionId: string; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
 // Plain JSON. Token records are keyed by SHA-256 hash; plaintext tokens are never stored.
 export interface IssuerState {
   version: 1;
   generation: string;
   sessions: Record<string, SessionRecord>;
+  grants: Record<string, GrantRecord>;
   accessTokens: Record<string, AccessTokenRecord>;
   replay: Record<string, number>; // assertion/proof jti key -> retain until (ms)
   nonces: { value: string; expiresAt: number }[];
@@ -30,6 +33,7 @@ export interface ReferenceIssuerOptions {
   resources?: string[]; // exact supported resource identifiers; absent resource means default
   metadata: MetadataResolver;
   store: StateStore<IssuerState>;
+  coordinator: AuthorityCoordinator; // deployment-wide, shared with conversation work and reset
   now: () => number;
   tokenLifetimeSeconds?: number; // default 3600
   requireDpopNonce?: boolean; // default true at token endpoint
@@ -37,7 +41,8 @@ export interface ReferenceIssuerOptions {
 export interface ReferenceIssuer {
   token(request: Request): Promise<Response>;
   authorizationMetadata(): Record<string, unknown>;
-  authority: Pick<ExternalAuthorityAdapter, 'issuer' | 'revocationVisibility' | 'introspect'>;
+  authority: ExternalAuthorityAdapter;
+  disconnect(clientId: string, accountId: string): Promise<void>;
 }
 
 const JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
@@ -51,7 +56,7 @@ const tokenHash = (token: string) => createHash('sha256').update(token).digest('
 const own = <T>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
 
 export function initialIssuerState(): IssuerState {
-  return { version: 1, generation: random(16), sessions: {}, accessTokens: {}, replay: {}, nonces: [] };
+  return { version: 1, generation: random(16), sessions: {}, grants: {}, accessTokens: {}, replay: {}, nonces: [] };
 }
 
 class TokenError extends Error {
@@ -180,6 +185,37 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     return json(200, { access_token: accessToken, token_type: 'DPoP', expires_in: lifetimeSeconds, scope: '', session_id: id, signed_in: false });
   }
 
+  // Plain checks over one issuer snapshot; only the policy wrappers below take the coordinator, once.
+  function liveGrant(state: IssuerState, principal: Principal): boolean {
+    if (principal.accountId === undefined && principal.grantId === undefined) return true;
+    const grant = principal.grantId === undefined ? undefined : own(state.grants, principal.grantId);
+    return !!grant && !grant.revoked && grant.expiresAt > now() && grant.clientId === principal.clientId && grant.accountId === principal.accountId;
+  }
+  function requireScopes(granted: readonly string[], scopes: readonly string[]): void {
+    if (!scopes.every(scope => granted.includes(scope))) throw new AuthorityError('insufficient_scope', { scope: scopes.join(' ') });
+  }
+  // Order: coordinator -> issuer snapshot -> caller's conversation transaction, released in run's finally.
+  const policy: AuthorityPolicy = {
+    withCurrent: (principal, scopes, action) => options.coordinator.run(async () => {
+      const state = await store.read();
+      const session = own(state.sessions, principal.sessionId);
+      if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
+        || session.userId !== principal.userId || session.version !== principal.sessionVersion || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
+      requireScopes(principal.scopes, scopes);
+      return action();
+    }),
+    withAccepted: (authority, scopes, action) => options.coordinator.run(async () => {
+      const state = await store.read();
+      const { principal } = authority;
+      // Admission token expiry is ignored: accepted work outlives its token. A reset (new generation) never is.
+      if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation) throw new AuthorityError('invalid_token');
+      if (authority.revocationPolicy !== 'allow-accepted-work-to-finish' && !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
+      // The ceiling is the accepted scopes; a later, broader sign-in never widens old work.
+      requireScopes(principal.scopes, scopes);
+      return action();
+    }),
+  };
+
   return {
     async token(request) {
       try { return await issue(request); } catch (error) {
@@ -200,7 +236,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     },
     authority: {
       issuer,
-      revocationVisibility: 'immediate: every introspection reads the shared issuer store',
+      revocationVisibility: 'immediate: every introspection and policy check reads the shared issuer store; policy checks are ordered by the shared coordinator',
       async introspect(token, resource) {
         const state = await store.read();
         const record = own(state.accessTokens, tokenHash(token));
@@ -210,7 +246,12 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
           principal: { issuer, clientId: session.clientId, userId: session.userId, sessionId: record.sessionId, scopes: [...record.scopes], tokenExpiresAt: record.expiresAt, sessionVersion: session.version, issuerGeneration: state.generation },
           dpopJkt: record.jkt,
         };
-      }
-    }
+      },
+      policy,
+    },
+    // shortcut: sessions are not linked to grants yet, so revoking only ends account authority; J10 also signs out the lineage's sessions.
+    disconnect: (clientId, accountId) => options.coordinator.run(() => store.transaction(draft => {
+      for (const grant of Object.values(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) grant.revoked = true;
+    })),
   };
 }

@@ -5,6 +5,7 @@ import { SignJWT } from 'jose';
 import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { createRequestAuthenticator } from '../../dist/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
+import { memoryCoordinator } from '../conversation/support.mjs';
 
 const ISSUER = 'https://auth.shop.test';
 const TOKEN_ENDPOINT = 'https://auth.shop.test/oauth/token';
@@ -33,7 +34,7 @@ async function setup(overrides = {}) {
     async resolveClient(id) { env.calls.client++; if (id !== CLIENT) throw new Error('unknown client'); return { client_id: CLIENT, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [], token_endpoint_auth_method: 'private_key_jwt' }; },
     async resolveJwks(uri, settings = {}) { assert.equal(uri, JWKS_URI); if (settings.refresh) { env.calls.refresh++; return structuredClone(env.refreshedJwks); } env.calls.jwks++; await env.onJwks?.(); return structuredClone(env.jwks); },
   };
-  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], resources: [RESOURCE], metadata: env.metadata, store: env.store, now: () => clock.now, ...overrides });
+  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, ...overrides });
   env.assertion = (claims = {}, { key = identity, header = {} } = {}) => {
     const iat = Math.floor(clock.now / 1000);
     return new SignJWT({ iss: CLIENT, sub: 'usr_1', aud: ISSUER, iat, exp: iat + 60, jti: randomUUID(), ...claims }).setProtectedHeader({ alg: 'ES256', kid: 'k1', ...header }).sign(key.privateKey);
