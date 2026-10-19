@@ -254,7 +254,11 @@ test('invalid cursor, wait and malformed requests are rejected without acceptanc
   }
   assert.equal((await t.call('POST', '', { body: '{not json' })).status, 400);
   assert.equal((await t.call('POST', '', { body: JSON.stringify({ message: { id: 'msg_big', sender: 'agent', text: 'x'.repeat(1048577) } }) })).status, 400);
-  assert.equal((await t.call('POST', '', { body: { parent_conversation_id: body.conversation_id, message: { id: 'msg_d', sender: 'human', text: 'x' } } })).status, 400);
+  // A Direct Conversation needs a valid parent ID and the User's own words.
+  for (const parent of ['bad id', 42]) {
+    assert.equal((await t.call('POST', '', { body: { parent_conversation_id: parent, message: { id: 'msg_d', sender: 'human', text: 'x' } } })).status, 400);
+  }
+  assert.equal((await t.call('POST', '', { body: { parent_conversation_id: body.conversation_id, message: { id: 'msg_d', sender: 'agent', text: 'x' } } })).status, 400);
   assert.equal((await t.store.read()).work.length, before);
   // The rejected IDs were never recorded, so they can still be used.
   assert.equal((await t.send(body.conversation_id, { id: 'msg_c', sender: 'agent', text: 'x' })).status, 202);
