@@ -148,6 +148,41 @@ test('handoff queues and cancels the agent attempt; a repeat changes nothing; no
   assert.equal((await t.store.read()).work[0].phase, 'cancelled');
 });
 
+test('messages sent while queued wait for the person; with no staff the agent answers only those', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.service.claim();
+  await t.handoff(id);
+  assert.equal((await t.send(id, { id: 'msg_2', sender: 'agent', text: 'More detail for the person.' })).body.status, 'queued');
+  assert.equal((await t.send(id, { id: 'msg_ctx', sender: 'agent', context: { user_available: false } })).status, 202);
+  assert.equal(await t.service.claim(), null, 'messages while queued create no automated work');
+  await t.service.noHumanAvailable(operator, id, 'Nobody is available right now.');
+  const page = (await t.read(id)).body;
+  assert.deepEqual([page.status, page.responder], ['working', 'agent']);
+  const next = await t.service.claim();
+  assert.equal(next.message.id, 'msg_2');
+  await t.service.finish(next, 'completed');
+  assert.equal(await t.service.claim(), null, 'the handed-off message and the context update are not retried');
+  assert.equal((await t.read(id)).body.status, 'idle');
+});
+
+test('returning to the agent queues user messages the person left unanswered', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  const person = await t.service.joinHuman(operator, id);
+  await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
+  await t.send(id, { id: 'msg_2', sender: 'human', text: 'One more thing.' });
+  await t.send(id, { id: 'msg_3', sender: 'human', text: 'And another.' });
+  await t.service.returnToAgent(operator, id);
+  assert.deepEqual([(await t.read(id)).body.status, (await t.read(id)).body.responder], ['working', 'agent']);
+  const first = await t.service.claim();
+  assert.equal(first.message.id, 'msg_2');
+  assert.deepEqual(first.message, { id: 'msg_2', sender: 'human', text: 'One more thing.' });
+  await t.service.finish(first, 'completed');
+  assert.equal((await t.service.claim()).message.id, 'msg_3');
+});
+
 test('a person joins, publishes as human, then returns the conversation to the agent', async () => {
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;
