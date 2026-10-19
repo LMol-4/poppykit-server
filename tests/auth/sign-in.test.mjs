@@ -323,3 +323,22 @@ test('the grant type alone picks the branch: a stray assertion never substitutes
   assert.equal(Object.keys(env.store.state.accessTokens).length, 1, 'only the first signed-out token was issued');
   assert.equal((await env.exchange(session.session_id, grant)).status, 200, 'the code was not consumed');
 });
+
+test('pending authorizations are capped until older ones expire', async () => {
+  const env = await signInSetup({ maxPendingAuthorizations: 2 });
+  await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  env.clock.now += 300_000;
+  const second = await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  const refused = await env.issuer.beginAuthorization(authorizeRequest(), BINDING).catch(error => error);
+  assert.ok(refused instanceof AuthorizationError);
+  assert.equal(refused.code, 'temporarily_unavailable');
+  assert.deepEqual(Object.fromEntries(refused.redirectTo.searchParams), { error: 'temporarily_unavailable', state: 'state-1', iss: ISSUER });
+  assert.equal(Object.keys(env.store.state.authorizations).length, 2);
+  // Completing one frees a slot; so does expiry.
+  await env.issuer.completeAuthorization(second.id, BINDING, { denied: true });
+  await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  await assert.rejects(env.issuer.beginAuthorization(authorizeRequest(), BINDING), { code: 'temporarily_unavailable' });
+  env.clock.now += 300_000;
+  await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  await assert.rejects(setup({ maxPendingAuthorizations: 0 }), TypeError);
+});

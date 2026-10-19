@@ -45,6 +45,7 @@ export interface ReferenceIssuerOptions {
   tokenLifetimeSeconds?: number; // default 3600
   accountLifetimeSeconds?: number; // default 2592000, rotation never extends it
   requireDpopNonce?: boolean; // default true at token endpoint
+  maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
@@ -123,14 +124,15 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const { issuer, metadata, store, now } = options;
   if (secureUrl(issuer).search) throw new TypeError('issuer');
   secureUrl(options.tokenEndpoint); secureUrl(options.revocationEndpoint);
-  const seconds = (value: number | undefined, fallback: number, name: string) => {
+  const positive = (value: number | undefined, fallback: number, name: string) => {
     const result = value ?? fallback;
     if (!Number.isSafeInteger(result) || result <= 0) throw new TypeError(name);
     return result;
   };
-  const lifetimeSeconds = seconds(options.tokenLifetimeSeconds, 3600, 'tokenLifetimeSeconds');
+  const lifetimeSeconds = positive(options.tokenLifetimeSeconds, 3600, 'tokenLifetimeSeconds');
   const lifetimeMs = lifetimeSeconds * 1000;
-  const accountLifetimeMs = seconds(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
+  const accountLifetimeMs = positive(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
+  const maxPending = positive(options.maxPendingAuthorizations, 1000, 'maxPendingAuthorizations');
   const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
@@ -386,6 +388,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     revoke: request => respond(request, revokeToken),
 
     // Validates the whole request before persisting anything; the host renders login and consent from the view.
+    // Unauthenticated: hosts must rate-limit their /authorize route; the pending cap only bounds state and coordinator time.
     async beginAuthorization(request, browserBinding) {
       if (typeof browserBinding !== 'string' || !browserBinding) throw new TypeError('browserBinding');
       const params = uniqueParams(new URL(request.url).searchParams, () => new AuthorizationError('invalid_request'));
@@ -410,6 +413,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       return commit(draft => {
         if (draft.generation !== generation) throw new AuthorizationError('invalid_request');
         const at = now(); prune(draft, at);
+        if (Object.keys(draft.authorizations).length >= maxPending) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
         draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt };
         return { id, clientId, clientName: client.client_name, scopes, expiresAt };
