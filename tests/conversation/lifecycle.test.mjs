@@ -166,6 +166,19 @@ test('messages sent while queued wait for the person; with no staff the agent an
   assert.equal((await t.read(id)).body.status, 'idle');
 });
 
+test('no-staff cannot publish into a parent while its Direct Conversation is open', async () => {
+  const t = staffSetup();
+  const parent = (await t.start(hello)).body.conversation_id;
+  await t.handoff(parent);
+  const child = (await t.direct(parent, human('msg_d1'))).body.conversation_id;
+  const before = (await t.store.read()).conversations[parent].events;
+  await assert.rejects(t.service.noHumanAvailable(operator, parent, 'Nobody.'), { code: 'stale_work' });
+  assert.deepEqual((await t.store.read()).conversations[parent].events, before);
+  await t.close(child);
+  await t.service.noHumanAvailable(operator, parent, 'Nobody.');
+  assert.deepEqual([(await t.read(parent)).body.status, (await t.read(parent)).body.events.at(-2).message.text], ['idle', 'Nobody.']);
+});
+
 test('returning to the agent queues user messages the person left unanswered', async () => {
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;

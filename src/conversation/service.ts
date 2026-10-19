@@ -277,6 +277,7 @@ export function createConversationService(options: ConversationOptions): Convers
           if (parent.status === 'closed') throw closed();
           if (parent.childId !== undefined) throw directOpen(parent.childId);
           // Parent automation pauses while the Direct Conversation is open; its current attempt can no longer publish.
+          // A person handling the parent loses their claim but stays responder: staff hosts rejoin or returnToAgent after the child closes.
           fence(draft, parent.id, 'pending');
           parent.childId = id;
           bindingId = parent.bindingId;
@@ -521,6 +522,8 @@ export function createConversationService(options: ConversationOptions): Convers
       if (typeof reason !== 'string' || reason === '') return Promise.reject(new TypeError('reason'));
       return staff(operator, conversationId, true, (draft, conversation) => {
         if (conversation.status !== 'queued') return;
+        // Parent publication waits until its Direct Conversation closes.
+        if (conversation.childId !== undefined) throw new PublicationError('stale_work');
         // Messages sent while queued were meant for a person; the agent answers them now.
         requeueUnanswered(draft, conversation, conversation.events.findLastIndex(event => event.type === 'state' && event.status === 'queued'));
         addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: reason } });
