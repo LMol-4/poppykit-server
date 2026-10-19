@@ -149,6 +149,20 @@ test('replay retention survives a restart and expires with the assertion', async
   assert.ok(Object.values(env.store.state.replay).every(until => until >= env.clock.now), 'expired replay entries are pruned');
 });
 
+test('freshness is rechecked at commit when the clock advances during the JWKS fetch', async () => {
+  const env = await setup(); await env.challenge(); const t0 = Math.floor(NOW / 1000);
+  const long = { iat: t0 + 50, exp: t0 + 350 };
+  const replayed = await env.proof();
+  assert.equal((await env.send({}, { dpop: replayed })).status, 200);
+  env.clock.now = NOW + 59_000; env.onJwks = () => { env.clock.now += 2_000; };
+  expectError(await env.send({ assertion: await env.assertion(long), client_assertion: await env.clientAssertion(long) }, { dpop: replayed }), 'invalid_dpop_proof');
+  env.clock.now = NOW + 59_000;
+  expectError(await env.send({ assertion: await env.assertion(long), client_assertion: await env.clientAssertion({ iat: t0, exp: t0 + 60 }) }), 'invalid_client');
+  env.clock.now = NOW + 59_000;
+  expectError(await env.send({ assertion: await env.assertion({ iat: t0, exp: t0 + 60 }), client_assertion: await env.clientAssertion(long) }), 'invalid_grant');
+  assert.equal(Object.keys(env.store.state.sessions).length, 1);
+});
+
 test('token-endpoint DPoP proofs are verified against the configured URL with replay and key separation', async () => {
   const env = await setup(); await env.challenge();
   const replayed = await env.proof();

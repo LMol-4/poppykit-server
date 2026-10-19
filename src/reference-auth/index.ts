@@ -132,10 +132,15 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Identity keys and DPoP keys must differ (spec 4.1).
     for (const key of keys.keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
 
-    const accessToken = random(32); const userId = session.sub; const issuedAt = now();
+    const accessToken = random(32); const userId = session.sub;
     const id = await store.transaction(draft => {
       // A reset between verification and commit must not recreate state from a stale verification.
       if (draft.generation !== generation) throw new TokenError('invalid_grant');
+      // Re-check freshness at commit time with the same clock used to prune, so a slow fetch cannot outlive its replay entry.
+      const issuedAt = now();
+      if ((proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000 < issuedAt) throw new TokenError('invalid_dpop_proof');
+      if (client.exp * 1000 <= issuedAt) throw new TokenError('invalid_client');
+      if (session.exp * 1000 <= issuedAt) throw new TokenError('invalid_grant');
       for (const [key, until] of Object.entries(draft.replay)) if (until < issuedAt) delete draft.replay[key];
       for (const [key, record] of Object.entries(draft.accessTokens)) if (record.expiresAt <= issuedAt) delete draft.accessTokens[key];
       // Client and session assertions share one jti namespace per client.
