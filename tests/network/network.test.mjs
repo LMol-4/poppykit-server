@@ -95,6 +95,8 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
   const server = createServer({ key, cert }, (request, response) => {
     requests++;
     if (request.url === '/redirect') { response.writeHead(302, { location: `https://localhost:${port}/ok` }); response.end(); }
+    else if (request.url === '/to-http') { response.writeHead(302, { location: `http://localhost:${port}/ok` }); response.end(); }
+    else if (request.url === '/to-ip') { response.writeHead(302, { location: `https://127.0.0.1:${port}/ok` }); response.end(); }
     else if (request.url === '/loop') { response.writeHead(302, { location: '/loop' }); response.end(); }
     else if (request.url === '/large') response.end('x'.repeat(2048));
     else if (request.url === '/slow') { response.writeHead(200); response.flushHeaders(); }
@@ -112,6 +114,11 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
   const before = requests;
   const redirected = await transport.fetch(new Request(`https://localhost:${port}/redirect`, { headers: { authorization: 'DPoP secret', DPoP: 'proof' } })); assert.equal(redirected.status, 302); assert.equal(requests, before + 1);
   const discovered = await transport.fetch(target('/redirect'), { mode: 'discovery' }); assert.equal(discovered.url, `https://localhost:${port}/ok`);
+  for (const [path, code] of [['/to-http', 'invalid_url'], ['/to-ip', 'blocked_address']]) {
+    const seen = requests;
+    await assert.rejects(transport.fetch(target(path), { mode: 'discovery' }), { code }, path);
+    assert.equal(requests, seen + 1, `${path}: redirect target never reached the server`);
+  }
   await assert.rejects(createNodeTransport({ ...options, maxRedirects: 1 }).fetch(target('/loop'), { mode: 'discovery' }), { code: 'redirect_limit' });
   await assert.rejects(createNodeTransport({ ...options, maxResponseBytes: 100 }).fetch(target('/large')), { code: 'body_limit' });
   await assert.rejects(createNodeTransport({ ...options, timeoutMs: 100 }).fetch(target('/slow')), { code: 'timeout' });
@@ -142,8 +149,56 @@ test('hostile URLs and discovery-mode requests are rejected before any connectio
 test('assertion and DPoP claim codecs enforce spec shapes and keep unknown claims', () => {
   const claims = { iss: 'https://agent.example/agent.json', sub: 'usr_1', aud: 'https://auth.example.com', iat: 1790900000, exp: 1790900060, jti: 'V6vJGs2ixBAvGdaQgGaTzg', extra: 1 };
   assert.deepEqual(wire.parseAssertionClaims(claims), claims);
-  for (const bad of [{ aud: ['https://auth.example.com'] }, { exp: 1790900301 }, { exp: 1790900000 }, { jti: 'short' }, { iat: 1.5 }, { sub: undefined }]) assert.throws(() => wire.parseAssertionClaims({ ...claims, ...bad }), { name: 'ValidationError' });
+  for (const bad of [{ aud: ['https://auth.example.com'] }, { exp: 1790900301 }, { exp: 1790900000 }, { jti: 'x'.repeat(15) }, { jti: 'x'.repeat(257) }, { iat: 1.5 }, { sub: undefined }]) assert.throws(() => wire.parseAssertionClaims({ ...claims, ...bad }), { name: 'ValidationError' });
   const proof = { jti: 'e1j3V_bKic8-LAEB', htm: 'POST', htu: 'https://api.example.com/orders', iat: 1790900000, ath: 'abc', nonce: 'n' };
   assert.deepEqual(wire.parseDpopClaims(proof), proof);
   for (const bad of [{ htu: 'https://api.example.com/o?x=1' }, { htu: 'https://api.example.com/o#f' }, { htu: 'http://api.example.com/' }, { htm: 1 }, { iat: 0 }, { ath: 5 }]) assert.throws(() => wire.parseDpopClaims({ ...proof, ...bad }), { name: 'ValidationError' });
+});
+test('every blocked range has a denied sample and a public neighbour', () => {
+  const table = [
+    ['0.1.2.3', false], ['1.0.0.1', true], ['10.255.255.255', false], ['11.0.0.1', true],
+    ['100.64.0.1', false], ['100.128.0.1', true], ['127.0.0.2', false], ['128.0.0.1', true],
+    ['169.254.169.254', false], ['169.255.0.1', true], ['172.16.0.1', false], ['172.32.0.1', true],
+    ['192.0.0.9', false], ['192.0.1.1', true], ['192.0.2.7', false], ['192.88.99.1', false],
+    ['192.168.0.1', false], ['192.169.0.1', true], ['198.18.0.1', false], ['198.20.0.1', true],
+    ['198.51.100.9', false], ['198.51.101.1', true], ['203.0.113.9', false], ['203.0.114.1', true],
+    ['224.0.0.1', false], ['255.255.255.255', false], ['223.255.255.255', true],
+    ['2606:4700::1', true], ['2000::1', true], ['1fff::1', false], ['4000::1', false],
+    ['2001::1', false], ['2001:1ff::1', false], ['2001:200::1', true], ['2001:db8::1', false],
+    ['2002::1', false], ['3fff::1', false], ['3fff:1000::1', true], ['::', false], ['::1', false],
+    ['::ffff:8.8.8.8', false], ['fe80::1', false], ['fc00::1', false], ['ff02::1', false],
+  ];
+  for (const [address, expected] of table) assert.equal(isPublicAddress(address), expected, address);
+});
+test('assertion jti accepts standard base64 and the length edges only', () => {
+  const claims = { iss: 'i', sub: 's', aud: 'a', iat: 1790900000, exp: 1790900060 };
+  for (const jti of ['VGhpcyBpcyAxNiBieXRlcw==', 'x'.repeat(16), 'x'.repeat(256)]) assert.equal(wire.parseAssertionClaims({ ...claims, jti }).jti, jti);
+});
+test('discovery mode rejects a caller-set Host header that would follow redirects', async () => {
+  await assert.rejects(createNodeTransport().fetch(new Request('https://8.8.8.8/', { headers: { host: '8.8.8.8' } }), { mode: 'discovery' }), { code: 'invalid_url' });
+});
+test('zoned IPv6 addresses fail closed instead of throwing', () => {
+  assert.equal(isPublicAddress('fe80::1%eth0'), false);
+  assert.equal(isPublicAddress('2606:4700:4700::1111%eth0'), false);
+});
+test('mixed DNS answers never dial a private address; all-private fails closed', async t => {
+  const key = await readFile(new URL('./fixtures/localhost-key.pem', import.meta.url));
+  const cert = await readFile(new URL('./fixtures/localhost-cert.pem', import.meta.url));
+  const server = createServer({ key, cert }, (_request, response) => response.end('ok'));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const port = server.address().port;
+  const original = dns.lookup; let answers = [];
+  t.after(() => { dns.lookup = original; syncBuiltinESMExports(); server.closeAllConnections(); server.close(); });
+  dns.lookup = (_host, _options, callback) => callback(null, answers.map(address => ({ address, family: 4 })));
+  syncBuiltinESMExports();
+  const transport = createNodeTransport({ ca: cert.toString(), timeoutMs: 2000, localExceptions: [{ hostname: 'localhost', addresses: ['127.0.0.1'] }] });
+  const dialed = []; const connect = tls.connect;
+  tls.connect = (options, ...rest) => { dialed.push(options.host); return connect(options, ...rest); };
+  syncBuiltinESMExports();
+  try {
+    answers = ['10.0.0.1', '127.0.0.1'];
+    assert.equal((await transport.fetch(new Request(`https://localhost:${port}/`))).status, 200);
+    answers = ['10.0.0.1', '192.168.0.1'];
+    await assert.rejects(transport.fetch(new Request(`https://localhost:${port}/`)), { code: 'blocked_address' });
+  } finally { tls.connect = connect; syncBuiltinESMExports(); }
+  assert.equal(dialed.length, 2);
 });

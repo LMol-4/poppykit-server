@@ -31,10 +31,26 @@ export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDoc
   if ('auth' in doc) {
     const auth = object(doc.auth, 'auth'); authorizationMetadataUrl(url(auth.issuer, 'issuer'));
     for (const key of ['direct', 'device']) if (key in auth) scopes(object(auth[key], key).scopes);
-    if ('mediated' in auth) { const mediated = object(auth.mediated, 'mediated'); url(mediated.endpoint, 'mediated.endpoint'); scopes(mediated.scopes); if (!Array.isArray(mediated.fields) || !mediated.fields.length) throw new ValidationError('mediated.fields'); for (const field of mediated.fields) { const item = object(field); string(item.name, 'field.name'); string(item.label, 'field.label'); member(item.secret, [true, false], 'field.secret'); } }
+    if ('mediated' in auth) {
+      const mediated = object(auth.mediated, 'mediated');
+      url(mediated.endpoint, 'mediated.endpoint'); scopes(mediated.scopes);
+      if (!Array.isArray(mediated.fields) || !mediated.fields.length) throw new ValidationError('mediated.fields');
+      for (const field of mediated.fields) {
+        const item = object(field);
+        string(item.name, 'field.name'); string(item.label, 'field.label'); member(item.secret, [true, false], 'field.secret');
+      }
+    }
     if ('custom_scopes' in auth) Object.values(object(auth.custom_scopes)).forEach(value => string(value, 'custom_scopes', false));
   }
-  if ('agent' in doc) { const protocols = object(doc.agent, 'agent').protocols; if (!Array.isArray(protocols) || !protocols.length) throw new ValidationError('protocols'); for (const protocol of protocols) { const item = object(protocol); string(item.type, 'protocol.type'); url(item.endpoint, 'protocol.endpoint'); if ('resource' in item) url(item.resource, 'protocol.resource'); } }
+  if ('agent' in doc) {
+    const protocols = object(doc.agent, 'agent').protocols;
+    if (!Array.isArray(protocols) || !protocols.length) throw new ValidationError('protocols');
+    for (const protocol of protocols) {
+      const item = object(protocol);
+      string(item.type, 'protocol.type'); url(item.endpoint, 'protocol.endpoint');
+      if ('resource' in item) url(item.resource, 'protocol.resource');
+    }
+  }
   if ('apis' in doc) { if (!Array.isArray(doc.apis)) throw new ValidationError('apis'); for (const api of doc.apis) { const item = object(api); string(item.type, 'api.type'); string(item.description, 'api.description'); url(item.url, 'api.url'); if ('resource' in item) url(item.resource, 'api.resource'); } }
   if ('feedback' in doc) url(object(doc.feedback).endpoint, 'feedback.endpoint');
   if ('extensions' in doc) for (const extension of Object.values(object(doc.extensions))) { const item = object(extension); string(item.version, 'extension.version'); if ('endpoint' in item) url(item.endpoint, 'extension.endpoint'); }
@@ -100,7 +116,15 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
     },
     async resolveClient(clientId) { validateClientId(clientId); const found = await get(clientId, value => parseClientMetadata(value, clientId), 'endpoint'); return parseClientMetadata(found.value, clientId); },
     async resolveJwks(uri, settings = {}) {
-      const validate = (value: unknown) => { const jwks = object(value); if (!Array.isArray(jwks.keys) || jwks.keys.length > 100) throw new ValidationError('jwks.keys'); for (const key of jwks.keys) { const item = object(key); string(item.kty, 'jwk.kty'); for (const secret of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) if (secret in item) throw new ValidationError('jwk.private'); } };
+      const validate = (value: unknown) => {
+        const jwks = object(value);
+        if (!Array.isArray(jwks.keys) || jwks.keys.length > 100) throw new ValidationError('jwks.keys');
+        for (const key of jwks.keys) {
+          const item = object(key);
+          string(item.kty, 'jwk.kty');
+          for (const secret of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) if (secret in item) throw new ValidationError('jwk.private');
+        }
+      };
       if (settings.refresh) { const last = refreshes.get(uri); if (last !== undefined && now() - last < 60000) throw new ValidationError('jwks.refresh_limited'); refreshes.set(uri, now()); }
       const found = await get(uri, validate, 'discovery', settings.refresh); return found.value as JsonObject;
     }

@@ -150,8 +150,8 @@ export interface DpopClaims { jti: string; htm: string; htu: string; iat: number
 export function parseAssertionClaims(value: unknown): AssertionClaims {
   const claims = object(value, 'claims');
   for (const key of ['iss', 'sub', 'aud', 'jti']) string(claims[key], key);
-  // jti needs >=128 random bits: at least 22 base64url characters
-  if (!/^[A-Za-z0-9_-]{22,}$/.test(claims.jti as string)) throw new ValidationError('jti');
+  // 128 random bits is at least 16 bytes; cap length since jti lands in the replay store. Encoding is not constrained.
+  if ((claims.jti as string).length < 16 || (claims.jti as string).length > 256) throw new ValidationError('jti');
   positive(claims.iat, 'iat'); positive(claims.exp, 'exp');
   if ((claims.exp as number) <= (claims.iat as number) || (claims.exp as number) - (claims.iat as number) > 300) throw new ValidationError('exp');
   return claims as AssertionClaims;

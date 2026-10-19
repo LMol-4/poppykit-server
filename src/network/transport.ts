@@ -2,7 +2,7 @@ import { request as httpsRequest, Agent } from 'node:https';
 import { connect, rootCertificates } from 'node:tls';
 import type { ConnectionOptions } from 'node:tls';
 import { lookup } from 'node:dns';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 
 export interface HttpTransport { fetch(request: Request, options?: { mode?: 'endpoint' | 'discovery' }): Promise<Response> }
 export interface NetworkOptions { timeoutMs?: number; maxResponseBytes?: number; maxRequestBytes?: number; maxRedirects?: number; localExceptions?: readonly { hostname: string; addresses: readonly string[] }[]; ca?: string }
@@ -16,18 +16,39 @@ export function secureUrl(value: string): URL {
   return url;
 }
 function normalizedAddress(value: string): string { return value.replace(/^\[|\]$/g, '').toLowerCase(); }
+const blockedV4 = new BlockList();
+for (const [network, prefix] of [
+  ['0.0.0.0', 8], // "this" network
+  ['10.0.0.0', 8], // private
+  ['100.64.0.0', 10], // carrier-grade NAT
+  ['127.0.0.0', 8], // loopback
+  ['169.254.0.0', 16], // link-local
+  ['172.16.0.0', 12], // private
+  ['192.0.0.0', 24], // IETF protocol assignments
+  ['192.0.2.0', 24], // documentation
+  ['192.88.99.0', 24], // 6to4 relay anycast
+  ['192.168.0.0', 16], // private
+  ['198.18.0.0', 15], // benchmarking
+  ['198.51.100.0', 24], // documentation
+  ['203.0.113.0', 24], // documentation
+  ['224.0.0.0', 3], // multicast and reserved (224.0.0.0 to 255.255.255.255)
+] as const) blockedV4.addSubnet(network, prefix, 'ipv4');
+// IPv6 is allow-listed: only global unicast 2000::/3 minus special-purpose ranges.
+const blockedV6 = new BlockList();
+for (const [network, prefix] of [
+  ['2001::', 23], // IETF protocol assignments (Teredo etc.)
+  ['2001:db8::', 32], // documentation
+  ['2002::', 16], // 6to4
+  ['3fff::', 20], // documentation
+] as const) blockedV6.addSubnet(network, prefix, 'ipv6');
+const globalV6 = new BlockList();
+globalV6.addSubnet('2000::', 3, 'ipv6');
 export function isPublicAddress(value: string): boolean {
   const address = normalizedAddress(value);
-  if (isIP(address) === 4) {
-    const [a, b, c] = address.split('.').map(Number);
-    return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 || b === 2 || (b === 88 && c === 99))) || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) || (a === 203 && b === 0 && c === 113));
-  }
-  if (isIP(address) !== 6) return false;
-  // Only global unicast; mapped, transition, documentation and local ranges fail closed.
-  const expanded = new URL(`https://[${address}]/`).hostname.slice(1, -1);
-  const first = parseInt(expanded.split(':')[0], 16);
-  const second = parseInt(expanded.split(':')[1] || '0', 16);
-  return first >= 0x2000 && first <= 0x3fff && !(first === 0x2001 && (second < 0x200 || second === 0xdb8)) && first !== 0x2002 && !(first === 0x3fff && second < 0x1000);
+  if (isIP(address) === 4) return !blockedV4.check(address, 'ipv4');
+  // Zoned addresses (fe80::1%eth0) fail closed.
+  if (isIP(address) !== 6 || address.includes('%')) return false;
+  return globalV6.check(address, 'ipv6') && !blockedV6.check(address, 'ipv6');
 }
 export function createNodeTransport(options: NetworkOptions = {}): HttpTransport {
   const limits = { timeoutMs: options.timeoutMs ?? 15000, maxResponseBytes: options.maxResponseBytes ?? 1048576, maxRequestBytes: options.maxRequestBytes ?? 1048576, maxRedirects: options.maxRedirects ?? 5 };
@@ -51,7 +72,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
       }
       let url = secureUrl(request.url);
       if (request.headers.has('host') && request.headers.get('host') !== url.host) throw new TransportError('invalid_url');
-      if (settings.mode === 'discovery' && (request.method !== 'GET' || body || ['authorization', 'dpop', 'cookie', 'proxy-authorization'].some(key => request.headers.has(key)))) throw new TransportError('invalid_url');
+      if (settings.mode === 'discovery' && (request.method !== 'GET' || body || ['authorization', 'dpop', 'cookie', 'proxy-authorization', 'host'].some(key => request.headers.has(key)))) throw new TransportError('invalid_url');
       for (let redirects = 0; ; redirects++) {
         signal.throwIfAborted();
         const hostname = normalizedAddress(url.hostname);
@@ -71,7 +92,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
           const finish = (error: Error | null) => { if (settled) return; settled = true; signal.removeEventListener('abort', abort); if (error) { socket.destroy(); callback(error); } else callback(null, socket); };
           const abort = () => finish(new TransportError(controller.signal.aborted ? 'timeout' : 'network_error'));
           signal.addEventListener('abort', abort, { once: true });
-          socket.once('error', () => finish(new TransportError('network_error')));
+          socket.once('error', error => finish(error instanceof TransportError ? error : new TransportError('network_error')));
           socket.once('secureConnect', () => finish(socket.remoteAddress && allowed(hostname, socket.remoteAddress) ? null : new TransportError('blocked_address')));
           return undefined;
         }) as typeof agent.createConnection;
