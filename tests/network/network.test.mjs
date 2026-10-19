@@ -202,3 +202,80 @@ test('mixed DNS answers never dial a private address; all-private fails closed',
   } finally { tls.connect = connect; syncBuiltinESMExports(); }
   assert.equal(dialed.length, 2);
 });
+const bounded = (clock, calls, extra = {}) => createMetadataResolver({ async fetch(request) {
+  calls.push(request.url);
+  const id = request.url; return Response.json({ client_id: id, client_name: 'A', jwks_uri: `${new URL(id).origin}/k`, redirect_uris: [], token_endpoint_auth_method: 'private_key_jwt' }, { headers: { 'cache-control': `max-age=${id.includes('short') ? 50 : 100}` } });
+} }, { now: () => clock.t, ...extra });
+test('metadata cache stays at its cap and evicts expired then oldest entries', async () => {
+  const clock = { t: 0 }; const calls = [];
+  const resolver = bounded(clock, calls, { maxEntries: 3 });
+  for (const n of [1, 2, 3, 4]) await resolver.resolveClient(`https://c${n}.example/id`);
+  assert.equal(calls.length, 4);
+  await resolver.resolveClient('https://c4.example/id'); await resolver.resolveClient('https://c2.example/id'); assert.equal(calls.length, 4);
+  await resolver.resolveClient('https://c1.example/id'); assert.equal(calls.length, 5); // oldest was evicted
+  clock.t = 101000; await resolver.resolveClient('https://c5.example/id'); // all earlier entries expired
+  await resolver.resolveClient('https://c5.example/id'); assert.equal(calls.length, 6);
+});
+test('cold fetches are rate and concurrency limited, deterministically', async () => {
+  const clock = { t: 0 }; const calls = [];
+  const resolver = bounded(clock, calls, { maxFetchesPerMinute: 2 });
+  await resolver.resolveClient('https://a.example/id'); await resolver.resolveClient('https://b.example/id');
+  await assert.rejects(resolver.resolveClient('https://c.example/id'), /metadata.rate_limited/);
+  await resolver.resolveClient('https://a.example/id'); assert.equal(calls.length, 2); // cache hits are not limited
+  clock.t = 60000; await resolver.resolveClient('https://c.example/id'); assert.equal(calls.length, 3);
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const slow = createMetadataResolver({ async fetch(request) { await gate; return Response.json({}, { status: 500 }); } }, { maxConcurrentFetches: 1 });
+  const first = slow.resolveClient('https://a.example/id'); const second = slow.resolveClient('https://b.example/id');
+  await assert.rejects(second, /metadata.rate_limited/); release(); await assert.rejects(first, /metadata.status/);
+});
+test('refresh and auth-document maps are bounded', async () => {
+  const clock = { t: 0 }; const resolver = createMetadataResolver({ async fetch(request) { return Response.json({ keys: [] }); } }, { now: () => clock.t, maxEntries: 2, maxFetchesPerMinute: 1000 });
+  for (let n = 0; n < 10; n++) await resolver.resolveJwks(`https://j${n}.example/k`, { refresh: true });
+  await resolver.resolveJwks('https://j9.example/k').catch(() => {});
+  await assert.rejects(resolver.resolveJwks('https://j9.example/k', { refresh: true }), /refresh_limited/); // newest still limited
+  await resolver.resolveJwks('https://j0.example/k', { refresh: true }); // oldest was evicted
+});
+test('expired entries are evicted before older live ones', async () => {
+  const clock = { t: 0 }; const calls = [];
+  const resolver = bounded(clock, calls, { maxEntries: 2 });
+  await resolver.resolveClient('https://live.example/id'); await resolver.resolveClient('https://short.example/id');
+  clock.t = 60000; await resolver.resolveClient('https://new.example/id'); assert.equal(calls.length, 3);
+  await resolver.resolveClient('https://live.example/id'); assert.equal(calls.length, 3); // oldest live entry kept
+  await resolver.resolveClient('https://short.example/id'); assert.equal(calls.length, 4); // expired entry was the one dropped
+});
+test('cold-fetch slot is released after a failed fetch', async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const slow = createMetadataResolver({ async fetch() { await gate; return Response.json({}, { status: 500 }); } }, { maxConcurrentFetches: 1 });
+  const first = slow.resolveClient('https://a.example/id'); await assert.rejects(slow.resolveClient('https://b.example/id'), /rate_limited/);
+  release(); await assert.rejects(first, /metadata.status/);
+  await assert.rejects(slow.resolveClient('https://c.example/id'), /metadata.status/);
+});
+test('rate-limited refresh does not burn the refresh slot', async () => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const resolver = createMetadataResolver({ async fetch() { await gate; return Response.json({ keys: [] }); } }, { now: () => 0, maxConcurrentFetches: 1 });
+  const x = resolver.resolveJwks('https://x.example/k');
+  await assert.rejects(resolver.resolveJwks('https://y.example/k', { refresh: true }), /metadata.rate_limited/);
+  release(); await x;
+  await resolver.resolveJwks('https://y.example/k', { refresh: true }); // same clock time: only a burned slot would block this
+});
+test('authDocuments inner and outer maps are bounded; live entries still conflict', async () => {
+  const issuers = { 'a1.example': 'i1', 'a2.example': 'i2', 'a3.example': 'i3', 'a4.example': 'i1', 'b1.example': 'j', 'b2.example': 'j', 'b3.example': 'j', 'b4.example': 'j' };
+  const scopesFor = {}; // domain -> direct scopes
+  const make = (clock, extra) => createMetadataResolver({ async fetch(request) {
+    const url = new URL(request.url); const headers = { 'cache-control': `max-age=${url.hostname === 'b1.example' ? 300 : 100}` };
+    if (url.pathname.includes('oauth-authorization-server')) return Response.json({ ...authorization, issuer: `https://${url.hostname}`, poppy_domains: Object.keys(issuers) }, { headers });
+    const domain = url.hostname;
+    return Response.json({ ...document, organization: { name: 'S', domain }, auth: { issuer: `https://${issuers[domain]}.example`, direct: { scopes: scopesFor[domain] } } }, { headers });
+  } }, { now: () => clock.t, maxFetchesPerMinute: 1000, ...extra });
+  Object.assign(scopesFor, { 'a1.example': ['x'], 'a2.example': ['x'], 'a3.example': ['x'], 'a4.example': ['y'] });
+  const full = make({ t: 0 }); for (const d of ['a1', 'a2', 'a3']) await full.resolveCompany(`${d}.example`);
+  await assert.rejects(full.resolveCompany('a4.example'), /auth.consistency/); // live entry conflicts
+  const clock = { t: 0 }; const outer = make(clock, { maxEntries: 2 });
+  for (const d of ['a1', 'a2', 'a3']) await outer.resolveCompany(`${d}.example`);
+  await outer.resolveCompany('a4.example'); // issuer i1 was evicted from the outer map
+  Object.assign(scopesFor, { 'b1.example': ['x'], 'b2.example': ['x'], 'b3.example': ['x'], 'b4.example': ['y'] });
+  const inner = make(clock, { maxEntries: 2 }); clock.t = 0;
+  for (const d of ['b1', 'b2', 'b3']) await inner.resolveCompany(`${d}.example`); // b1 (300 s) evicted from inner map, b2/b3 live 100 s
+  await assert.rejects(inner.resolveCompany('b4.example'), /auth.consistency/);
+  clock.t = 150000; await inner.resolveCompany('b4.example'); // b2/b3 expired, evicted b1 no longer conflicts
+});

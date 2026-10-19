@@ -76,8 +76,20 @@ export function parseClientMetadata(value: unknown, clientId: string): ClientMet
   if ('logo_uri' in metadata) url(metadata.logo_uri, 'logo_uri');
   return metadata as unknown as ClientMetadata;
 }
-export function createMetadataResolver(transport: HttpTransport, options: { now?: () => number } = {}): MetadataResolver {
-  const now = options.now ?? Date.now;
+// Re-insert so Map order is recency, then drop expired entries and finally the oldest until at most `max` remain.
+function remember<V>(map: Map<string, V>, key: string, value: V, max: number, expired: (value: V) => boolean): void {
+  map.delete(key); map.set(key, value);
+  if (map.size <= max) return;
+  for (const [k, v] of map) if (expired(v)) map.delete(k);
+  for (const k of map.keys()) { if (map.size <= max) break; map.delete(k); }
+}
+// Defaults: 1000 entries per map; at most 16 cold fetch operations in flight and 120 started per 60 s (excess is rejected, not queued).
+// Invariant: maxFetchesPerMinute * 5 (300 s TTL cap) must stay below maxEntries, or a flood can evict live authDocuments/refreshes entries.
+// shortcut: limits are global per resolver, not per caller, and cap total cold-fetch throughput; move per-caller limiting to the server HTTP layer before production use.
+export function createMetadataResolver(transport: HttpTransport, options: { now?: () => number; maxEntries?: number; maxConcurrentFetches?: number; maxFetchesPerMinute?: number } = {}): MetadataResolver {
+  const now = options.now ?? Date.now; const maxEntries = options.maxEntries ?? 1000;
+  const maxConcurrent = options.maxConcurrentFetches ?? 16; const maxPerMinute = options.maxFetchesPerMinute ?? 120;
+  const starts: number[] = [];
   const cache = new Map<string, { value: unknown; url: string; expires: number }>();
   const pending = new Map<string, Promise<{ value: unknown; url: string; expires: number }>>();
   const refreshes = new Map<string, number>();
@@ -87,6 +99,9 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
     if (!refresh && cached && cached.expires > now()) { validate(cached.value, cached.url); return structuredClone(cached); }
     let task = pending.get(key);
     if (!task) {
+      while (starts.length && now() - starts[0] >= 60000) starts.shift();
+      if (pending.size >= maxConcurrent || starts.length >= maxPerMinute) throw new ValidationError('metadata.rate_limited');
+      starts.push(now()); if (refresh) remember(refreshes, target, now(), maxEntries, at => now() - at >= 60000);
       task = (async () => {
         const response = await transport.fetch(new Request(target), { mode });
         if (response.status !== 200) throw new ValidationError('metadata.status');
@@ -95,7 +110,7 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
         const control = response.headers.get('cache-control') ?? ''; const age = Number(response.headers.get('age') ?? 0);
         const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 0);
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
-        const result = { value, url: servedUrl, expires }; if (expires > now()) cache.set(key, result); else cache.delete(key);
+        const result = { value, url: servedUrl, expires }; if (expires > now()) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
       })(); pending.set(key, task);
     }
@@ -111,7 +126,9 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
       const entries = authDocuments.get(document.auth.issuer) ?? new Map();
       const spelling = canonical(document.auth); const currentDomain = document.organization.domain.toLowerCase();
       for (const [otherDomain, entry] of entries) if (otherDomain !== currentDomain && entry.expires > now() && entry.auth !== spelling) throw new ValidationError('auth.consistency');
-      entries.set(currentDomain, { auth: spelling, expires: found.expires }); authDocuments.set(document.auth.issuer, entries);
+      const expiredEntry = (entry: { auth: string; expires: number }) => entry.expires <= now();
+      remember(entries, currentDomain, { auth: spelling, expires: found.expires }, maxEntries, expiredEntry);
+      remember(authDocuments, document.auth.issuer, entries, maxEntries, inner => [...inner.values()].every(expiredEntry));
       return { document, authorization: parseAuthorizationMetadata(auth.value, document), url: found.url };
     },
     async resolveClient(clientId) { validateClientId(clientId); const found = await get(clientId, value => parseClientMetadata(value, clientId), 'endpoint'); return parseClientMetadata(found.value, clientId); },
@@ -125,7 +142,7 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
           for (const secret of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) if (secret in item) throw new ValidationError('jwk.private');
         }
       };
-      if (settings.refresh) { const last = refreshes.get(uri); if (last !== undefined && now() - last < 60000) throw new ValidationError('jwks.refresh_limited'); refreshes.set(uri, now()); }
+      if (settings.refresh) { const last = refreshes.get(uri); if (last !== undefined && now() - last < 60000) throw new ValidationError('jwks.refresh_limited'); }
       const found = await get(uri, validate, 'discovery', settings.refresh); return found.value as JsonObject;
     }
   };
