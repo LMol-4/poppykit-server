@@ -22,7 +22,7 @@ export interface IssuerState {
   version: 1;
   generation: string;
   sessions: Record<string, SessionRecord>;
-  grants: Record<string, GrantRecord>;
+  grants: Record<string, GrantRecord>; // absent in state persisted before J11; read as {}
   accessTokens: Record<string, AccessTokenRecord>;
   replay: Record<string, number>; // assertion/proof jti key -> retain until (ms)
   nonces: { value: string; expiresAt: number }[];
@@ -188,7 +188,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   // Plain checks over one issuer snapshot; only the policy wrappers below take the coordinator, once.
   function liveGrant(state: IssuerState, principal: Principal): boolean {
     if (principal.accountId === undefined && principal.grantId === undefined) return true;
-    const grant = principal.grantId === undefined ? undefined : own(state.grants, principal.grantId);
+    const grant = principal.grantId === undefined ? undefined : own(state.grants ?? {}, principal.grantId);
     return !!grant && !grant.revoked && grant.expiresAt > now() && grant.clientId === principal.clientId && grant.accountId === principal.accountId;
   }
   function requireScopes(granted: readonly string[], scopes: readonly string[]): void {
@@ -251,7 +251,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     },
     // shortcut: sessions are not linked to grants yet, so revoking only ends account authority; J10 also signs out the lineage's sessions.
     disconnect: (clientId, accountId) => options.coordinator.run(() => store.transaction(draft => {
-      for (const grant of Object.values(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) grant.revoked = true;
+      for (const grant of Object.values(draft.grants ?? {})) if (grant.clientId === clientId && grant.accountId === accountId) grant.revoked = true;
     })),
   };
 }
