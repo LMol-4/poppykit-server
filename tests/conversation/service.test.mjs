@@ -21,7 +21,8 @@ function memoryStore(initial) {
   let queue = Promise.resolve();
   const store = {
     transactions: 0,
-    async read() { return structuredClone(state); },
+    afterRead: null, // test hook: runs once between a read and the next transaction
+    async read() { const copy = structuredClone(state); const hook = store.afterRead; store.afterRead = null; hook?.(state); return copy; },
     transaction(change) {
       const run = queue.then(() => {
         const draft = structuredClone(state);
@@ -302,6 +303,17 @@ test('retry without wait of a waited POST still needs poppy:read on an account-b
   // A three-field receipt holds no history, so no read scope is needed.
   const ack = await t.send(waited.body.conversation_id, { id: 'msg_2', sender: 'agent', text: 'more' }, { as: 'aliceNoScopes' });
   assert.deepEqual([ack.status, ack.body], [plain.status, plain.body]);
+});
+
+test('binding that gains an account between read and transaction rescopes a retry to poppy:read', async () => {
+  const t = setup();
+  const waited = await t.start(hello, { query: '?wait=0', as: 'aliceNoScopes' });
+  assert.equal(waited.status, 201);
+  t.store.afterRead = state => { state.bindings[waited.body.conversation_id].accountId = 'acct_1'; };
+  t.calls.length = 0;
+  const retry = await t.start(hello, { as: 'aliceNoScopes' });
+  assert.deepEqual([retry.status, retry.body], [403, { error: 'insufficient_scope' }]);
+  assert.deepEqual(t.calls.map(call => call.scopes), [[], ['poppy:read']]);
 });
 
 test('routing: wrong origin, path, method and missing auth', async () => {
