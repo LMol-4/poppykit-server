@@ -208,7 +208,10 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const codeVerifier = params.get('code_verifier'); const refreshToken = params.get('refresh_token');
     const sessionId = params.get('session_id'); const resource = params.get('resource'); const scope = params.get('scope');
     if (sessionId === '') throw new TokenError('invalid_request');
+    // Each grant takes only its own credential, so a stray assertion can never stand in for a code or Account Token.
+    if (grantType !== JWT_BEARER && assertion !== undefined) throw new TokenError('invalid_request');
     if (grantType === JWT_BEARER) {
+      // A missing assertion is invalid_grant (spec 4.2 error table).
       if (!assertion) throw new TokenError('invalid_grant');
       // Signed-out sessions hold no account scopes.
       if (scope?.trim()) throw new TokenError('invalid_scope');
@@ -230,8 +233,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
 
     const { client, verify, keys } = await authenticateClient(clientId, clientAssertion);
     let session: AssertionClaims | undefined;
-    if (assertion !== undefined) {
-      try { session = await verify(assertion); } catch { throw new TokenError('invalid_grant'); }
+    if (grantType === JWT_BEARER) {
+      try { session = await verify(assertion!); } catch { throw new TokenError('invalid_grant'); }
       if (session.iss !== clientId || session.aud !== issuer || session.sub.length > 256 || !current(session) || session.jti === client.jti) throw new TokenError('invalid_grant');
     }
     // Identity keys and DPoP keys must differ (spec 4.1).
@@ -283,15 +286,16 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         return { ...grant(id, record, grantId, scopes), refresh_token: successor, refresh_token_expires_in: Math.floor((lineage.expiresAt - at) / 1000) };
       };
 
-      if (session) {
+      if (grantType === JWT_BEARER) {
+        if (!session) throw new TokenError('invalid_grant');
         if (sessionId === undefined) return grant(...create(session.sub), null, []);
         const record = existing(session.sub);
         // A signed-in Session is renewed with its Account Token instead (spec 4.2).
         if (record.grantId !== null && grantLive(own(draft.grants, record.grantId), at)) throw new TokenError('invalid_grant');
         return grant(sessionId, record, null, []);
       }
-      if (code !== undefined) {
-        const record = own(draft.codes, tokenHash(code));
+      if (grantType === 'authorization_code') {
+        const record = own(draft.codes, tokenHash(code!));
         if (!record || record.expiresAt <= at || record.clientId !== clientId) throw new TokenError('invalid_grant');
         if (record.grantId !== null) { revokeGrant(draft, record.grantId); return null; }
         if (record.redirectUri !== redirectUri || tokenHash(codeVerifier!) !== record.codeChallenge) throw new TokenError('invalid_grant');

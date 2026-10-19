@@ -311,3 +311,15 @@ test('a reset during begin or exchange cannot recreate state from the old genera
   expectError(await env.exchange(session.session_id, grant), 'invalid_grant');
   assert.deepEqual([env.store.state.grants, env.store.state.sessions], [{}, {}]);
 });
+
+test('the grant type alone picks the branch: a stray assertion never substitutes for a code or Account Token', async () => {
+  const env = await signInSetup();
+  const session = await env.session();
+  const grant = await env.code();
+  expectError(await env.refresh('bogus', { assertion: await env.assertion() }), 'invalid_request');
+  expectError(await env.refresh('bogus', { assertion: await env.assertion(), session_id: session.session_id }), 'invalid_request');
+  expectError(await env.exchange(session.session_id, grant, { assertion: await env.assertion() }), 'invalid_request');
+  expectError(await env.send({ assertion: undefined }), 'invalid_grant');
+  assert.equal(Object.keys(env.store.state.accessTokens).length, 1, 'only the first signed-out token was issued');
+  assert.equal((await env.exchange(session.session_id, grant)).status, 200, 'the code was not consumed');
+});
