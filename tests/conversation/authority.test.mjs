@@ -25,7 +25,7 @@ function setup(revocationPolicy) {
   const authenticator = { async authenticate() { return current; } };
   const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
-  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, directScopes: ['poppy:read'] });
+  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, directScopes: ['poppy:read', 'poppy:write'] });
   const call = async (method, path, body) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body && JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
@@ -102,6 +102,19 @@ test('stop-account-work: revoked work can still ask to sign in, but cannot ask f
   assert.deepEqual([event.type, event.error, event.scope], ['authorization', 'sign_in_required', 'poppy:read']);
   assert.equal(conversation.status, 'idle');
   assert.equal(t.coordinator.held, false);
+});
+
+test('revoked work asking for a scope it never had is told to sign in, not to widen scopes', async () => {
+  for (const revocationPolicy of ['stop-account-work', 'allow-accepted-work-to-finish']) {
+    const t = setup(revocationPolicy);
+    const id = (await t.call('POST', '', { message })).body.conversation_id;
+    const claim = await t.service.claim();
+    await t.service.requestAuthorization(claim, 'live', ['poppy:write']);
+    await t.issuer.disconnect(CLIENT, 'acct_1');
+    await t.service.requestAuthorization(claim, 'revoked', ['poppy:write']);
+    const events = (await t.store.read()).conversations[id].events.filter(event => event.type === 'authorization');
+    assert.deepEqual(events.map(event => [event.error, event.scope]), [['insufficient_scope', 'poppy:write'], ['sign_in_required', 'poppy:write']], revocationPolicy);
+  }
 });
 
 test('a revoked sign-in request still respects the fence and a reset generation', async () => {

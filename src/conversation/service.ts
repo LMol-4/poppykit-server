@@ -384,22 +384,30 @@ export function createConversationService(options: ConversationOptions): Convers
 
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
   // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
+  // change() gets live: whether the accepted sign-in still holds. Only account-free publications check it; others pass true.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
-    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, accountFree = false): Promise<T> {
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord, live: boolean) => T, accountFree = false): Promise<T> {
     for (;;) {
       const before = await store.read();
       const stored = before.work.find(work => work.id === ref.workId);
       if (!stored) throw new PublicationError('stale_work');
       const granted = scopes(before, stored);
-      // A publication that uses no account (failing, suspending, asking to sign in) must stay possible after revocation, or the work is reclaimed forever.
-      const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      const run = (authority: AcceptedAuthority, live: boolean) => policy.withAccepted(authority, granted, () => store.transaction(draft => {
+        const work = draft.work.find(item => item.id === ref.workId);
+        if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (!work.human && (work.leaseUntil ?? 0) <= clock.now())) throw new PublicationError('stale_work');
+        if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
+        return change(draft, work, draft.conversations[work.conversationId], live);
+      }));
       try {
-        return await policy.withAccepted(authority, granted, () => store.transaction(draft => {
-          const work = draft.work.find(item => item.id === ref.workId);
-          if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (!work.human && (work.leaseUntil ?? 0) <= clock.now())) throw new PublicationError('stale_work');
-          if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
-          return change(draft, work, draft.conversations[work.conversationId]);
-        }));
+        if (!accountFree) return await run(stored.authority, true);
+        // A publication that uses no account (failing, suspending, asking to sign in) must stay possible after revocation,
+        // or the work is reclaimed forever. Try it as if revocation stopped work first, to learn whether the sign-in is live.
+        try {
+          return await run({ ...stored.authority, revocationPolicy: 'stop-account-work' }, true);
+        } catch (error) {
+          if (!(error instanceof AuthorityError && error.code === 'invalid_token')) throw error;
+          return await run({ ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' }, false);
+        }
       } catch (error) {
         if (!(error instanceof Rescope)) throw error;
       }
@@ -509,12 +517,12 @@ export function createConversationService(options: ConversationOptions): Convers
       if (!direct) throw new TypeError('directScopes is not configured');
       if (!Array.isArray(scopes) || !scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.includes(scope))) throw new TypeError('scopes');
       const scope = [...new Set(scopes)].join(' ');
-      await publish(ref, noScopes, (draft, work, conversation) => {
+      await publish(ref, noScopes, (draft, work, conversation, live) => {
         if (!firstOutput(work, outputId, canonical({ authorization: scope }))) return;
         const { accountId, scopes: granted } = work.authority.principal;
         const bound = boundAccount(draft, work);
-        // More scopes only helps a signed-in work on the right account; signed out, another account or revoked all need sign-in.
-        const narrow = accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
+        // More scopes only helps a live sign-in on the right account; signed out, another account or revoked all need sign-in.
+        const narrow = live && accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
         addEvent(conversation, { type: 'authorization', error: narrow ? 'insufficient_scope' : 'sign_in_required', scope });
       }, true);
     },
