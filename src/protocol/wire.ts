@@ -140,7 +140,7 @@ export function parseReadOptions(url: URL, maxWaitSeconds: number): { cursor?: s
 }
 export function retryAfterMilliseconds(value: string | null, nowMs: number): number | undefined {
   if (!value) return undefined;
-  if (/^\d+$/.test(value)) { const ms = Number(value) * 1000; return Number.isSafeInteger(ms) ? ms : undefined; }
+  if (/^\d+$/.test(value)) { const ms = Number(value) * 1000; return Number.isSafeInteger(ms) ? ms : Infinity; } // too large to wait: let the caller's maxDelay check surface it
   if (!/^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)) return undefined;
   const date = Date.parse(value); return Number.isFinite(date) ? Math.max(0, date - nowMs) : undefined;
 }
