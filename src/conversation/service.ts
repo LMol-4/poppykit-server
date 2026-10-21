@@ -16,12 +16,13 @@ export interface ConversationRecord {
   authority: AcceptedAuthority; // of the latest accepted message; staff operations act under it
   parentId?: string; // set on a Direct Conversation
   childId?: string; // the parent's open Direct Conversation
+  humanUntil?: number; // while responder is human: the operator lease, set on join and renew; it outlives a finished claim
 }
 export interface WorkRecord {
   id: string; conversationId: string; message: Message; authority: AcceptedAuthority;
   phase: 'held' | 'pending' | 'claimed' | 'completed' | 'suspended' | 'failed' | 'cancelled'; // held: for a person, not automation
   fence?: string; leaseUntil?: number;
-  human?: true; // a staff attempt: no lease, never claimed by automation
+  human?: true; // a staff attempt: never claimed by automation; once the conversation's humanUntil passes, claim() hands it back
   outputs: Record<string, string>; // outputId -> canonical payload
 }
 export interface MessageRecord { conversationId: string; fingerprint: string; receipt: { status: number; body: JsonObject } }
@@ -41,6 +42,8 @@ export interface ConversationOptions {
   revocationPolicy?: WorkRevocationPolicy;
   pageSize?: number;
   leaseMs?: number;
+  operatorLeaseMs?: number; // default 900000: a person's claim lasts this long unless renewed
+  finishedWorkLimit?: number; // default 1000 finished work records kept, newest first, for inspection; older ones are dropped
   pollIntervalMs?: number; // long-poll store checks, outside all locks
   /** Mandatory for staff methods: authenticate and authorize this company operator for the conversation, or throw. */
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
@@ -68,7 +71,7 @@ export interface ConversationService {
   handoff(work: WorkRef): Promise<void>;
   /** The company closes the conversation (and its open Direct Conversation); idempotent. */
   close(work: WorkRef): Promise<void>;
-  /** A person joins: automated work is fenced and the returned claim publishes with sender human. */
+  /** A person joins: automated work is fenced and the returned claim publishes with sender human. Renew it within operatorLeaseMs. */
   joinHuman(operator: unknown, conversationId: string): Promise<WorkClaim>;
   /** Nobody can join a queued conversation: the agent says why and the conversation leaves the queue. No-op unless queued. */
   noHumanAvailable(operator: unknown, conversationId: string, reason: string): Promise<void>;
@@ -99,7 +102,10 @@ class Rescope extends Error {}
 const notFound = () => new HttpError(404, { error: 'conversation_not_found' });
 const closed = () => new HttpError(409, { error: 'conversation_closed' });
 const directOpen = (childId: string) => new HttpError(409, { error: 'direct_conversation_open', conversation_id: childId });
+const never = () => false;
+const always = () => true;
 const unfinished = (work: WorkRecord) => work.phase === 'pending' || work.phase === 'claimed';
+const finished = (work: WorkRecord) => !unfinished(work) && work.phase !== 'held';
 
 function json(status: number, body: unknown, headers: HeadersInit = {}): Response {
   const response = Response.json(body, { status, headers });
@@ -133,9 +139,11 @@ export function createConversationService(options: ConversationOptions): Convers
   const { store, authenticator, policy, clock } = options;
   const pageSize = options.pageSize ?? 100;
   const leaseMs = options.leaseMs ?? 60000;
+  const operatorLeaseMs = options.operatorLeaseMs ?? 900000;
   const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const finishedWorkLimit = options.finishedWorkLimit ?? 1000;
   const revocationPolicy = options.revocationPolicy ?? 'stop-account-work';
-  for (const value of [pageSize, leaseMs, pollIntervalMs]) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid conversation option');
+  for (const value of [pageSize, leaseMs, operatorLeaseMs, pollIntervalMs, finishedWorkLimit]) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid conversation option');
   const endpoint = secureUrl(options.endpoint);
   const basePath = endpoint.pathname.replace(/\/$/, '');
 
@@ -150,6 +158,31 @@ export function createConversationService(options: ConversationOptions): Convers
     addEvent(conversation, { type: 'state', status, responder });
   }
   const newFence = (draft: ConversationStoreState) => `${draft.generation}.${randomId('')}`;
+  // Finished work is never read again: publication needs a claimed record (else stale_work), and status, claims and
+  // handback look only at held, pending and claimed work. Output dedupe lives on the claimed record. So the oldest go first.
+  function pruneWork(draft: ConversationStoreState): void {
+    let excess = draft.work.filter(finished).length - finishedWorkLimit;
+    if (excess > 0) draft.work = draft.work.filter(work => !finished(work) || excess-- <= 0);
+  }
+  // Serial per conversation: only the oldest unfinished work item is eligible.
+  function claimable(state: ConversationStoreState, now: number): WorkRecord | undefined {
+    const seen = new Set<string>();
+    for (const work of state.work) {
+      const conversation = state.conversations[work.conversationId];
+      // A person who left, with or without finishing their claim: once the operator lease passes, anything awaiting
+      // them (their claim or held messages) is handed back. Never while a Direct Conversation is open: that would cancel parent work.
+      if (conversation.responder === 'human') {
+        if ((work.phase === 'held' || unfinished(work)) && (conversation.humanUntil ?? 0) <= now && conversation.childId === undefined) return work;
+        continue;
+      }
+      if (!unfinished(work) || seen.has(work.conversationId)) continue;
+      seen.add(work.conversationId);
+      // Automation pauses while queued for a person and while a Direct Conversation is open.
+      if (conversation.status === 'queued' || conversation.childId !== undefined) continue;
+      if (work.phase === 'claimed' && (work.leaseUntil ?? 0) > now) continue;
+      return work;
+    }
+  }
   const idleOrWorking = (draft: ConversationStoreState, id: string): Status =>
     draft.work.some(work => work.conversationId === id && unfinished(work)) ? 'working' : 'idle';
   // Invalidates every current claim on a conversation: automated work returns to pending, or all of it is cancelled.
@@ -171,6 +204,13 @@ export function createConversationService(options: ConversationOptions): Convers
   const release = (draft: ConversationStoreState, id: string) => {
     for (const work of draft.work) if (work.conversationId === id && work.phase === 'held') work.phase = 'pending';
   };
+  // The person's claim stops working and automation answers what they left unanswered.
+  function handBack(draft: ConversationStoreState, conversation: ConversationRecord): void {
+    fence(draft, conversation.id, 'cancelled');
+    release(draft, conversation.id);
+    delete conversation.humanUntil;
+    setState(conversation, idleOrWorking(draft, conversation.id), 'agent');
+  }
   // Closing a parent closes its open Direct Conversation first; closing a child reopens its parent for messages.
   function closeConversation(draft: ConversationStoreState, conversation: ConversationRecord): void {
     if (conversation.status === 'closed') return;
@@ -296,6 +336,7 @@ export function createConversationService(options: ConversationOptions): Convers
         if (read.cursor !== undefined) page(conversation, read.cursor);
         conversation.authority = authority;
       }
+      pruneWork(draft);
       const message = body.message;
       if (message.context) conversation.context = { ...conversation.context, ...message.context };
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
@@ -361,31 +402,41 @@ export function createConversationService(options: ConversationOptions): Convers
 
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
   // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
+  // change() gets live: whether the accepted sign-in still holds. Only account-free publications check it; others pass true.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
-    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, ending = false): Promise<T> {
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord, live: boolean) => T, accountFree: (work: WorkRecord) => boolean = never): Promise<T> {
     for (;;) {
       const before = await store.read();
       const stored = before.work.find(work => work.id === ref.workId);
       if (!stored) throw new PublicationError('stale_work');
       const granted = scopes(before, stored);
-      // Failing or suspending uses no account and must stay possible after revocation, or the work is reclaimed forever.
-      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      const run = (authority: AcceptedAuthority, live: boolean) => policy.withAccepted(authority, granted, () => store.transaction(draft => {
+        const work = draft.work.find(item => item.id === ref.workId);
+        if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
+        if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
+        return change(draft, work, draft.conversations[work.conversationId], live);
+      }));
       try {
-        return await policy.withAccepted(authority, granted, () => store.transaction(draft => {
-          const work = draft.work.find(item => item.id === ref.workId);
-          if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (!work.human && (work.leaseUntil ?? 0) <= clock.now())) throw new PublicationError('stale_work');
-          if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
-          return change(draft, work, draft.conversations[work.conversationId]);
-        }));
+        if (!accountFree(stored)) return await run(stored.authority, true);
+        // A publication that uses no account (failing, suspending, asking to sign in, a person's words) must stay possible after revocation,
+        // or the work is reclaimed forever. Try it as if revocation stopped work first, to learn whether the sign-in is live.
+        try {
+          return await run({ ...stored.authority, revocationPolicy: 'stop-account-work' }, true);
+        } catch (error) {
+          if (!(error instanceof AuthorityError && error.code === 'invalid_token')) throw error;
+          return await run({ ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' }, false);
+        }
       } catch (error) {
         if (!(error instanceof Rescope)) throw error;
       }
     }
   }
   const noScopes = () => [];
+  // A person's own words and their claim's upkeep use no account (7.8); their account reads still go through requireAccount.
+  const byPerson = (work: WorkRecord) => work.human === true;
 
   // Staff operations: the host authorizes the operator, then the conversation's stored customer authority applies.
-  async function staff<T>(operator: unknown, conversationId: string, ending: boolean,
+  async function staff<T>(operator: unknown, conversationId: string, accountFree: boolean,
     change: (draft: ConversationStoreState, conversation: ConversationRecord, authority: AcceptedAuthority) => T): Promise<T> {
     if (!options.authorizeOperator) throw new TypeError('authorizeOperator is not configured');
     await options.authorizeOperator(operator, conversationId);
@@ -395,7 +446,7 @@ export function createConversationService(options: ConversationOptions): Convers
       // Conversations stored before staff support have none until the customer's next accepted message.
       if (stored.authority === undefined) throw new Error('Conversation has no stored customer authority');
       // Leaving the queue or handing back uses no account, so it stays possible after revocation.
-      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
         return await policy.withAccepted(authority, [], () => store.transaction(draft => {
           const conversation = own(draft.conversations, conversationId);
@@ -431,19 +482,16 @@ export function createConversationService(options: ConversationOptions): Convers
       }
     },
 
-    claim() {
+    async claim() {
+      // Idle pollers only read; the transaction rechecks, since another claimer may have won in between.
+      if (!claimable(await store.read(), clock.now())) return null;
       return store.transaction(draft => {
         const now = clock.now();
-        const seen = new Set<string>();
-        for (const work of draft.work) {
-          if (!unfinished(work)) continue;
-          // Serial per conversation: only the oldest unfinished work item is eligible.
-          if (seen.has(work.conversationId)) continue;
-          seen.add(work.conversationId);
+        pruneWork(draft);
+        for (let work = claimable(draft, now); work; work = claimable(draft, now)) {
           const conversation = draft.conversations[work.conversationId];
-          // Automation pauses while queued for or handled by a person, and while a Direct Conversation is open.
-          if (conversation.status === 'queued' || conversation.responder === 'human' || conversation.childId !== undefined) continue;
-          if (work.phase === 'claimed' && (work.leaseUntil ?? 0) > now) continue;
+          // An abandoned person's claim pins responder human no longer; this uses no account, like returnToAgent.
+          if (conversation.responder === 'human') { handBack(draft, conversation); continue; }
           work.phase = 'claimed';
           work.fence = newFence(draft);
           work.leaseUntil = now + leaseMs;
@@ -454,7 +502,10 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     renew(ref) {
-      return publish(ref, noScopes, (_draft, work) => { work.leaseUntil = clock.now() + leaseMs; });
+      return publish(ref, noScopes, (_draft, work, conversation) => {
+        work.leaseUntil = clock.now() + (work.human ? operatorLeaseMs : leaseMs);
+        if (work.human) conversation.humanUntil = work.leaseUntil;
+      }, byPerson);
     },
 
     history(ref) {
@@ -485,7 +536,7 @@ export function createConversationService(options: ConversationOptions): Convers
         // A person's reply answers the messages held for them so far.
         if (work.human) for (const item of draft.work) if (item.conversationId === conversation.id && item.phase === 'held') item.phase = 'cancelled';
         addEvent(conversation, { type: 'message', message: { ...parsed, role: 'company' } as JsonObject });
-      });
+      }, byPerson);
     },
 
     async requestAuthorization(ref, outputId, scopes) {
@@ -493,19 +544,21 @@ export function createConversationService(options: ConversationOptions): Convers
       if (!direct) throw new TypeError('directScopes is not configured');
       if (!Array.isArray(scopes) || !scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.includes(scope))) throw new TypeError('scopes');
       const scope = [...new Set(scopes)].join(' ');
-      await publish(ref, noScopes, (draft, work, conversation) => {
+      await publish(ref, noScopes, (draft, work, conversation, live) => {
         if (!firstOutput(work, outputId, canonical({ authorization: scope }))) return;
         const { accountId, scopes: granted } = work.authority.principal;
         const bound = boundAccount(draft, work);
-        // More scopes only helps a signed-in work on the right account; signed out, another account or revoked all need sign-in.
-        const narrow = accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
+        // More scopes only helps a live sign-in on the right account; signed out, another account or revoked all need sign-in.
+        const narrow = live && accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
         addEvent(conversation, { type: 'authorization', error: narrow ? 'insufficient_scope' : 'sign_in_required', scope });
-      }, true);
+      }, always);
     },
 
     async requestUser(ref, outputId, reason) {
       if (typeof reason !== 'string' || reason === '') throw new TypeError('reason');
       await publish(ref, noScopes, (_draft, work, conversation) => {
+        // The User is already the one talking in a Direct Conversation (7.10).
+        if (conversation.parentId !== undefined) throw new TypeError('requestUser in a Direct Conversation');
         if (firstOutput(work, outputId, canonical({ user_requested: reason }))) addEvent(conversation, { type: 'user_requested', reason });
       });
     },
@@ -520,7 +573,7 @@ export function createConversationService(options: ConversationOptions): Convers
           addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: 'Sorry, something went wrong and this request could not be completed.' } });
         }
         if (conversation.status === 'working') setState(conversation, idleOrWorking(draft, conversation.id));
-      }, outcome !== 'completed');
+      }, work => outcome !== 'completed' || byPerson(work));
     },
 
     handoff(ref) {
@@ -529,11 +582,11 @@ export function createConversationService(options: ConversationOptions): Convers
         delete work.fence;
         delete work.leaseUntil;
         requestHandoff(draft, conversation);
-      }, true);
+      }, always);
     },
 
     close(ref) {
-      return publish(ref, noScopes, (draft, _work, conversation) => closeConversation(draft, conversation), true);
+      return publish(ref, noScopes, (draft, _work, conversation) => closeConversation(draft, conversation), always);
     },
 
     joinHuman(operator, conversationId) {
@@ -542,7 +595,8 @@ export function createConversationService(options: ConversationOptions): Convers
         fence(draft, conversationId, 'cancelled');
         const last = conversation.events.findLast(event => event.type === 'message' && (event.message as Message).role === 'user');
         const { role: _role, ...message } = last!.message as Message;
-        const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), human: true, outputs: {} };
+        const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), leaseUntil: clock.now() + operatorLeaseMs, human: true, outputs: {} };
+        conversation.humanUntil = work.leaseUntil;
         draft.work.push(work);
         setState(conversation, 'idle', 'human');
         return { workId: work.id, fence: work.fence!, conversationId, message, context: conversation.context };
@@ -565,9 +619,7 @@ export function createConversationService(options: ConversationOptions): Convers
     returnToAgent(operator, conversationId) {
       return staff(operator, conversationId, true, (draft, conversation) => {
         if (conversation.responder !== 'human' || conversation.status === 'closed') return;
-        fence(draft, conversationId, 'cancelled');
-        release(draft, conversationId);
-        setState(conversation, idleOrWorking(draft, conversationId), 'agent');
+        handBack(draft, conversation);
       });
     },
   };

@@ -100,3 +100,15 @@ test('requestUser needs the accepted authority', async () => {
   await assert.rejects(t.service.requestUser(claim, 'user', 'A specialist needs you.'), { code: 'invalid_token' });
   assert.ok(!(await t.store.read()).conversations[id].events.some(event => event.type === 'user_requested'));
 });
+
+test('requestUser is refused inside a Direct Conversation, where the User is already talking', async () => {
+  const t = setup();
+  const parent = (await t.start(hello)).body.conversation_id;
+  await t.service.finish(await t.service.claim(), 'completed');
+  const child = (await t.direct(parent, { id: 'msg_child', sender: 'human', text: 'Hi.' })).body.conversation_id;
+  const claim = await t.service.claim();
+  assert.equal(claim.conversationId, child);
+  await assert.rejects(t.service.requestUser(claim, 'user', 'A specialist needs you.'), { name: 'TypeError', message: /Direct Conversation/ });
+  assert.ok(!(await t.store.read()).conversations[child].events.some(event => event.type === 'user_requested'));
+  await t.service.reply(claim, 'user', { id: 'msg_r1', sender: 'agent', text: 'Hello.' }); // the refused request used no output ID
+});

@@ -41,7 +41,6 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
     generation: { issuerGeneration: 'old' },
     noGeneration: { issuerGeneration: undefined },
     session: { sessionId: 'nope' },
-    sessionVersion: { sessionVersion: 2 },
     sessionUser: { userId: 'usr_2' },
     sessionClient: { clientId: 'https://agent.test/other.json' },
     unknownGrant: { grantId: 'g2' },

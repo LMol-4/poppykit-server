@@ -284,6 +284,20 @@ test('disconnect revokes the account sign-ins of that client and signs out their
   assert.equal((await env.refresh(b.body.refresh_token)).status, 200);
 });
 
+test('disconnect deletes the unredeemed codes of that client and account; other accounts and clients keep theirs', async () => {
+  const env = await signInSetup();
+  const session = await env.session();
+  const mine = await env.code();
+  const otherAccount = await env.code({ accountId: 'acct_2' });
+  const otherClient = await env.code({ params: { client_id: OTHER_CLIENT } });
+  await env.issuer.disconnect(CLIENT, 'acct_1');
+  assert.equal(Object.keys(env.store.state.codes).length, 2);
+  expectError(await env.exchange(session.session_id, mine), 'invalid_grant');
+  assert.deepEqual(env.store.state.grants, {}, 'no sign-in was created from the deleted code');
+  assert.equal((await env.exchange(session.session_id, otherAccount)).status, 200);
+  assert.equal(Object.values(env.store.state.codes).find(code => code.clientId === OTHER_CLIENT).accountId, 'acct_1');
+});
+
 test('Sessions end after a day without tokens and expired records are pruned', async () => {
   const env = await signInSetup();
   const idle = await env.session();
@@ -347,6 +361,40 @@ test('pending authorizations are capped until older ones expire', async () => {
   env.clock.now += 300_000;
   await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
   await assert.rejects(setup({ maxPendingAuthorizations: 0 }), TypeError);
+});
+
+test('per-client caps: one client filling its share leaves pending authorizations and Sessions for others', async () => {
+  const env = await signInSetup({ maxPendingAuthorizationsPerClient: 2, maxSessionsPerClient: 2 });
+  await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  await assert.rejects(env.issuer.beginAuthorization(authorizeRequest(), BINDING), { code: 'temporarily_unavailable' });
+  await env.issuer.beginAuthorization(authorizeRequest({ client_id: OTHER_CLIENT }), BINDING);
+
+  const first = await env.session();
+  env.clock.now += 60_000;
+  const second = await env.session();
+  const refused = await env.send();
+  assert.deepEqual([refused.status, refused.body, refused.headers.get('retry-after')], [429, { error: 'rate_limited' }, String(DAY / 1000 - 60)]);
+  assert.equal(Object.keys(env.store.state.sessions).length, 2);
+  const other = { client_id: OTHER_CLIENT, client_assertion: await env.clientAssertion({ iss: OTHER_CLIENT, sub: OTHER_CLIENT }), assertion: await env.assertion({ iss: OTHER_CLIENT }) };
+  assert.equal((await env.send(other)).status, 200);
+  // Renewing an existing Session is never refused, and a Session ending frees a slot.
+  assert.equal((await env.send({ session_id: second.session_id })).status, 200);
+  env.clock.now += DAY - 60_000;
+  assert.equal((await env.send()).status, 200, `${first.session_id} ended`);
+  await assert.rejects(setup({ maxSessionsPerClient: 0 }), TypeError);
+  await assert.rejects(setup({ maxPendingAuthorizationsPerClient: 1.5 }), TypeError);
+});
+
+test('a rate_limited Session request rolls back: the same assertions and proof succeed once a slot frees', async () => {
+  const env = await signInSetup({ maxSessionsPerClient: 1 });
+  const first = await env.session();
+  const fields = { assertion: await env.assertion(), client_assertion: await env.clientAssertion() };
+  const dpop = await env.proof();
+  expectError(await env.send(fields, { dpop }), 'rate_limited', 429);
+  delete env.store.state.sessions[first.session_id]; // the Session ends
+  assert.equal((await env.send(fields, { dpop })).status, 200, 'no jti was consumed by the refused request');
+  expectError(await env.send(fields, { dpop }), 'invalid_grant'); // the accepted request did consume them
 });
 
 test('only the current and previous Account Token hashes are retained per lineage', async () => {
