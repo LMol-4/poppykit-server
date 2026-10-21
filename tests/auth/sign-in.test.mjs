@@ -386,6 +386,17 @@ test('per-client caps: one client filling its share leaves pending authorization
   await assert.rejects(setup({ maxPendingAuthorizationsPerClient: 1.5 }), TypeError);
 });
 
+test('a rate_limited Session request rolls back: the same assertions and proof succeed once a slot frees', async () => {
+  const env = await signInSetup({ maxSessionsPerClient: 1 });
+  const first = await env.session();
+  const fields = { assertion: await env.assertion(), client_assertion: await env.clientAssertion() };
+  const dpop = await env.proof();
+  expectError(await env.send(fields, { dpop }), 'rate_limited', 429);
+  delete env.store.state.sessions[first.session_id]; // the Session ends
+  assert.equal((await env.send(fields, { dpop })).status, 200, 'no jti was consumed by the refused request');
+  expectError(await env.send(fields, { dpop }), 'invalid_grant'); // the accepted request did consume them
+});
+
 test('only the current and previous Account Token hashes are retained per lineage', async () => {
   const env = await signInSetup();
   let token = (await env.signIn((await env.session()).session_id)).body.refresh_token;
