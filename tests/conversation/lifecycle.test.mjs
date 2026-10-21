@@ -451,13 +451,15 @@ test('close cancels work held for a person', async () => {
   assert.deepEqual((await t.store.read()).work.filter(work => !work.human).map(work => work.phase), ['cancelled', 'cancelled']);
 });
 
-test('a failed finish on a person-handled conversation does not apologise as the agent', async () => {
+test('a failed finish adds no canned message for a person, but the agent still apologises', async () => {
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;
+  await t.service.finish(await t.service.claim(), 'failed');
+  const last = async () => (await t.store.read()).conversations[id].events.filter(event => event.type === 'message').at(-1).message;
+  assert.deepEqual([(await last()).sender, (await last()).text.startsWith('Sorry')], ['agent', true]);
   await t.handoff(id);
   const person = await t.service.joinHuman(operator, id);
+  const before = (await t.store.read()).conversations[id].events.length;
   await t.service.finish(person, 'failed');
-  const message = (await t.store.read()).conversations[id].events.at(-1).message;
-  assert.match(message.text, /^Sorry/);
-  assert.equal(message.sender, 'human');
+  assert.equal((await t.store.read()).conversations[id].events.length, before);
 });

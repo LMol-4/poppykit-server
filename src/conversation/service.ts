@@ -485,9 +485,9 @@ export function createConversationService(options: ConversationOptions): Convers
         work.phase = outcome;
         delete work.fence;
         delete work.leaseUntil;
-          // Sent as whoever is responding: a person's conversation never carries agent-sent text.
-        if (outcome === 'failed') {
-          addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: conversation.responder, text: 'Sorry, something went wrong and this request could not be completed.' } });
+        // Spec 7.8: 'human' means a person's own words, so a person's failed work gets no canned apology.
+        if (outcome === 'failed' && !work.human) {
+          addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: 'Sorry, something went wrong and this request could not be completed.' } });
         }
         if (conversation.status === 'working') setState(conversation, idleOrWorking(draft, conversation.id));
       }, outcome !== 'completed');
