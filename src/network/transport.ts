@@ -4,7 +4,8 @@ import type { ConnectionOptions } from 'node:tls';
 import { lookup } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
 
-export interface HttpTransport { fetch(request: Request, options?: { mode?: 'endpoint' | 'discovery' }): Promise<Response> }
+// waitMs: how long the peer may legitimately hold this request (a long poll); it is added to the timeout.
+export interface HttpTransport { fetch(request: Request, options?: { mode?: 'endpoint' | 'discovery'; waitMs?: number }): Promise<Response> }
 export interface NetworkOptions { timeoutMs?: number; maxResponseBytes?: number; maxRequestBytes?: number; maxRedirects?: number; localExceptions?: readonly { hostname: string; addresses: readonly string[] }[]; ca?: string }
 export class TransportError extends Error {
   constructor(readonly code: 'invalid_url' | 'blocked_address' | 'redirect_limit' | 'timeout' | 'body_limit' | 'network_error') { super(`Transport ${code}`); this.name = 'TransportError'; }
@@ -57,8 +58,11 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
     return isPublicAddress(address) || !!options.localExceptions?.some(entry => entry.hostname.toLowerCase() === hostname.toLowerCase() && entry.addresses.some(ip => normalizedAddress(ip) === normalizedAddress(address)));
   }
   return { async fetch(request, settings = {}) {
+    const timeoutMs = limits.timeoutMs + (settings.waitMs ?? 0);
+    // setTimeout fires at once beyond 2^31-1 ms, which would turn a long wait into an instant timeout.
+    if (!Number.isSafeInteger(settings.waitMs ?? 0) || settings.waitMs! < 0 || timeoutMs > 2 ** 31 - 1) throw new TypeError('Invalid transport wait');
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new TransportError('timeout')), limits.timeoutMs);
+    const timer = setTimeout(() => controller.abort(new TransportError('timeout')), timeoutMs);
     const signal = AbortSignal.any([request.signal, controller.signal]);
     let body: Buffer | undefined;
     try {
