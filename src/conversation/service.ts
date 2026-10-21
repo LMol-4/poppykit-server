@@ -385,14 +385,14 @@ export function createConversationService(options: ConversationOptions): Convers
   // Resolves the durable authority, then revalidates fence, lease and phase inside the transaction.
   // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
-    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, ending = false): Promise<T> {
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord) => T, accountFree = false): Promise<T> {
     for (;;) {
       const before = await store.read();
       const stored = before.work.find(work => work.id === ref.workId);
       if (!stored) throw new PublicationError('stale_work');
       const granted = scopes(before, stored);
-      // Failing or suspending uses no account and must stay possible after revocation, or the work is reclaimed forever.
-      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      // A publication that uses no account (failing, suspending, asking to sign in) must stay possible after revocation, or the work is reclaimed forever.
+      const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
         return await policy.withAccepted(authority, granted, () => store.transaction(draft => {
           const work = draft.work.find(item => item.id === ref.workId);
@@ -408,7 +408,7 @@ export function createConversationService(options: ConversationOptions): Convers
   const noScopes = () => [];
 
   // Staff operations: the host authorizes the operator, then the conversation's stored customer authority applies.
-  async function staff<T>(operator: unknown, conversationId: string, ending: boolean,
+  async function staff<T>(operator: unknown, conversationId: string, accountFree: boolean,
     change: (draft: ConversationStoreState, conversation: ConversationRecord, authority: AcceptedAuthority) => T): Promise<T> {
     if (!options.authorizeOperator) throw new TypeError('authorizeOperator is not configured');
     await options.authorizeOperator(operator, conversationId);
@@ -418,7 +418,7 @@ export function createConversationService(options: ConversationOptions): Convers
       // Conversations stored before staff support have none until the customer's next accepted message.
       if (stored.authority === undefined) throw new Error('Conversation has no stored customer authority');
       // Leaving the queue or handing back uses no account, so it stays possible after revocation.
-      const authority: AcceptedAuthority = ending ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
+      const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
         return await policy.withAccepted(authority, [], () => store.transaction(draft => {
           const conversation = own(draft.conversations, conversationId);
