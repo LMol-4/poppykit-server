@@ -47,6 +47,8 @@ export interface ReferenceIssuerOptions {
   accountLifetimeSeconds?: number; // default 2592000, rotation never extends it
   requireDpopNonce?: boolean; // default true at token endpoint
   maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
+  maxPendingAuthorizationsPerClient?: number; // default 100, so one client cannot use up the global cap
+  maxSessionsPerClient?: number; // default 10000 live Sessions; new ones are refused with rate_limited
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
@@ -96,7 +98,7 @@ export function initialIssuerState(): IssuerState {
 }
 
 class TokenError extends Error {
-  constructor(readonly code: string, readonly nonce?: string) { super(`Token request failed: ${code}`); this.name = 'TokenError'; }
+  constructor(readonly code: string, readonly headers: Record<string, string> = {}) { super(`Token request failed: ${code}`); this.name = 'TokenError'; }
 }
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...headers } });
@@ -140,6 +142,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const lifetimeMs = lifetimeSeconds * 1000;
   const accountLifetimeMs = positive(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
   const maxPending = positive(options.maxPendingAuthorizations, 1000, 'maxPendingAuthorizations');
+  const maxPendingPerClient = positive(options.maxPendingAuthorizationsPerClient, 100, 'maxPendingAuthorizationsPerClient');
+  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 10_000, 'maxSessionsPerClient');
   const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
@@ -241,7 +245,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // htu is checked against the configured token endpoint, never the incoming Request URL.
     const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
     // Nonce challenge precedes any network fetch and any replay consumption.
-    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', await currentNonce(state));
+    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
 
     const { client, verify, keys } = await authenticateClient(clientId, clientAssertion);
     let session: AssertionClaims | undefined;
@@ -276,6 +280,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         return found;
       };
       const create = (userId: string): [string, SessionRecord] => {
+        // Pruned above, so these are live; a slot frees when the soonest of them ends (spec 4.2 rate_limited).
+        const live = Object.values(draft.sessions).filter(record => record.clientId === clientId);
+        if (live.length >= maxSessionsPerClient) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil((Math.min(...live.map(record => record.expiresAt)) - at) / 1000)) });
         const id = `ses_${random(16)}`;
         return [id, draft.sessions[id] = { clientId, userId, version: 1, createdAt: at, expiresAt: at, accountId: null, grantId: null }];
       };
@@ -363,7 +370,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       if (!request.bodyUsed) await request.body?.cancel().catch(() => {});
       const code = error instanceof TokenError || error instanceof AuthorityError ? error.code : undefined;
       if (!code) throw error;
-      return json(code === 'invalid_client' ? 401 : 400, { error: code }, error instanceof TokenError && error.nonce ? { 'DPoP-Nonce': error.nonce } : {});
+      const status = code === 'invalid_client' ? 401 : code === 'rate_limited' ? 429 : 400;
+      return json(status, { error: code }, error instanceof TokenError ? error.headers : {});
     }
   }
 
@@ -428,7 +436,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       return commit(draft => {
         if (draft.generation !== generation) throw new AuthorizationError('invalid_request');
         const at = now(); prune(draft, at);
-        if (Object.keys(draft.authorizations).length >= maxPending) throw fail('temporarily_unavailable');
+        const pending = Object.values(draft.authorizations);
+        if (pending.length >= maxPending || pending.filter(record => record.clientId === clientId).length >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
         draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt };
         return { id, clientId, clientName: client.client_name, scopes, expiresAt };
