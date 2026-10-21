@@ -485,8 +485,10 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       policy,
     },
     // The User disconnected this Personal Agent: revoke its grants for the account and sign out their Sessions (spec 4.9).
+    // Its codes for the account go too, so none consented before can sign in again; pending authorizations name no account until consent.
     disconnect: (clientId, accountId) => commit(draft => {
       for (const [grantId, grant] of Object.entries(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) revokeGrant(draft, grantId);
+      for (const [key, code] of Object.entries(draft.codes)) if (code.clientId === clientId && code.accountId === accountId) delete draft.codes[key];
     }),
   };
 }

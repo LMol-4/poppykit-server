@@ -284,6 +284,20 @@ test('disconnect revokes the account sign-ins of that client and signs out their
   assert.equal((await env.refresh(b.body.refresh_token)).status, 200);
 });
 
+test('disconnect deletes the unredeemed codes of that client and account; other accounts and clients keep theirs', async () => {
+  const env = await signInSetup();
+  const session = await env.session();
+  const mine = await env.code();
+  const otherAccount = await env.code({ accountId: 'acct_2' });
+  const otherClient = await env.code({ params: { client_id: OTHER_CLIENT } });
+  await env.issuer.disconnect(CLIENT, 'acct_1');
+  assert.equal(Object.keys(env.store.state.codes).length, 2);
+  expectError(await env.exchange(session.session_id, mine), 'invalid_grant');
+  assert.deepEqual(env.store.state.grants, {}, 'no sign-in was created from the deleted code');
+  assert.equal((await env.exchange(session.session_id, otherAccount)).status, 200);
+  assert.equal(Object.values(env.store.state.codes).find(code => code.clientId === OTHER_CLIENT).accountId, 'acct_1');
+});
+
 test('Sessions end after a day without tokens and expired records are pruned', async () => {
   const env = await signInSetup();
   const idle = await env.session();
