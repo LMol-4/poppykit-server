@@ -14,6 +14,7 @@ export interface StateStore<State> {
   transaction<T>(change: (draft: State) => T): Promise<T>;
 }
 // accountId is sticky (spec 4.4): it stays after sign-out; grantId is the active sign-in, null when signed out.
+// version only fills Principal.sessionVersion: it is never bumped, since a Session ends by deletion, which the policy already checks.
 interface SessionRecord { clientId: string; userId: string; version: number; createdAt: number; expiresAt: number; accountId: string | null; grantId: string | null }
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
@@ -381,7 +382,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const state = await read();
       const session = own(state.sessions, principal.sessionId);
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
-        || session.userId !== principal.userId || session.version !== principal.sessionVersion || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
+        || session.userId !== principal.userId || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
       requireScopes(principal.scopes, scopes);
       return action();
     }),
