@@ -285,6 +285,7 @@ test('construction rejects invalid options', () => {
   const base = { endpoint, store, authenticator: {}, policy: {}, clock: { now: () => 0 } };
   assert.throws(() => createConversationService({ ...base, pageSize: 0 }), TypeError);
   assert.throws(() => createConversationService({ ...base, leaseMs: -1 }), TypeError);
+  assert.throws(() => createConversationService({ ...base, finishedWorkLimit: 0 }), TypeError);
   assert.throws(() => createConversationService({ ...base, endpoint: 'http://api.example.test/poppy' }));
 });
 
@@ -367,6 +368,41 @@ test('work is serial per conversation and finish keeps working while more is pen
   assert.equal(page.events.at(-2).message.role, 'company');
   await t.service.finish(second, 'suspended');
   assert.equal(await t.service.claim(), null, 'suspended work is not resumed automatically');
+});
+
+test('an idle claim only reads; a claim that loses the race after its read returns null', async () => {
+  const t = setup();
+  assert.equal(await t.service.claim(), null);
+  assert.equal(t.store.transactions, 0, 'no candidate, no write transaction');
+  await t.start(hello);
+  const before = t.store.transactions;
+  let winner;
+  t.store.afterRead = async () => { winner = await t.service.claim(); };
+  assert.equal(await t.service.claim(), null, 'the transaction rechecks the candidate');
+  assert.equal(winner.message.id, hello.id);
+  assert.equal(t.store.transactions, before + 2);
+  assert.equal((await t.store.read()).work[0].fence, winner.fence, 'the loser changed nothing');
+});
+
+test('finished work is pruned oldest first beyond the limit; held and unfinished work and receipts are kept', async () => {
+  const t = setup({ finishedWorkLimit: 2 });
+  const ids = []; const claims = [];
+  for (const n of [1, 2, 3]) {
+    ids.push((await t.start({ id: `msg_${n}`, sender: 'agent', text: `q${n}` })).body.conversation_id);
+    claims.push(await t.service.claim());
+    await t.service.finish(claims.at(-1), 'completed');
+  }
+  await t.handoff(ids[0]);
+  await t.send(ids[0], { id: 'msg_held', sender: 'agent', text: 'for the person' });
+  const phases = async () => (await t.store.read()).work.map(work => [work.message.id, work.phase]);
+  assert.deepEqual(await phases(), [['msg_2', 'completed'], ['msg_3', 'completed'], ['msg_held', 'held']]);
+  await t.start({ id: 'msg_4', sender: 'agent', text: 'q4' });
+  await t.service.finish(await t.service.claim(), 'failed');
+  await t.start({ id: 'msg_5', sender: 'agent', text: 'q5' });
+  assert.deepEqual(await phases(), [['msg_3', 'completed'], ['msg_held', 'held'], ['msg_4', 'failed'], ['msg_5', 'pending']]);
+  assert.equal(Object.keys((await t.store.read()).messages).length, 6, 'message receipts are kept as long as the conversation (spec 7.3)');
+  await assert.rejects(t.service.finish(claims[1], 'completed'), { code: 'stale_work' }, 'a pruned fence is stale, as it was once finished');
+  assert.equal((await t.start({ id: 'msg_1', sender: 'agent', text: 'q1' })).body.conversation_id, ids[0], 'dedupe outlives the pruned work');
 });
 
 const childMessage = { id: 'msg_child', sender: 'human', text: 'Hi, I have a question.' };

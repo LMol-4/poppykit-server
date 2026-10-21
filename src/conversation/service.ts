@@ -41,6 +41,7 @@ export interface ConversationOptions {
   revocationPolicy?: WorkRevocationPolicy;
   pageSize?: number;
   leaseMs?: number;
+  finishedWorkLimit?: number; // default 1000 finished work records kept, newest first, for inspection; older ones are dropped
   pollIntervalMs?: number; // long-poll store checks, outside all locks
   /** Mandatory for staff methods: authenticate and authorize this company operator for the conversation, or throw. */
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
@@ -100,6 +101,7 @@ const notFound = () => new HttpError(404, { error: 'conversation_not_found' });
 const closed = () => new HttpError(409, { error: 'conversation_closed' });
 const directOpen = (childId: string) => new HttpError(409, { error: 'direct_conversation_open', conversation_id: childId });
 const unfinished = (work: WorkRecord) => work.phase === 'pending' || work.phase === 'claimed';
+const finished = (work: WorkRecord) => !unfinished(work) && work.phase !== 'held';
 
 function json(status: number, body: unknown, headers: HeadersInit = {}): Response {
   const response = Response.json(body, { status, headers });
@@ -134,8 +136,9 @@ export function createConversationService(options: ConversationOptions): Convers
   const pageSize = options.pageSize ?? 100;
   const leaseMs = options.leaseMs ?? 60000;
   const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const finishedWorkLimit = options.finishedWorkLimit ?? 1000;
   const revocationPolicy = options.revocationPolicy ?? 'stop-account-work';
-  for (const value of [pageSize, leaseMs, pollIntervalMs]) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid conversation option');
+  for (const value of [pageSize, leaseMs, pollIntervalMs, finishedWorkLimit]) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid conversation option');
   const endpoint = secureUrl(options.endpoint);
   const basePath = endpoint.pathname.replace(/\/$/, '');
 
@@ -150,6 +153,25 @@ export function createConversationService(options: ConversationOptions): Convers
     addEvent(conversation, { type: 'state', status, responder });
   }
   const newFence = (draft: ConversationStoreState) => `${draft.generation}.${randomId('')}`;
+  // Finished work is never read again: publication needs a claimed record (else stale_work), and status, claims and
+  // handback look only at held, pending and claimed work. Output dedupe lives on the claimed record. So the oldest go first.
+  function pruneWork(draft: ConversationStoreState): void {
+    let excess = draft.work.filter(finished).length - finishedWorkLimit;
+    if (excess > 0) draft.work = draft.work.filter(work => !finished(work) || excess-- <= 0);
+  }
+  // Serial per conversation: only the oldest unfinished work item is eligible.
+  function claimable(state: ConversationStoreState, now: number): WorkRecord | undefined {
+    const seen = new Set<string>();
+    for (const work of state.work) {
+      if (!unfinished(work) || seen.has(work.conversationId)) continue;
+      seen.add(work.conversationId);
+      const conversation = state.conversations[work.conversationId];
+      // Automation pauses while queued for or handled by a person, and while a Direct Conversation is open.
+      if (conversation.status === 'queued' || conversation.responder === 'human' || conversation.childId !== undefined) continue;
+      if (work.phase === 'claimed' && (work.leaseUntil ?? 0) > now) continue;
+      return work;
+    }
+  }
   const idleOrWorking = (draft: ConversationStoreState, id: string): Status =>
     draft.work.some(work => work.conversationId === id && unfinished(work)) ? 'working' : 'idle';
   // Invalidates every current claim on a conversation: automated work returns to pending, or all of it is cancelled.
@@ -296,6 +318,7 @@ export function createConversationService(options: ConversationOptions): Convers
         if (read.cursor !== undefined) page(conversation, read.cursor);
         conversation.authority = authority;
       }
+      pruneWork(draft);
       const message = body.message;
       if (message.context) conversation.context = { ...conversation.context, ...message.context };
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
@@ -431,25 +454,18 @@ export function createConversationService(options: ConversationOptions): Convers
       }
     },
 
-    claim() {
+    async claim() {
+      // Idle pollers only read; the transaction rechecks, since another claimer may have won in between.
+      if (!claimable(await store.read(), clock.now())) return null;
       return store.transaction(draft => {
         const now = clock.now();
-        const seen = new Set<string>();
-        for (const work of draft.work) {
-          if (!unfinished(work)) continue;
-          // Serial per conversation: only the oldest unfinished work item is eligible.
-          if (seen.has(work.conversationId)) continue;
-          seen.add(work.conversationId);
-          const conversation = draft.conversations[work.conversationId];
-          // Automation pauses while queued for or handled by a person, and while a Direct Conversation is open.
-          if (conversation.status === 'queued' || conversation.responder === 'human' || conversation.childId !== undefined) continue;
-          if (work.phase === 'claimed' && (work.leaseUntil ?? 0) > now) continue;
-          work.phase = 'claimed';
-          work.fence = newFence(draft);
-          work.leaseUntil = now + leaseMs;
-          return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: work.message, context: conversation.context };
-        }
-        return null;
+        const work = claimable(draft, now);
+        if (!work) return null;
+        pruneWork(draft);
+        work.phase = 'claimed';
+        work.fence = newFence(draft);
+        work.leaseUntil = now + leaseMs;
+        return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: work.message, context: draft.conversations[work.conversationId].context };
       });
     },
 
