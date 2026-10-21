@@ -44,6 +44,8 @@ export interface ConversationOptions {
   pollIntervalMs?: number; // long-poll store checks, outside all locks
   /** Mandatory for staff methods: authenticate and authorize this company operator for the conversation, or throw. */
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
+  /** Mandatory for requestAuthorization: the scopes the issuer's Direct Sign-In grants; work may ask only for these. */
+  directScopes?: readonly string[];
 }
 export interface WorkRef { workId: string; fence: string }
 export interface WorkClaim extends WorkRef { conversationId: string; message: Message; context: JsonObject }
@@ -57,6 +59,10 @@ export interface ConversationService {
   /** Account-use gate: call before any account read or tool. Checks accepted authority, then binds the shared ownership once. */
   requireAccount(work: WorkRef, scopes: readonly string[]): Promise<{ accountId: string }>;
   reply(work: WorkRef, outputId: string, message: Message): Promise<void>;
+  /** Spec 7.11: asks the Personal Agent to sign in or grant these scopes. Uses no account, so it still publishes after revocation. */
+  requestAuthorization(work: WorkRef, outputId: string, scopes: readonly string[]): Promise<void>;
+  /** Spec 7.10: asks to talk with the User directly; status and responder are unchanged. */
+  requestUser(work: WorkRef, outputId: string, reason: string): Promise<void>;
   finish(work: WorkRef, outcome: 'completed' | 'suspended' | 'failed'): Promise<void>;
   /** The company asks for a person on its own: this attempt ends and the conversation is queued. */
   handoff(work: WorkRef): Promise<void>;
@@ -403,6 +409,13 @@ export function createConversationService(options: ConversationOptions): Convers
       }
     }
   }
+  // Stable output IDs: true the first time, false for an identical repeat, a conflict for changed content.
+  function firstOutput(work: WorkRecord, outputId: string, payload: string): boolean {
+    const previous = own(work.outputs, outputId);
+    if (previous === undefined) { work.outputs[outputId] = payload; return true; }
+    if (previous !== payload) throw new PublicationError('output_conflict');
+    return false;
+  }
   const boundAccount = (state: ConversationStoreState, work: WorkRecord) => own(state.bindings, state.conversations[work.conversationId].bindingId)?.accountId;
 
   return {
@@ -468,15 +481,32 @@ export function createConversationService(options: ConversationOptions): Convers
       const payload = canonical({ reply: parsed });
       await publish(ref, noScopes, (draft, work, conversation) => {
         if (parsed.sender !== conversation.responder) throw new ValidationError('message.sender');
-        const previous = own(work.outputs, outputId);
-        if (previous !== undefined) {
-          if (previous !== payload) throw new PublicationError('output_conflict');
-          return;
-        }
-        work.outputs[outputId] = payload;
+        if (!firstOutput(work, outputId, payload)) return;
         // A person's reply answers the messages held for them so far.
         if (work.human) for (const item of draft.work) if (item.conversationId === conversation.id && item.phase === 'held') item.phase = 'cancelled';
         addEvent(conversation, { type: 'message', message: { ...parsed, role: 'company' } as JsonObject });
+      });
+    },
+
+    async requestAuthorization(ref, outputId, scopes) {
+      const direct = options.directScopes;
+      if (!direct) throw new TypeError('directScopes is not configured');
+      if (!Array.isArray(scopes) || !scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.includes(scope))) throw new TypeError('scopes');
+      const scope = [...new Set(scopes)].join(' ');
+      await publish(ref, noScopes, (draft, work, conversation) => {
+        if (!firstOutput(work, outputId, canonical({ authorization: scope }))) return;
+        const { accountId, scopes: granted } = work.authority.principal;
+        const bound = boundAccount(draft, work);
+        // More scopes only helps a signed-in work on the right account; signed out, another account or revoked all need sign-in.
+        const narrow = accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
+        addEvent(conversation, { type: 'authorization', error: narrow ? 'insufficient_scope' : 'sign_in_required', scope });
+      }, true);
+    },
+
+    async requestUser(ref, outputId, reason) {
+      if (typeof reason !== 'string' || reason === '') throw new TypeError('reason');
+      await publish(ref, noScopes, (_draft, work, conversation) => {
+        if (firstOutput(work, outputId, canonical({ user_requested: reason }))) addEvent(conversation, { type: 'user_requested', reason });
       });
     },
 

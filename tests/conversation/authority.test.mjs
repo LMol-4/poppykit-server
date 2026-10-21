@@ -25,7 +25,7 @@ function setup(revocationPolicy) {
   const authenticator = { async authenticate() { return current; } };
   const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
-  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1 });
+  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, directScopes: ['poppy:read'] });
   const call = async (method, path, body) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body && JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
@@ -86,6 +86,34 @@ test('stop-account-work: revoked work can still fail or suspend, so the conversa
     state = await t.store.read();
     assert.equal(state.conversations[id].status, 'idle');
   }
+});
+
+test('stop-account-work: revoked work can still ask to sign in, but cannot ask for the user', async () => {
+  const t = setup();
+  const id = (await t.call('POST', '', { message })).body.conversation_id;
+  const claim = await t.service.claim();
+  await t.issuer.disconnect(CLIENT, 'acct_1');
+  await assert.rejects(t.service.requestUser(claim, 'user', 'A specialist needs you.'), { code: 'invalid_token' });
+  // Asking to sign in uses no account and is exactly what the signed-out User needs (spec 4.9, 7.11).
+  await t.service.requestAuthorization(claim, 'auth', ['poppy:read']);
+  await t.service.finish(claim, 'suspended');
+  const conversation = (await t.store.read()).conversations[id];
+  const event = conversation.events.at(-2);
+  assert.deepEqual([event.type, event.error, event.scope], ['authorization', 'sign_in_required', 'poppy:read']);
+  assert.equal(conversation.status, 'idle');
+  assert.equal(t.coordinator.held, false);
+});
+
+test('a revoked sign-in request still respects the fence and a reset generation', async () => {
+  const t = setup();
+  await t.call('POST', '', { message });
+  const claim = await t.service.claim();
+  await t.issuer.disconnect(CLIENT, 'acct_1');
+  t.clock.t = NOW + 2 * 60_000; // past the default lease
+  await assert.rejects(t.service.requestAuthorization(claim, 'auth', ['poppy:read']), { code: 'stale_work' });
+  const fresh = await t.service.claim();
+  t.issuerStore.set(state => { state.generation = 'after-reset'; });
+  await assert.rejects(t.service.requestAuthorization(fresh, 'auth', ['poppy:read']), { code: 'invalid_token' });
 });
 
 test('failing revoked work still respects a reset generation', async () => {
