@@ -436,6 +436,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       return commit(draft => {
         if (draft.generation !== generation) throw new AuthorizationError('invalid_request');
         const at = now(); prune(draft, at);
+        // shortcut: an unauthenticated caller can fill one client's slots for AUTHORIZATION_MS (10 minutes); hosts must rate-limit /authorize.
         const pending = Object.values(draft.authorizations);
         if (pending.length >= maxPending || pending.filter(record => record.clientId === clientId).length >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
