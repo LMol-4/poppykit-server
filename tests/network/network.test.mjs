@@ -100,6 +100,7 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
     else if (request.url === '/loop') { response.writeHead(302, { location: '/loop' }); response.end(); }
     else if (request.url === '/large') response.end('x'.repeat(2048));
     else if (request.url === '/slow') { response.writeHead(200); response.flushHeaders(); }
+    else if (request.url === '/held') setTimeout(() => response.end('held'), 300); // a long poll answered late
     else { response.writeHead(429, { 'Retry-After': '2', 'DPoP-Nonce': 'n', 'WWW-Authenticate': ['DPoP error="use_dpop_nonce"', 'Bearer realm="example"'] }); response.end('{"error":"rate_limited"}'); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); port = server.address().port;
@@ -122,6 +123,11 @@ test('real TLS enforces trust, bounded bodies/time, safe redirects and exact add
   await assert.rejects(createNodeTransport({ ...options, maxRedirects: 1 }).fetch(target('/loop'), { mode: 'discovery' }), { code: 'redirect_limit' });
   await assert.rejects(createNodeTransport({ ...options, maxResponseBytes: 100 }).fetch(target('/large')), { code: 'body_limit' });
   await assert.rejects(createNodeTransport({ ...options, timeoutMs: 100 }).fetch(target('/slow')), { code: 'timeout' });
+  // A held long poll gets its wait on top of the timeout; without it the same request times out.
+  const short = createNodeTransport({ ...options, timeoutMs: 100 });
+  assert.equal(await (await short.fetch(target('/held'), { waitMs: 1000 })).text(), 'held');
+  await assert.rejects(short.fetch(target('/held')), { code: 'timeout' });
+  for (const waitMs of [-1, 1.5, 2 ** 31]) await assert.rejects(short.fetch(target('/held'), { waitMs }), TypeError, String(waitMs));
   await assert.rejects(createNodeTransport({ ...options, maxRequestBytes: 2 }).fetch(new Request(`https://localhost:${port}/ok`, { method: 'POST', body: 'large' })), { code: 'body_limit' });
   await assert.rejects(transport.fetch(new Request(`https://localhost:${port}/ok`, { signal: AbortSignal.abort() })));
   const original = dns.lookup; let count = 0;
