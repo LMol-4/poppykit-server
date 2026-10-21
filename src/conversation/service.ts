@@ -16,12 +16,13 @@ export interface ConversationRecord {
   authority: AcceptedAuthority; // of the latest accepted message; staff operations act under it
   parentId?: string; // set on a Direct Conversation
   childId?: string; // the parent's open Direct Conversation
+  humanUntil?: number; // while responder is human: the operator lease, set on join and renew; it outlives a finished claim
 }
 export interface WorkRecord {
   id: string; conversationId: string; message: Message; authority: AcceptedAuthority;
   phase: 'held' | 'pending' | 'claimed' | 'completed' | 'suspended' | 'failed' | 'cancelled'; // held: for a person, not automation
   fence?: string; leaseUntil?: number;
-  human?: true; // a staff attempt: never claimed by automation; when its operator lease runs out, claim() hands the conversation back
+  human?: true; // a staff attempt: never claimed by automation; once the conversation's humanUntil passes, claim() hands it back
   outputs: Record<string, string>; // outputId -> canonical payload
 }
 export interface MessageRecord { conversationId: string; fingerprint: string; receipt: { status: number; body: JsonObject } }
@@ -167,13 +168,17 @@ export function createConversationService(options: ConversationOptions): Convers
   function claimable(state: ConversationStoreState, now: number): WorkRecord | undefined {
     const seen = new Set<string>();
     for (const work of state.work) {
+      const conversation = state.conversations[work.conversationId];
+      // A person who left, with or without finishing their claim: once the operator lease passes, anything awaiting
+      // them (their claim or held messages) is handed back. Never while a Direct Conversation is open: that would cancel parent work.
+      if (conversation.responder === 'human') {
+        if ((work.phase === 'held' || unfinished(work)) && (conversation.humanUntil ?? 0) <= now && conversation.childId === undefined) return work;
+        continue;
+      }
       if (!unfinished(work) || seen.has(work.conversationId)) continue;
       seen.add(work.conversationId);
-      // A person's claim is the conversation's only unfinished work; once its lease runs out it is handed back.
-      if (work.human) { if ((work.leaseUntil ?? 0) <= now) return work; continue; }
-      const conversation = state.conversations[work.conversationId];
-      // Automation pauses while queued for or handled by a person, and while a Direct Conversation is open.
-      if (conversation.status === 'queued' || conversation.responder === 'human' || conversation.childId !== undefined) continue;
+      // Automation pauses while queued for a person and while a Direct Conversation is open.
+      if (conversation.status === 'queued' || conversation.childId !== undefined) continue;
       if (work.phase === 'claimed' && (work.leaseUntil ?? 0) > now) continue;
       return work;
     }
@@ -203,6 +208,7 @@ export function createConversationService(options: ConversationOptions): Convers
   function handBack(draft: ConversationStoreState, conversation: ConversationRecord): void {
     fence(draft, conversation.id, 'cancelled');
     release(draft, conversation.id);
+    delete conversation.humanUntil;
     setState(conversation, idleOrWorking(draft, conversation.id), 'agent');
   }
   // Closing a parent closes its open Direct Conversation first; closing a child reopens its parent for messages.
@@ -485,7 +491,7 @@ export function createConversationService(options: ConversationOptions): Convers
         for (let work = claimable(draft, now); work; work = claimable(draft, now)) {
           const conversation = draft.conversations[work.conversationId];
           // An abandoned person's claim pins responder human no longer; this uses no account, like returnToAgent.
-          if (work.human) { handBack(draft, conversation); continue; }
+          if (conversation.responder === 'human') { handBack(draft, conversation); continue; }
           work.phase = 'claimed';
           work.fence = newFence(draft);
           work.leaseUntil = now + leaseMs;
@@ -496,7 +502,10 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     renew(ref) {
-      return publish(ref, noScopes, (_draft, work) => { work.leaseUntil = clock.now() + (work.human ? operatorLeaseMs : leaseMs); }, byPerson);
+      return publish(ref, noScopes, (_draft, work, conversation) => {
+        work.leaseUntil = clock.now() + (work.human ? operatorLeaseMs : leaseMs);
+        if (work.human) conversation.humanUntil = work.leaseUntil;
+      }, byPerson);
     },
 
     history(ref) {
@@ -587,6 +596,7 @@ export function createConversationService(options: ConversationOptions): Convers
         const last = conversation.events.findLast(event => event.type === 'message' && (event.message as Message).role === 'user');
         const { role: _role, ...message } = last!.message as Message;
         const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), leaseUntil: clock.now() + operatorLeaseMs, human: true, outputs: {} };
+        conversation.humanUntil = work.leaseUntil;
         draft.work.push(work);
         setState(conversation, 'idle', 'human');
         return { workId: work.id, fence: work.fence!, conversationId, message, context: conversation.context };

@@ -299,6 +299,22 @@ test("an abandoned person's claim expires: the next claim hands the conversation
   assert.throws(() => staffSetup({ operatorLeaseMs: 0 }), TypeError);
 });
 
+test('a person who finished and left hands back once the operator lease passes, so later messages are answered', async () => {
+  const t = staffSetup({ operatorLeaseMs: 10_000 });
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  const person = await t.service.joinHuman(operator, id);
+  await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
+  await t.service.finish(person, 'completed');
+  await t.send(id, human('msg_2', 'One more question.'));
+  assert.equal(await t.service.claim(), null, 'held for the person while the lease runs');
+  assert.equal((await t.read(id)).body.responder, 'human');
+  t.clock.advance(10_000);
+  const next = await t.service.claim();
+  assert.equal(next.message.id, 'msg_2');
+  assert.deepEqual([(await t.read(id)).body.status, (await t.read(id)).body.responder], ['working', 'agent']);
+});
+
 test('staff operations: operator authorization is mandatory and stored customer authority applies', async () => {
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;
