@@ -25,7 +25,7 @@ function setup(revocationPolicy) {
   const authenticator = { async authenticate() { return current; } };
   const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
-  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, directScopes: ['poppy:read', 'poppy:write'] });
+  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, authorizeOperator: async () => {}, directScopes: ['poppy:read', 'poppy:write'] });
   const call = async (method, path, body) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body && JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
@@ -115,6 +115,27 @@ test('revoked work asking for a scope it never had is told to sign in, not to wi
     const events = (await t.store.read()).conversations[id].events.filter(event => event.type === 'authorization');
     assert.deepEqual(events.map(event => [event.error, event.scope]), [['insufficient_scope', 'poppy:write'], ['sign_in_required', 'poppy:write']], revocationPolicy);
   }
+});
+
+test("stop-account-work: a person's replies use no account and still publish after revocation; account reads do not", async () => {
+  const t = setup();
+  const id = (await t.call('POST', '', { message })).body.conversation_id;
+  const person = await t.service.joinHuman({}, id);
+  await t.issuer.disconnect(CLIENT, 'acct_1');
+  await assert.rejects(t.service.requireAccount(person, ['poppy:read']), { code: 'invalid_token' });
+  await assert.rejects(t.service.history(person), { code: 'invalid_token' });
+  await t.service.renew(person);
+  await t.service.reply(person, 'out_1', { id: 'msg_h1', sender: 'human', text: 'I can help with that.' });
+  const { generation } = await t.issuerStore.read();
+  t.issuerStore.set(state => { state.generation = 'after-reset'; });
+  await assert.rejects(t.service.finish(person, 'completed'), { code: 'invalid_token' }, 'a reset still stops it');
+  t.issuerStore.set(state => { state.generation = generation; });
+  await t.service.finish(person, 'completed');
+  const state = await t.store.read();
+  assert.equal(state.conversations[id].events.at(-1).message.sender, 'human');
+  assert.deepEqual(state.bindings[id], {}, 'no account was used');
+  await assert.rejects(t.service.reply(person, 'out_2', { id: 'msg_h2', sender: 'human', text: 'x' }), { code: 'stale_work' }, 'the fence still applies');
+  await assert.rejects(t.service.joinHuman({}, id), { code: 'invalid_token' }, 'joining acts under the revoked customer authority');
 });
 
 test('a revoked sign-in request still respects the fence and a reset generation', async () => {

@@ -262,7 +262,7 @@ test('a person joins, publishes as human, then returns the conversation to the a
   await t.send(id, { id: 'msg_2', sender: 'human', text: 'Thanks!' });
   assert.equal(await t.service.claim(), null);
   assert.equal((await t.service.history(person)).at(-1).message.text, 'Thanks!');
-  // The person's claim is not lease-bound.
+  // The person's claim has its own, longer operator lease.
   t.clock.advance(10 * 60_000);
   await t.service.reply(person, 'out_2', reply('msg_h2', 'human'));
   await t.service.returnToAgent(operator, id);
@@ -273,6 +273,30 @@ test('a person joins, publishes as human, then returns the conversation to the a
   await assert.rejects(t.service.reply(person, 'out_3', reply('msg_h3', 'human')), { code: 'stale_work' });
   await t.send(id, { id: 'msg_3', sender: 'agent', text: 'Back to you.' });
   assert.equal((await t.service.claim()).message.id, 'msg_3');
+});
+
+test("an abandoned person's claim expires: the next claim hands the conversation back and answers what they left", async () => {
+  const t = staffSetup({ operatorLeaseMs: 10_000 });
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  const person = await t.service.joinHuman(operator, id);
+  await t.send(id, human('msg_2', 'Anyone there?'));
+  t.clock.advance(9_000);
+  await t.service.renew(person);
+  t.clock.advance(9_000);
+  assert.equal(await t.service.claim(), null, 'a renewed claim is not handed back');
+  assert.equal((await t.read(id)).body.responder, 'human');
+  await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
+  await t.send(id, human('msg_3', 'Hello?'));
+  t.clock.advance(10_000);
+  await assert.rejects(t.service.reply(person, 'out_2', reply('msg_h2', 'human')), { code: 'stale_work' }, 'an expired lease cannot publish');
+  const next = await t.service.claim();
+  assert.equal(next.message.id, 'msg_3', 'the agent answers the message the person left');
+  const page = (await t.read(id)).body;
+  assert.deepEqual([page.status, page.responder], ['working', 'agent']);
+  assert.deepEqual([page.events.at(-1).type, page.events.at(-1).responder], ['state', 'agent']);
+  await assert.rejects(t.service.reply(person, 'out_2', reply('msg_h2', 'human')), { code: 'stale_work' });
+  assert.throws(() => staffSetup({ operatorLeaseMs: 0 }), TypeError);
 });
 
 test('staff operations: operator authorization is mandatory and stored customer authority applies', async () => {
