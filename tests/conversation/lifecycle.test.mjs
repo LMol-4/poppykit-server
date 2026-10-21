@@ -427,3 +427,39 @@ test('long poll: foreign readers are refused before any hold; an aborted wait on
 test('construction rejects an invalid poll interval', () => {
   assert.throws(() => setup({ pollIntervalMs: 0 }), TypeError);
 });
+
+test("a person's reply cancels the messages held before it; later ones stay held", async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  const person = await t.service.joinHuman(operator, id);
+  await t.send(id, { id: 'msg_2', sender: 'human', text: 'Still there?' });
+  await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
+  await t.send(id, { id: 'msg_3', sender: 'human', text: 'Thanks.' });
+  const phases = (await t.store.read()).work.filter(work => !work.human).map(work => [work.message.id, work.phase]);
+  assert.deepEqual(phases, [[hello.id, 'cancelled'], ['msg_2', 'cancelled'], ['msg_3', 'held']]);
+});
+
+test('close cancels work held for a person', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.handoff(id);
+  await t.service.joinHuman(operator, id);
+  await t.send(id, { id: 'msg_2', sender: 'human', text: 'Still there?' });
+  assert.equal((await t.store.read()).work.at(-1).phase, 'held');
+  await t.close(id);
+  assert.deepEqual((await t.store.read()).work.filter(work => !work.human).map(work => work.phase), ['cancelled', 'cancelled']);
+});
+
+test('a failed finish adds no canned message for a person, but the agent still apologises', async () => {
+  const t = staffSetup();
+  const id = (await t.start(hello)).body.conversation_id;
+  await t.service.finish(await t.service.claim(), 'failed');
+  const last = async () => (await t.store.read()).conversations[id].events.filter(event => event.type === 'message').at(-1).message;
+  assert.deepEqual([(await last()).sender, (await last()).text.startsWith('Sorry')], ['agent', true]);
+  await t.handoff(id);
+  const person = await t.service.joinHuman(operator, id);
+  const before = (await t.store.read()).conversations[id].events.length;
+  await t.service.finish(person, 'failed');
+  assert.equal((await t.store.read()).conversations[id].events.length, before);
+});
