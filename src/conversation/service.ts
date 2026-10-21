@@ -530,6 +530,8 @@ export function createConversationService(options: ConversationOptions): Convers
     async requestUser(ref, outputId, reason) {
       if (typeof reason !== 'string' || reason === '') throw new TypeError('reason');
       await publish(ref, noScopes, (_draft, work, conversation) => {
+        // The User is already the one talking in a Direct Conversation (7.10).
+        if (conversation.parentId !== undefined) throw new TypeError('requestUser in a Direct Conversation');
         if (firstOutput(work, outputId, canonical({ user_requested: reason }))) addEvent(conversation, { type: 'user_requested', reason });
       });
     },
