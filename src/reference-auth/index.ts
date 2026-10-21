@@ -48,7 +48,7 @@ export interface ReferenceIssuerOptions {
   requireDpopNonce?: boolean; // default true at token endpoint
   maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
   maxPendingAuthorizationsPerClient?: number; // default 100, so one client cannot use up the global cap
-  maxSessionsPerClient?: number; // default 10000 live Sessions; new ones are refused with rate_limited
+  maxSessionsPerClient?: number; // default 1000000 live Sessions (one client serves all its users); new ones are refused with rate_limited
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
@@ -143,7 +143,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const accountLifetimeMs = positive(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
   const maxPending = positive(options.maxPendingAuthorizations, 1000, 'maxPendingAuthorizations');
   const maxPendingPerClient = positive(options.maxPendingAuthorizationsPerClient, 100, 'maxPendingAuthorizationsPerClient');
-  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 10_000, 'maxSessionsPerClient');
+  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 1_000_000, 'maxSessionsPerClient');
   const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
