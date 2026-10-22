@@ -285,3 +285,36 @@ test('authDocuments inner and outer maps are bounded; live entries still conflic
   await assert.rejects(inner.resolveCompany('b4.example'), /auth.consistency/);
   clock.t = 150000; await inner.resolveCompany('b4.example'); // b2/b3 expired, evicted b1 no longer conflicts
 });
+
+test('parseJson rejects duplicate member names at any depth and accepts look-alikes', () => {
+  assert.deepEqual(wire.parseJson('{"a":1,"b":{"a":2},"c":[{"a":1},{"a":2}],"d":"a\\":1,\\"a"}'), { a: 1, b: { a: 2 }, c: [{ a: 1 }, { a: 2 }], d: 'a":1,"a' });
+  for (const text of ['{"a":1,"a":2}', '{"x":{"a":1,"a":2}}', '[{"a":1,"\\u0061":2}]', '{"a":{"b":1},"a":1}']) assert.throws(() => wire.parseJson(text), { field: 'json.duplicate_member' }, text);
+  assert.throws(() => wire.parseJson('{"a":'), SyntaxError);
+});
+test('canonical sorts keys but keeps array order', () => {
+  assert.equal(wire.canonical({ b: [2, 1], a: { d: 1, c: undefined } }), '{"a":{"d":1},"b":[2,1]}');
+});
+test('metadata cache floors at 60 s without cache headers and stays uncached for no-store/no-cache', async () => {
+  for (const [control, cached] of [[undefined, true], ['no-store', false], ['no-cache', false]]) {
+    const clock = { t: 0 }; let calls = 0;
+    const resolver = createMetadataResolver({ async fetch() { calls++; return Response.json({ keys: [] }, control ? { headers: { 'cache-control': control } } : {}); } }, { now: () => clock.t });
+    await resolver.resolveJwks('https://a.example/keys'); clock.t = 59_000; await resolver.resolveJwks('https://a.example/keys');
+    assert.equal(calls, cached ? 1 : 2, String(control));
+    if (cached) { clock.t = 60_001; await resolver.resolveJwks('https://a.example/keys'); assert.equal(calls, 2, 'expires after the floor'); }
+  }
+});
+test('discovery duplicate member names are rejected', async () => {
+  const resolver = createMetadataResolver({ async fetch() { return new Response('{"keys":[],"keys":[]}'); } });
+  await assert.rejects(resolver.resolveJwks('https://a.example/keys'), { field: 'metadata.json' });
+});
+test('discovery fetches are capped at 100 KB while other fetches keep the configured limit', async t => {
+  const key = await readFile(new URL('./fixtures/localhost-key.pem', import.meta.url));
+  const cert = await readFile(new URL('./fixtures/localhost-cert.pem', import.meta.url));
+  const server = createServer({ key, cert }, (request, response) => response.end('x'.repeat(150_000)));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const transport = createNodeTransport({ ca: cert.toString(), localExceptions: [{ hostname: 'localhost', addresses: ['127.0.0.1'] }] });
+  const url = `https://localhost:${server.address().port}/`;
+  await assert.rejects(transport.fetch(new Request(url), { mode: 'discovery' }), { code: 'body_limit' });
+  assert.equal((await (await transport.fetch(new Request(url))).text()).length, 150_000);
+});

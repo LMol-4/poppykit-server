@@ -1,4 +1,4 @@
-import { object, string, member, ValidationError } from '../protocol/wire.js';
+import { object, string, member, canonical, parseJson, ValidationError } from '../protocol/wire.js';
 import type { JsonObject } from '../protocol/wire.js';
 import { secureUrl } from './transport.js';
 import type { HttpTransport } from './transport.js';
@@ -11,7 +11,6 @@ function url(value: unknown, field: string): string { const valueString = string
 function strings(value: unknown, field: string, allowEmpty = false): string[] { if (!Array.isArray(value) || (!allowEmpty && !value.length)) throw new ValidationError(field); value.forEach(item => string(item, field)); return value; }
 function scopes(value: unknown): void { for (const scope of strings(value, 'scopes')) if (!/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) throw new ValidationError('scopes'); }
 function domain(value: unknown): string { const text = string(value, 'domain'); if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(text) || text.includes('..')) throw new ValidationError('domain'); return text; }
-function canonical(value: unknown): string { if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`; if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`; return JSON.stringify(value); }
 export function authorizationMetadataUrl(issuer: string): string { const parsed = secureUrl(issuer); if (parsed.search) throw new ValidationError('issuer'); return `${parsed.origin}/.well-known/oauth-authorization-server${parsed.pathname === '/' ? '' : parsed.pathname}`; }
 export function validateClientId(clientId: string): URL {
   // Backslashes, whitespace and control characters are normalized away by URL parsing, hiding dot segments.
@@ -105,10 +104,10 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
       task = (async () => {
         const response = await transport.fetch(new Request(target), { mode });
         if (response.status !== 200) throw new ValidationError('metadata.status');
-        let value: unknown; try { value = await response.json(); } catch { throw new ValidationError('metadata.json'); }
+        let value: unknown; try { value = parseJson(await response.text()); } catch { throw new ValidationError('metadata.json'); }
         const servedUrl = response.url || target; validate(value, servedUrl);
         const control = response.headers.get('cache-control') ?? ''; const age = Number(response.headers.get('age') ?? 0);
-        const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 0);
+        const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 60); // no max-age: 60 s floor (guide: at least a minute)
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
         const result = { value, url: servedUrl, expires }; if (expires > now()) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
