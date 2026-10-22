@@ -115,3 +115,19 @@ test('HTTPS JSON and streaming paths deliver the same durable conversation end t
   let cursor;const jsonIds=[];for(;;){const response=await transport.fetch(new Request(url+`/conversations/${id}/events`+(cursor?'?cursor='+cursor:''),{headers:{authorization:'DPoP alice'}}));const page=await response.json();jsonIds.push(...page.events.map(event=>event.id));cursor=page.cursor;if(!page.has_more)break;}
   const response=await transport.stream(new Request(url+`/conversations/${id}/events`,{headers:{authorization:'DPoP alice',accept:'text/event-stream'}}));const streamIds=[];for await(const frame of parseEventStream(response.body))streamIds.push(frame.event.id);assert.deepEqual(streamIds,jsonIds);assert.ok(jsonIds.length>2);
 });
+
+test('idle SSE lifetime closes normally and concurrent retention/read/append stays coherent',async t=>{
+  const notifications=hints(),local=setup({notifications,streamMs:10}),localId=(await local.start(hello)).body.conversation_id,cursor=(await local.read(localId)).body.cursor;
+  const response=await local.service.handle(request(localId,{stream:true,cursor}));const frames=[];for await(const frame of parseEventStream(response.body))frames.push(frame);assert.deepEqual(frames,[]);assert.equal(notifications.subscriptions,0);
+  const dir=await mkdtemp(join(tmpdir(),'poppy-retention-')),path=join(dir,'db'),a=new SqliteCompanyDatabase(path),b=new SqliteCompanyDatabase(path);t.after(async()=>{a.close();b.close();await rm(dir,{recursive:true,force:true});});
+  const one=setup({store:a.conversations('test')}),two=setup({store:b.conversations('test')}),start=await one.start(hello),id=start.body.conversation_id,old=(await one.read(id)).body.events[0].id;const work=await one.service.claim();await one.service.finish(work,'completed');
+  const [read,removed,sent]=await Promise.all([two.read(id,{query:'?cursor='+old}),a.conversations('test').pruneEvents(id,one.clock.now()+1,1),one.send(id,{id:'racing',sender:'agent',context:{user_available:false}})]);assert.ok([200,410].includes(read.status));assert.equal(removed,1);assert.equal(sent.status,202);assert.equal((await two.read(id,{query:'?cursor='+old})).status,410);assert.deepEqual((await two.start(hello)).body,start.body);
+});
+
+test('event reads and appends keep row counts constant as own history grows',async t=>{
+  const db=new SqliteCompanyDatabase(':memory:');try{const store=db.conversations('test'),env=setup({store,pageSize:2}),id=(await env.start(hello)).body.conversation_id;let cursor=(await store.read({conversationId:id})).conversations[id].events.at(-1).id;
+    const read=async()=>{db.metrics.rowsRead=0;await env.read(id,{query:'?cursor='+cursor});return db.metrics.rowsRead;};
+    const append=async suffix=>{db.metrics.rowsRead=0;await env.send(id,{id:suffix,sender:'agent',context:{n:suffix}});return db.metrics.rowsRead;};
+    const beforeRead=await read(),beforeAppend=await append('base');for(let i=0;i<75;i++)await env.send(id,{id:'c'+i,sender:'agent',context:{n:i}});cursor=(await store.read({conversationId:id})).conversations[id].events.at(-1).id;const afterRead=await read(),afterAppend=await append('after');assert.equal(afterRead,beforeRead);assert.equal(afterAppend,beforeAppend);t.diagnostic(JSON.stringify({emptyReadRows:[beforeRead,afterRead],appendRows:[beforeAppend,afterAppend]}));
+  }finally{db.close();}
+});

@@ -409,7 +409,7 @@ export function createConversationService(options: ConversationOptions): Convers
       }
       lifetime = setTimeout(cleanup, streamMs);
       const encoder = new TextEncoder(), deadline = Date.now()+streamMs;
-      let pending = first, index = 0, bytes = 0;
+      let pending = first, index = 0, bytes = 0, cancelled = false;
       const stream = new ReadableStream<Uint8Array>({
         async pull(target) {
           try {
@@ -424,9 +424,9 @@ export function createConversationService(options: ConversationOptions): Convers
             bytes += frame.byteLength;
             if (frame.byteLength > maxFrameBytes || bytes > 16777216) { cleanup(); target.close(); return; }
             cursor=event.id; target.enqueue(frame);
-          } catch (error) { cleanup(); target.error(error); }
+          } catch (error) { const expired = stop.signal.aborted && !request.signal.aborted; cleanup(); if (cancelled) return; if (expired) target.close(); else target.error(error); }
         },
-        cancel() { cleanup(); },
+        cancel() { cancelled = true; cleanup(); },
       },{highWaterMark:0});
       return new Response(stream,{headers:{'content-type':'text/event-stream','cache-control':'no-store'}});
     } catch (error) { cleanup(); throw error; }
