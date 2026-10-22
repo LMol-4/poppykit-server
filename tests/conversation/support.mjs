@@ -56,6 +56,7 @@ const base = { issuer: 'https://auth.example.test', clientId: 'https://agent.exa
 export const principals = {
   alice: { ...base, userId: 'u_alice' },
   aliceSignedIn: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
+  aliceCustomScope: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['shop:history'] },
   aliceNoScopes: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['poppy:read'] },
   bob: { ...base, userId: 'u_bob' },

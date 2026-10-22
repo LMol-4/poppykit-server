@@ -5,7 +5,7 @@ import type { DpopClaims } from '../protocol/wire.js';
 import { AuthorityError } from './authority.js';
 
 export const PROOF_WINDOW_SECONDS = 60;
-export const CLOCK_SKEW_SECONDS = 5;
+export const CLOCK_SKEW_SECONDS = 30;
 const COMPACT_JWT = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 export function base64urlSha256(value: string): string { return createHash('sha256').update(value).digest('base64url'); }

@@ -1,18 +1,19 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { calculateJwkThumbprint, compactVerify, createLocalJWKSet, errors } from 'jose';
 import type { JSONWebKeySet } from 'jose';
-import { parseAssertionClaims } from '../protocol/wire.js';
+import { ValidationError, parseAssertionClaims } from '../protocol/wire.js';
 import type { AssertionClaims } from '../protocol/wire.js';
 import type { MetadataResolver } from '../network/discovery.js';
 import { secureUrl } from '../network/transport.js';
+import { own } from '../store.js';
+import type { StateStore } from '../store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
 import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, verifyDpopProof } from '../auth/dpop.js';
 
-export interface StateStore<State> {
-  read(): Promise<State>;
-  transaction<T>(change: (draft: State) => T): Promise<T>;
-}
+export type { StateStore };
+export { createMetadataResolver } from '../network/discovery.js';
+export { createNodeTransport } from '../network/transport.js';
 // accountId is sticky (spec 4.4): it stays after sign-out; grantId is the active sign-in, null when signed out.
 // version only fills Principal.sessionVersion: it is never bumped, since a Session ends by deletion, which the policy already checks.
 interface SessionRecord { clientId: string; userId: string; version: number; createdAt: number; expiresAt: number; accountId: string | null; grantId: string | null }
@@ -48,7 +49,7 @@ export interface ReferenceIssuerOptions {
   requireDpopNonce?: boolean; // default true at token endpoint
   maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
   maxPendingAuthorizationsPerClient?: number; // default 100, so one client cannot use up the global cap
-  maxSessionsPerClient?: number; // default 1000000 live Sessions (one client serves all its users); new ones are refused with rate_limited
+  maxSessionsPerClient?: number; // default 10000 live Sessions (one client serves all its users); new ones are refused with rate_limited
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
@@ -69,7 +70,7 @@ export class AuthorizationError extends Error {
 
 const JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
-const ASSERTION_ALGORITHMS = ['ES256', 'ES384', 'ES512', 'RS256', 'PS256', 'EdDSA'];
+const ASSERTION_ALGORITHMS = ['ES256', 'RS256'];
 const NONCE_SECONDS = 300;
 const MAX_FORM_BYTES = 65536;
 const AUTHORIZATION_MS = 600_000;
@@ -79,7 +80,6 @@ const SESSION_IDLE_SECONDS = 86_400;
 
 const random = (bytes: number) => randomBytes(bytes).toString('base64url');
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('base64url');
-const own = <T>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
 const grantLive = (grant: GrantRecord | undefined, at: number) => !!grant && !grant.revoked && grant.expiresAt > at;
 function callback(redirectUri: string, fields: Record<string, string>): string {
   const url = new URL(redirectUri);
@@ -143,7 +143,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const accountLifetimeMs = positive(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
   const maxPending = positive(options.maxPendingAuthorizations, 1000, 'maxPendingAuthorizations');
   const maxPendingPerClient = positive(options.maxPendingAuthorizationsPerClient, 100, 'maxPendingAuthorizationsPerClient');
-  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 1_000_000, 'maxSessionsPerClient');
+  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 10_000, 'maxSessionsPerClient');
   const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
@@ -173,7 +173,11 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   // Fetches the client's keys and verifies its client assertion (spec 4.1); verify() is reused for the session assertion.
   async function authenticateClient(clientId: string, clientAssertion: string) {
     let jwksUri: string; let keys: JSONWebKeySet;
-    try { jwksUri = (await metadata.resolveClient(clientId)).jwks_uri; keys = await metadata.resolveJwks(jwksUri) as unknown as JSONWebKeySet; } catch { throw new TokenError('invalid_client'); }
+    try { jwksUri = (await metadata.resolveClient(clientId)).jwks_uri; keys = await metadata.resolveJwks(jwksUri) as unknown as JSONWebKeySet; } catch (error) {
+      // The shared resolver signals its fetch cap as ValidationError('metadata.rate_limited'); its window is 60 s.
+      if (error instanceof ValidationError && error.field === 'metadata.rate_limited') throw new TokenError('rate_limited', { 'Retry-After': '60' });
+      throw new TokenError('invalid_client');
+    }
     let refreshed = false;
     const verify = async (jwt: string) => {
       try { return await verifyAssertion(jwt, keys); } catch (error) {

@@ -520,3 +520,22 @@ test('history: unbound needs no scope; bound needs the bound account and poppy:r
   t.store.set(state => { state.bindings[other].accountId = 'acct_1'; });
   await assert.rejects(t.service.history(otherClaim), { code: 'sign_in_required' });
 });
+
+test('history scopes default to poppy:read and can be set to a Company custom scope (spec 4.4)', async () => {
+  for (const [options, allowed, denied] of [[{}, 'aliceSignedIn', 'aliceCustomScope'], [{ historyScopes: ['shop:history'] }, 'aliceCustomScope', 'aliceSignedIn']]) {
+    const t = setup(options);
+    const id = (await t.start(hello)).body.conversation_id;
+    t.store.set(state => { state.bindings[id].accountId = 'acct_1'; });
+    assert.equal((await t.read(id, { as: allowed })).status, 200);
+    const refused = await t.read(id, { as: denied });
+    assert.deepEqual([refused.status, refused.body.error], [403, 'insufficient_scope']);
+  }
+});
+
+test('a path conversation ID that fails the pattern is 400 invalid_request, unknown paths stay 404 (spec 7.13)', async () => {
+  const t = setup();
+  for (const [method, path] of [['GET', '/bad.id/events'], ['POST', '/bad%20id/messages'], ['POST', `/${'a'.repeat(257)}/close`], ['POST', '/a$b/handoff']]) {
+    assert.deepEqual(await t.call(method, path, method === 'GET' ? {} : { body: {} }).then(r => [r.status, r.body]), [400, { error: 'invalid_request' }], path);
+  }
+  for (const path of ['/bad.id', '/cnv_1/other', '/cnv_1/events/x']) assert.deepEqual(await t.call('GET', path).then(r => [r.status, r.body]), [404, { error: 'not_found' }], path);
+});
