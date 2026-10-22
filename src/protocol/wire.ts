@@ -165,3 +165,28 @@ export function parseDpopClaims(value: unknown): DpopClaims {
   for (const key of ['ath', 'nonce']) if (key in claims) string(claims[key], key);
   return claims as DpopClaims;
 }
+// Sorted keys so structural equality ignores key order but keeps arrays, text and unknown members exact.
+export function canonical(value: unknown): string {
+  const walk = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(walk).join(',')}]`;
+    if (item && typeof item === 'object') return `{${Object.keys(item).sort().map(key => `${JSON.stringify(key)}:${walk((item as Record<string, unknown>)[key])}`).join(',')}}`;
+    return JSON.stringify(item);
+  };
+  return walk(JSON.parse(JSON.stringify(value))); // same shape as the wire (drops undefined members)
+}
+// JSON.parse that rejects duplicate member names (guide "Transport and JSON"); JSON.parse alone keeps the last one.
+export function parseJson(text: string): unknown {
+  const value = JSON.parse(text); // validates syntax, so the scan below only sees well-formed tokens
+  const stack: (Set<string> | null)[] = [];
+  const tokens = text.match(/"(?:[^"\\]|\\.)*"|[{}[\],:]|[^\s"{}[\],:]+/g) ?? [];
+  tokens.forEach((token, index) => {
+    if (token === '{') stack.push(new Set()); else if (token === '[') stack.push(null);
+    else if (token === '}' || token === ']') stack.pop();
+    else if (token[0] === '"' && tokens[index + 1] === ':') {
+      const names = stack.at(-1), name = JSON.parse(token) as string;
+      if (names?.has(name)) throw new ValidationError('json.duplicate_member');
+      names?.add(name);
+    }
+  });
+  return value;
+}

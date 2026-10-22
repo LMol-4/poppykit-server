@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { SignJWT } from 'jose';
+import { CompactSign, SignJWT } from 'jose';
 import { ValidationError } from '../../dist/protocol/wire.js';
-import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
+import { createMetadataResolver, createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { createRequestAuthenticator } from '../../dist/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
 import { memoryCoordinator } from '../conversation/support.mjs';
-import { API, CLIENT, ISSUER, RESOURCE, TOKEN_ENDPOINT, expectError, setup } from './issuer-support.mjs';
+import { API, CLIENT, ISSUER, JWKS_URI, RESOURCE, TOKEN_ENDPOINT, expectError, setup } from './issuer-support.mjs';
 
 test('issues and renews a signed-out DPoP session after a nonce challenge', async () => {
   const env = await setup();
@@ -240,4 +240,42 @@ test('a metadata resolver rate limit is rate_limited with Retry-After; other fet
   expectError(await env.send(), 'invalid_client');
   env.onClient = undefined;
   assert.equal((await env.send()).status, 200);
+});
+
+// Signs a payload given as raw JSON text, so it can carry duplicate members that SignJWT cannot produce.
+const signRaw = (key, header, payloadText) => new CompactSign(new TextEncoder().encode(payloadText)).setProtectedHeader(header).sign(key.privateKey);
+
+test('a client assertion or DPoP proof with a duplicate member is rejected', async () => {
+  const env = await setup(); await env.challenge(); const iat = Math.floor(NOW / 1000);
+  const claims = `"iss":"${CLIENT}","aud":"${ISSUER}","iat":${iat},"exp":${iat + 60},"jti":"j1"`;
+  // The last duplicate is the valid one, so only the duplicate check can reject these.
+  const dupSub = await signRaw(env.identity, { alg: 'ES256', kid: 'k1' }, `{${claims},"sub":"someone-else","sub":"${CLIENT}"}`);
+  expectError(await env.send({ client_assertion: dupSub }), 'invalid_client');
+  const dupHeader = await signRaw(env.identity, { alg: 'ES256', kid: 'k1' }, `{${claims},"sub":"${CLIENT}"}`);
+  const [, body, sig] = dupHeader.split('.');
+  const header = Buffer.from('{"alg":"ES256","kid":"nope","kid":"k1"}').toString('base64url');
+  expectError(await env.send({ client_assertion: `${header}.${body}.${sig}` }), 'invalid_client'); // bad signature too, but never reaches it
+  const dpopHeader = { typ: 'dpop+jwt', alg: 'ES256', jwk: env.dpopKey.jwk };
+  const dpopClaims = `"jti":"p1","htu":"${TOKEN_ENDPOINT}","iat":${iat},"nonce":"${env.nonce}"`;
+  expectError(await env.send({}, { dpop: await signRaw(env.dpopKey, dpopHeader, `{${dpopClaims},"htm":"GET","htm":"POST"}`) }), 'invalid_dpop_proof');
+  assert.equal((await env.send({}, { dpop: await signRaw(env.dpopKey, dpopHeader, `{${dpopClaims},"htm":"POST"}`) })).status, 200, 'control: same proof without the duplicate');
+});
+
+test('the real metadata resolver limits map to rate_limited, not invalid_client', async () => {
+  const doc = { client_id: CLIENT, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [], token_endpoint_auth_method: 'private_key_jwt' };
+  const build = async options => {
+    let env; const transport = { async fetch(request) { return Response.json(request.url === CLIENT ? doc : env.jwks); } };
+    env = await setup({ metadata: createMetadataResolver(transport, { now: () => NOW, ...options }) }); await env.challenge();
+    return env;
+  };
+  // Cap of one fetch per minute: the client document uses it, so the JWKS fetch is refused.
+  const capped = await build({ maxFetchesPerMinute: 1 });
+  const limited = await capped.send();
+  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
+  // An unknown kid forces a JWKS refresh; a second one inside a minute is jwks.refresh_limited.
+  const refreshing = await build({ maxFetchesPerMinute: 100 });
+  const unknownKid = await refreshing.clientAssertion({}, { header: { kid: 'k9' } });
+  expectError(await refreshing.send({ client_assertion: unknownKid }), 'invalid_client');
+  const again = await refreshing.send({ client_assertion: unknownKid });
+  assert.deepEqual([again.status, again.body, again.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
 });

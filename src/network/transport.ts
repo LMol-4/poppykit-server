@@ -58,7 +58,10 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
     return isPublicAddress(address) || !!options.localExceptions?.some(entry => entry.hostname.toLowerCase() === hostname.toLowerCase() && entry.addresses.some(ip => normalizedAddress(ip) === normalizedAddress(address)));
   }
   return { async fetch(request, settings = {}) {
-    const timeoutMs = limits.timeoutMs + (settings.waitMs ?? 0);
+    // Discovery targets are attacker-controlled URLs: tighter limits (guide "Fetching metadata safely").
+    const discovery = settings.mode === 'discovery';
+    const maxResponseBytes = discovery ? Math.min(limits.maxResponseBytes, 102400) : limits.maxResponseBytes;
+    const timeoutMs = (discovery ? Math.min(limits.timeoutMs, 5000) : limits.timeoutMs) + (settings.waitMs ?? 0);
     // setTimeout fires at once beyond 2^31-1 ms, which would turn a long wait into an instant timeout.
     if (!Number.isSafeInteger(settings.waitMs ?? 0) || settings.waitMs! < 0 || timeoutMs > 2 ** 31 - 1) throw new TypeError('Invalid transport wait');
     const controller = new AbortController();
@@ -83,7 +86,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
         const agent = new Agent({ keepAlive: false });
         // Return no socket until TLS and actual peer-address verification finish: HTTP cannot write early.
         agent.createConnection = ((connectionOptions: ConnectionOptions, callback: (error: Error | null, socket?: ReturnType<typeof connect>) => void) => {
-          const socket = connect({ ...connectionOptions, host: hostname, servername: isIP(hostname) ? undefined : hostname, rejectUnauthorized: true, ca: options.ca ? [...rootCertificates, options.ca] : undefined,
+          const socket = connect({ ...connectionOptions, host: hostname, servername: isIP(hostname) ? undefined : hostname, rejectUnauthorized: true, minVersion: 'TLSv1.2', ca: options.ca ? [...rootCertificates, options.ca] : undefined,
             lookup: ((host: string, opts: { all?: boolean }, done: (error: Error | null, address?: string | { address: string; family: number }[], family?: number) => void) => {
               lookup(host, { all: true, verbatim: true }, (error, addresses) => {
                 if (error) return done(new TransportError('network_error'));
@@ -104,7 +107,7 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
         const response = await new Promise<Response>((resolve, reject) => {
           const outgoing = httpsRequest(url, { method: request.method, headers: Object.fromEntries(request.headers), agent, signal }, incoming => {
             const chunks: Buffer[] = []; let size = 0;
-            incoming.on('data', (chunk: Buffer) => { size += chunk.length; if (size > limits.maxResponseBytes) incoming.destroy(new TransportError('body_limit')); else chunks.push(chunk); });
+            incoming.on('data', (chunk: Buffer) => { size += chunk.length; if (size > maxResponseBytes) incoming.destroy(new TransportError('body_limit')); else chunks.push(chunk); });
             incoming.on('error', reject);
             incoming.on('end', () => {
               const headers = new Headers(); for (let i = 0; i < incoming.rawHeaders.length; i += 2) headers.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1]);
