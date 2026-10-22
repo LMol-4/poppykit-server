@@ -10,6 +10,7 @@ import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticato
 
 export interface ConversationRecord {
   id: string; issuer: string; clientId: string; userId: string; bindingId: string;
+  lastUserMessage?: Message;
   status: Status; responder: Sender; context: JsonObject; events: ConversationEvent[];
   eventWindow?: { invalid?: boolean; expired?: boolean; hasMore: boolean };
   authority: AcceptedAuthority; // of the latest accepted message; staff operations act under it
@@ -26,6 +27,7 @@ export interface WorkRecord {
 }
 export interface MessageRecord { conversationId: string; fingerprint: string; receipt: { status: number; body: JsonObject } }
 export interface ConversationStoreState {
+  cursorStatus?: 'expired' | 'invalid';
   version: 1; generation: string;
   conversations: Record<string, ConversationRecord>;
   bindings: Record<string, { accountId?: string }>;
@@ -239,10 +241,10 @@ export function createConversationService(options: ConversationOptions): Convers
     const root = conversation.parentId === undefined ? conversation : draft.conversations[conversation.parentId];
     return root.events.flatMap(event => event.type === 'direct_opened' ? [event, ...draft.conversations[event.conversation_id as string].events] : [event]);
   }
-  function page(conversation: ConversationRecord, cursor?: string): JsonObject {
+  function page(conversation: ConversationRecord, cursor?: string, cursorStatus?: 'expired' | 'invalid'): JsonObject {
     let start = 0;
-    if (conversation.eventWindow?.expired) throw new HttpError(410, { error: 'cursor_expired' });
-    if (conversation.eventWindow?.invalid) throw new HttpError(400, { error: 'invalid_cursor' });
+    if (cursorStatus === 'expired' || conversation.eventWindow?.expired) throw new HttpError(410, { error: 'cursor_expired' });
+    if (cursorStatus === 'invalid' || conversation.eventWindow?.invalid) throw new HttpError(400, { error: 'invalid_cursor' });
     if (cursor !== undefined && !conversation.eventWindow) {
       const index = conversation.events.findIndex(event => event.id === cursor);
       if (index < 0) throw new HttpError(400, { error: 'invalid_cursor' });
@@ -309,7 +311,7 @@ export function createConversationService(options: ConversationOptions): Convers
     // A retry returns the saved receipt, which is a history page if the original request waited.
     const history = (state: ConversationStoreState) => waiting || 'events' in (own(state.messages, key)?.receipt.body ?? {});
 
-    const receipt = await current(principal, { ...(conversationId ? { conversationId } : parentId ? { conversationId: parentId } : {}), messageKey: key, append: !waiting && read.cursor === undefined }, target, history, draft => {
+    const receipt = await current(principal, { ...(conversationId ? { conversationId } : parentId ? { conversationId: parentId } : {}), messageKey: key, cursorCheck: read.cursor, append: !waiting && read.cursor === undefined }, target, history, draft => {
       if (conversationId !== undefined) owned(draft, principal, conversationId);
       const existing = own(draft.messages, key);
       if (existing) {
@@ -347,11 +349,12 @@ export function createConversationService(options: ConversationOptions): Convers
         if (conversation.status === 'closed') throw closed();
         if (conversation.childId !== undefined) throw directOpen(conversation.childId);
         if (conversation.parentId !== undefined && directWords(body.message)) throw new ValidationError('message.sender');
-        if (read.cursor !== undefined) page(conversation, read.cursor);
+        if (read.cursor !== undefined) page(conversation, read.cursor, draft.cursorStatus);
         conversation.authority = authority;
       }
       pruneWork(draft);
       const message = body.message;
+      conversation.lastUserMessage = message;
       if (message.context) conversation.context = { ...conversation.context, ...message.context };
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
       // A context-only message asks nothing. Work always records this message's own accepted authority; while queued
@@ -412,7 +415,7 @@ export function createConversationService(options: ConversationOptions): Convers
           try {
             signal.throwIfAborted();
             while (index >= (pending.events as unknown[]).length) {
-              if (Date.now() >= deadline || pending.status === 'closed') { cleanup(); target.close(); return; }
+              if (Date.now() >= deadline || pending.status === 'closed' && !pending.has_more) { cleanup(); target.close(); return; }
               if (!pending.has_more) await wait(Math.min(pollIntervalMs,deadline-Date.now()),seen);
               signal.throwIfAborted(); seen=revision; pending=await deliver(); index=0;
             }
@@ -660,7 +663,9 @@ export function createConversationService(options: ConversationOptions): Convers
         if (conversation.status === 'closed' || conversation.childId !== undefined) throw new PublicationError('stale_work');
         fence(draft, conversationId, 'cancelled');
         const last = conversation.events.findLast(event => event.type === 'message' && (event.message as Message).role === 'user');
-        const { role: _role, ...message } = last!.message as Message;
+        const source = conversation.lastUserMessage ?? last?.message as Message | undefined;
+        if (!source) throw new PublicationError('stale_work');
+        const { role: _role, ...message } = source;
         const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), leaseUntil: clock.now() + operatorLeaseMs, human: true, outputs: {} };
         conversation.humanUntil = work.leaseUntil;
         draft.work.push(work);

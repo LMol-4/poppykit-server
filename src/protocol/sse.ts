@@ -25,9 +25,9 @@ export async function* parseEventStream(body: ReadableStream<Uint8Array>, option
     for (;;) {
       options.signal?.throwIfAborted();
       const item = await reader.read(); options.signal?.throwIfAborted();
-      if (item.done) { decoder.decode(); break; } // An unterminated frame is incomplete and discarded.
-      bytes += item.value.byteLength; if (bytes > maxStream) throw new ValidationError('sse.stream.size');
-      buffer += decoder.decode(item.value,{stream:true});
+      if (item.done) { buffer += decoder.decode(); if(buffer.endsWith('\r'))buffer+='\n';else break; } // Discard an unterminated frame, but CR alone is a valid line ending.
+      bytes += item.value?.byteLength ?? 0; if (bytes > maxStream) throw new ValidationError('sse.stream.size');
+      if(!item.done)buffer += decoder.decode(item.value,{stream:true});
       for (;;) {
         const end=buffer.search(/[\r\n]/); if (end<0) break;
         if (buffer[end]==='\r' && end===buffer.length-1) break;
@@ -43,6 +43,7 @@ export async function* parseEventStream(body: ReadableStream<Uint8Array>, option
         }
       }
       if(frameBytes+Buffer.byteLength(buffer)>maxFrame)throw new ValidationError('sse.frame.size');
+      if(item.done)break;
     }
   } finally { options.signal?.removeEventListener('abort',abort); await reader.cancel().catch(()=>{});reader.releaseLock(); }
 }

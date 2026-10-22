@@ -1,5 +1,5 @@
 import type { ConversationStoreState } from './service.js';
-export type ConversationSelection = { conversationId?: string; messageKey?: string; workId?: string; claimAt?: number; append?: boolean; events?: { cursor?: string; limit: number; maxBytes?: number } };
+export type ConversationSelection = { conversationId?: string; messageKey?: string; workId?: string; claimAt?: number; append?: boolean; cursorCheck?: string; events?: { cursor?: string; limit: number; maxBytes?: number } };
 export interface ConversationStore {
   pruneEvents?(conversationId: string, before: number, limit?: number): Promise<number>;
   read(selection: ConversationSelection): Promise<ConversationStoreState>;

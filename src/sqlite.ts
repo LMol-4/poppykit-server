@@ -38,6 +38,7 @@ export class SqliteCompanyDatabase {
       CREATE INDEX IF NOT EXISTS by_expiry ON records(ns,kind,json_extract(body,'$.expiresAt'));
       CREATE INDEX IF NOT EXISTS replay_expiry ON records(ns,kind,CAST(body AS REAL));
       CREATE TABLE IF NOT EXISTS events (ns TEXT NOT NULL, conversation TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(ns,conversation,seq));
+      CREATE INDEX IF NOT EXISTS last_user_event ON events(ns,conversation,json_extract(body,'$.type'),json_extract(body,'$.message.role'),seq);
       CREATE TABLE IF NOT EXISTS event_cursors (ns TEXT NOT NULL, conversation TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(ns,conversation,id));
       CREATE INDEX IF NOT EXISTS cursor_seq ON event_cursors(ns,conversation,seq);
       INSERT OR IGNORE INTO event_cursors SELECT ns,conversation,json_extract(body,'$.id'),seq FROM events;
@@ -119,6 +120,11 @@ export class SqliteCompanyDatabase {
       }
       const target = id ? this.one<ConversationRecord>(namespace, 'conversations', id) : undefined;
       if (!target) return state;
+      if (selection.cursorCheck !== undefined) {
+        const found = this.db.prepare('SELECT seq FROM event_cursors WHERE ns=? AND conversation=? AND id=?').get(namespace,target.id,selection.cursorCheck);
+        if (!found) state.cursorStatus = 'invalid';
+        else if (!this.db.prepare('SELECT 1 FROM events WHERE ns=? AND conversation=? AND seq=?').get(namespace,target.id,Number(found.seq))) state.cursorStatus = 'expired';
+      }
       for (const row of this.rows(namespace, 'conversations', selection.events ? 'AND id=?' : "AND json_extract(body,'$.bindingId')=?", [selection.events ? target.id : target.bindingId])) {
         const conversation: ConversationRecord = JSON.parse(row.body);
         let from = -1;
@@ -140,6 +146,10 @@ export class SqliteCompanyDatabase {
           conversation.eventWindow = { ...conversation.eventWindow, hasMore };
         } else if (!selection.append) events.push(...this.db.prepare('SELECT body FROM events WHERE ns=? AND conversation=? ORDER BY seq').all(namespace,row.id));
         if (!selection.events) this.metrics.rowsRead += events.length;
+        if (selection.append && !conversation.lastUserMessage) {
+          const last = this.db.prepare("SELECT body FROM events WHERE ns=? AND conversation=? AND json_extract(body,'$.type')='message' AND json_extract(body,'$.message.role')='user' ORDER BY seq DESC LIMIT 1").get(namespace,row.id);
+          if (last) { this.metrics.rowsRead++; conversation.lastUserMessage = JSON.parse(last.body as string).message; }
+        }
         conversation.events = events.map(event => JSON.parse(event.body as string));
         state.conversations[row.id] = conversation;
         if (!selection.events) state.work.push(...this.rows(namespace, 'work', "AND json_extract(body,'$.conversationId')=? ORDER BY rowid", [row.id]).map(work => JSON.parse(work.body)));

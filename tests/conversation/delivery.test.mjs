@@ -78,3 +78,21 @@ test('separate processes receive committed updates through durable reconciliatio
   const readers=[spawn(),spawn()];await Promise.all(readers.map(r=>r.ready));const work=await env.service.claim();await env.service.reply(work,'out',{id:'cross_process',sender:'agent',text:'committed, no broker'});
   await Promise.all(readers.map(r=>r.exited));for(const reader of readers){assert.equal(reader.child.exitCode,0);assert.equal(reader.messages.at(-1).message,'cross_process');}
 });
+
+test('SQLite human lifecycle uses the last user message and closed SSE drains every page',async()=>{
+  const db=new SqliteCompanyDatabase(':memory:');try{
+    const store=db.conversations('test'),env=setup({store,pageSize:1,authorizeOperator:async operator=>{assert.equal(operator,'staff');}});const id=(await env.start(hello)).body.conversation_id;
+    await env.handoff(id);const person=await env.service.joinHuman('staff',id);assert.equal(person.message.id,hello.id);await env.service.reply(person,'out',{id:'human_reply',sender:'human',text:'A person answered.'});await env.service.returnToAgent('staff',id);
+    await env.close(id);const full=(await store.read({conversationId:id})).conversations[id].events;const response=await env.service.handle(request(id,{stream:true}));const ids=[];for await(const frame of parseEventStream(response.body))ids.push(frame.event.id);assert.deepEqual(ids,full.map(event=>event.id));
+  }finally{db.close();}
+});
+
+test('waited POST distinguishes expired and foreign cursors without accepting the rejected write',async()=>{
+  const db=new SqliteCompanyDatabase(':memory:');try{
+    const store=db.conversations('test'),env=setup({store});const id=(await env.start(hello)).body.conversation_id,cursor=(await env.read(id)).body.events[0].id;const work=await env.service.claim();await env.service.finish(work,'completed');await store.pruneEvents(id,env.clock.now()+1,1);
+    const message={id:'waited',sender:'agent',text:'new'};
+    assert.equal((await env.send(id,message,{query:`?wait=1&cursor=${cursor}`})).status,410);
+    assert.equal((await env.send(id,message,{query:'?wait=1&cursor=foreign'})).body.error,'invalid_cursor');
+    assert.equal((await env.send(id,message)).status,202);
+  }finally{db.close();}
+});

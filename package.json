@@ -25,7 +25,8 @@
   "files": [
     "dist",
     "README.md",
-    "STORAGE.md"
+    "STORAGE.md",
+    "AUTH.md"
   ],
   "exports": {
     ".": {
