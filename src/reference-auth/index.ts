@@ -9,7 +9,7 @@ import { own } from '../store.js';
 import type { StateStore } from '../store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
-import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, verifyDpopProof } from '../auth/dpop.js';
+import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, assertUniqueJwtMembers, verifyDpopProof } from '../auth/dpop.js';
 
 export type { StateStore };
 export { createMetadataResolver } from '../network/discovery.js';
@@ -163,6 +163,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   }
 
   async function verifyAssertion(jwt: string, keys: JSONWebKeySet): Promise<AssertionClaims> {
+    assertUniqueJwtMembers(jwt); // before jose, which keeps the last of any duplicate claim
     const { payload, protectedHeader } = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ASSERTION_ALGORITHMS });
     // Media types are case-insensitive and may carry the application/ prefix (RFC 7515 4.1.9).
     if (protectedHeader.typ?.toLowerCase().replace(/^application\//, '') === 'poppy-browser+jwt') throw new TypeError('browser assertion'); // spec 5: not accepted here
@@ -183,12 +184,15 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       try { return await verifyAssertion(jwt, keys); } catch (error) {
         if (refreshed || !(error instanceof errors.JWKSNoMatchingKey)) throw error;
         refreshed = true; // one bounded refresh for an unknown kid; the resolver rate-limits it too
-        keys = await metadata.resolveJwks(jwksUri, { refresh: true }) as unknown as JSONWebKeySet;
+        try { keys = await metadata.resolveJwks(jwksUri, { refresh: true }) as unknown as JSONWebKeySet; } catch (limit) {
+          if (limit instanceof ValidationError && limit.field === 'jwks.refresh_limited') throw new TokenError('rate_limited', { 'Retry-After': '60' });
+          throw limit;
+        }
         return verifyAssertion(jwt, keys);
       }
     };
     let client: AssertionClaims;
-    try { client = await verify(clientAssertion); } catch { throw new TokenError('invalid_client'); }
+    try { client = await verify(clientAssertion); } catch (error) { throw error instanceof TokenError ? error : new TokenError('invalid_client'); }
     if (client.iss !== clientId || client.sub !== clientId || client.aud !== issuer || !current(client)) throw new TokenError('invalid_client');
     return { client, verify, keys: () => keys };
   }
@@ -254,7 +258,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const { client, verify, keys } = await authenticateClient(clientId, clientAssertion);
     let session: AssertionClaims | undefined;
     if (grantType === JWT_BEARER) {
-      try { session = await verify(assertion!); } catch { throw new TokenError('invalid_grant'); }
+      try { session = await verify(assertion!); } catch (error) { throw error instanceof TokenError ? error : new TokenError('invalid_grant'); }
       if (session.iss !== clientId || session.aud !== issuer || session.sub.length > 256 || !current(session) || session.jti === client.jti) throw new TokenError('invalid_grant');
     }
     // Identity keys and DPoP keys must differ (spec 4.1).

@@ -112,3 +112,11 @@ test('requestUser is refused inside a Direct Conversation, where the User is alr
   assert.ok(!(await t.store.read()).conversations[child].events.some(event => event.type === 'user_requested'));
   await t.service.reply(claim, 'user', { id: 'msg_r1', sender: 'agent', text: 'Hello.' }); // the refused request used no output ID
 });
+
+test('a request body with a duplicate member is 400 invalid_request', async () => {
+  const t = setup({ directScopes });
+  const body = `{"message":${JSON.stringify(hello)},"message":${JSON.stringify(hello)}}`;
+  const rejected = await t.call('POST', '', { body });
+  assert.deepEqual([rejected.status, rejected.body], [400, { error: 'invalid_request' }]);
+  assert.equal((await t.call('POST', '', { body: JSON.stringify({ message: hello }) })).status, 201, 'control: same body without the duplicate');
+});

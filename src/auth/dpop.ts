@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { calculateJwkThumbprint, compactVerify, decodeProtectedHeader, importJWK } from 'jose';
-import { parseDpopClaims } from '../protocol/wire.js';
+import { parseDpopClaims, parseJson } from '../protocol/wire.js';
 import type { DpopClaims } from '../protocol/wire.js';
 import { AuthorityError } from './authority.js';
 
@@ -12,6 +12,9 @@ export function base64urlSha256(value: string): string { return createHash('sha2
 // Origin plus path: the htu form RFC 9449 compares (no query or fragment).
 export function canonicalHtu(url: string): string { const parsed = new URL(url); return `${parsed.origin}${parsed.pathname}`; }
 
+// Header and payload both go through parseJson: jose's JSON.parse keeps the last of any duplicate member.
+export function assertUniqueJwtMembers(jwt: string): void { for (const segment of jwt.split('.').slice(0, 2)) parseJson(Buffer.from(segment, 'base64url').toString('utf8')); }
+
 // RFC 9449 section 4.3 checks except nonce and replay, which only the token endpoint enforces.
 // accessToken absent means a token-endpoint proof, which must not carry ath.
 export async function verifyDpopProof(proof: string | null, expected: { method: string; url: string; nowMs: number; accessToken?: string }): Promise<{ claims: DpopClaims; jkt: string }> {
@@ -20,6 +23,7 @@ export async function verifyDpopProof(proof: string | null, expected: { method: 
   if (!proof || proof.length > 8192 || !COMPACT_JWT.test(proof)) throw invalid();
   let claims: DpopClaims; let jkt: string; let htu: string;
   try {
+    assertUniqueJwtMembers(proof);
     const header = decodeProtectedHeader(proof); const jwk = header.jwk;
     if (header.typ !== 'dpop+jwt' || header.alg !== 'ES256' || !jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || 'd' in jwk) throw invalid();
     const { payload } = await compactVerify(proof, await importJWK(jwk, 'ES256'), { algorithms: ['ES256'] });

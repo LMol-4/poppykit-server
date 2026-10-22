@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { ValidationError, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
+import { ValidationError, canonical, parseJson, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
@@ -114,16 +114,6 @@ function json(status: number, body: unknown, headers: HeadersInit = {}): Respons
   return response;
 }
 
-// Key order independent; arrays, strings and unknown members compared exactly.
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const entries = value as Record<string, unknown>;
-    return `{${Object.keys(entries).sort().map(key => `${JSON.stringify(key)}:${canonical(entries[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
 async function readJson(request: Request): Promise<unknown> {
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -133,7 +123,7 @@ async function readJson(request: Request): Promise<unknown> {
     if (size > maxBodyBytes) { await reader!.cancel(); throw new ValidationError('body'); }
     chunks.push(part.value);
   }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new ValidationError('body'); }
+  try { return parseJson(Buffer.concat(chunks).toString('utf8')); } catch { throw new ValidationError('body'); }
 }
 
 export function createConversationService(options: ConversationOptions): ConversationService {
