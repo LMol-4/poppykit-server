@@ -91,6 +91,9 @@ for (const durable of [false, true]) {
     assert.equal((await mediated(env, a.access_token, { code: 'wrong' }, id)).body.status, 'code_required');
     assert.equal((await mediated(env, a.access_token, { code: 'wrong' }, id)).body.status, 'failed');
     assert.equal((await mediated(env, a.access_token, { code: '123456' }, id)).body.status, 'failed');
+    const successful = await mediated(env, a.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } });
+    env.issuer = env.reopen();
+    assert.equal((await mediated(env, a.access_token, { code: '123456' }, successful.body.sign_in_id)).body.status, 'complete');
     const next = await mediated(env, a.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } });
     env.clock.now += 601000;
     assert.equal((await mediated(env, a.access_token, { code: '123456' }, next.body.sign_in_id)).body.status, 'expired');
