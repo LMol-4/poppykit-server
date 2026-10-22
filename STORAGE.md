@@ -98,3 +98,22 @@ also checks publication fencing/deduplication, detached values, rollback, accoun
 token rotation versus revocation, namespace isolation, and unchanged read counts
 after adding unrelated conversations. These are local Windows/Node results;
 other OS runner evidence belongs to J5/J6.
+
+## Bounded conversation delivery and retention
+
+`ConversationSelection.events` loads a cursor-relative, count/byte-bounded event
+window without work/history aggregates; it is read-only inside transactions.
+`append` loads operational records without historical event payloads. `cursorCheck`
+checks retained cursor identities for waited POSTs. These selectors preserve the
+shared authority coordinator. Custom adapters must implement equivalent targeted
+reads before claiming the same operation-count guarantees.
+
+SQLite `pruneEvents(conversationId, beforeUnixMilliseconds, limit=100)` deletes at
+most 1000 old payloads per call and refuses active held/pending/claimed work.
+Message receipts, event cursor identities and the latest user message/context stay
+with the conversation for its lifetime. Closure is not deletion. Retention uses
+one database transaction; concurrent writers/readers see a coherent before/after
+state. Default payload retention is indefinite; operators should retain at least
+30 days and explicitly choose any shorter policy. See [DELIVERY.md](DELIVERY.md)
+for distinct lifetimes and client recovery behavior. No automatic destructive
+reset or history deletion was added.

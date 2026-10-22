@@ -26,7 +26,8 @@
     "dist",
     "README.md",
     "STORAGE.md",
-    "AUTH.md"
+    "AUTH.md",
+    "DELIVERY.md"
   ],
   "exports": {
     ".": {

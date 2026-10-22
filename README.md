@@ -54,3 +54,6 @@ Creating this repository does not reserve a name on npm, PyPI, or crates.io.
 
 These are intended names, not reserved registry packages. Python and Rust implementations are not yet present.
 
+
+See [DELIVERY.md](DELIVERY.md) for durable event windows, notification hints,
+SSE backpressure, byte-budgeted acceptance and record-specific retention.
