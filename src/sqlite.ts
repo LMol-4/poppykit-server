@@ -169,7 +169,7 @@ export class SqliteCompanyDatabase {
         get('sessions', selection.sessionId);
         get('accessTokens', selection.accessHash);
         for (const key of selection.replayKeys) get('replay', key);
-        const counts = this.db.prepare("SELECT count(*) AS n, sum(CASE WHEN json_extract(body,'$.clientId')=? THEN 1 ELSE 0 END) AS client FROM records WHERE ns=? AND kind='signIns' AND json_extract(body,'$.kind')!='attempts' AND json_extract(body,'$.expiresAt')>?").get(selection.clientId ?? '', namespace, selection.at)!;
+        const counts = this.db.prepare("SELECT count(*) AS n, sum(CASE WHEN json_extract(body,'$.clientId')=? THEN 1 ELSE 0 END) AS client FROM records WHERE ns=? AND kind='signIns' AND json_extract(body,'$.status') IN ('pending','approved','verifying') AND json_extract(body,'$.expiresAt')>?").get(selection.clientId ?? '', namespace, selection.at)!;
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(counts.n), pendingForClient: Number(counts.client ?? 0) };
       }
       if (selection.kind === 'principal') { get('sessions', selection.sessionId); get('grants', selection.grantId); }
@@ -186,7 +186,11 @@ export class SqliteCompanyDatabase {
         const client = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.clientId, selection.at)!;
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(pending.n), pendingForClient: Number(client.n) };
       }
-      if (selection.kind === 'disconnect') for (const kind of ['grants', 'codes', 'signIns'] as const) find(kind, "AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.accountId')=?", selection.clientId, selection.accountId);
+      if (selection.kind === 'disconnect') {
+        for (const kind of ['grants', 'codes'] as const) find(kind, "AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.accountId')=?", selection.clientId, selection.accountId);
+        find('signIns', "AND json_extract(body,'$.clientId')=? AND (json_extract(body,'$.accountId') IS NULL OR json_extract(body,'$.accountId')=?)", selection.clientId, selection.accountId);
+        find('authorizations', "AND json_extract(body,'$.clientId')=?", selection.clientId);
+      }
       for (const record of Object.values(state.accessTokens)) { get('sessions', record.sessionId); if (record.grantId) get('grants', record.grantId); }
       for (const record of [...Object.values(state.sessions), ...Object.values(state.codes)]) if (record.grantId) get('grants', record.grantId);
       for (const id of Object.values(state.refreshTokens)) get('grants', id);

@@ -27,13 +27,17 @@ async function environment(t, durable, extra = {}) {
     authenticate: async credentials => { seen.push(credentials); return credentials.password === 'private-password' ? { accountId: 'acct_1' } : null; }, verifyCode: async ({ code }) => code === '123456', ...extra };
   const env = await setup({ requireDpopNonce: false, device: { endpoint: DEVICE, verificationUri: VERIFY, scopes: ['poppy:read', 'poppy:write'] }, mediated: config,
     ...(db ? { store: db.issuer(ISSUER), coordinator: db } : {}) });
-  return { ...env, db, seen, config };
+  const reopen = () => createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: [], metadata: env.metadata,
+    store: db ? db.issuer(ISSUER) : env.store, coordinator: db ?? { run: action => action() }, now: () => env.clock.now, requireDpopNonce: false,
+    device: { endpoint: DEVICE, verificationUri: VERIFY, scopes: ['poppy:read', 'poppy:write'] }, mediated: config });
+  return { ...env, db, seen, config, reopen };
 }
 
 for (const durable of [false, true]) {
   test(`Device approval/partial consent, interval, one-use code and revocation (${durable ? 'SQLite' : 'memory'})`, async t => {
     const env = await environment(t, durable), session = (await env.send()).body;
     const start = await startDevice(env); assert.equal(start.status, 200); assert.equal(start.headers.get('cache-control'), 'no-store');
+    env.issuer = env.reopen();
     assert.equal(new URL(start.body.verification_uri).host, new URL(ISSUER).host);
     const view = await env.issuer.beginDeviceAuthorization(start.body.user_code, BROWSER);
     assert.deepEqual(view.scopes, ['poppy:read', 'poppy:write']);
@@ -107,4 +111,42 @@ test('Mediated attempt windows persist across issuer reconstruction and do not l
   env.config.authenticate = async () => { throw new Error('never-log-this'); };
   const failed = await mediated(env, session.access_token, input);
   assert.equal(failed.status, 503); assert.deepEqual(failed.body, { error: 'temporarily_unavailable' });
+});
+
+for (const durable of [false, true]) test(`disconnect cancels delayed credential checks and completed account tombstones (${durable ? 'SQLite' : 'memory'})`, async t => {
+  let deliver, waiting;
+  const ready = new Promise(resolve => { waiting = resolve; });
+  const env = await environment(t, durable, { authenticate: async () => { waiting(); return new Promise(resolve => { deliver = resolve; }); } });
+  const session = (await env.send()).body;
+  const active = mediated(env, session.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } });
+  await ready; await env.issuer.disconnect(CLIENT, 'acct_1'); deliver({ accountId: 'acct_1' });
+  const result = await active; assert.equal(result.body.error, 'sign_in_not_found'); assert.equal(result.status, 404);
+  if (durable) assert.equal((await env.db.issuer(ISSUER).read({ kind: 'principal', sessionId: session.session_id })).sessions[session.session_id].grantId, null);
+  else assert.deepEqual(env.store.state.grants, {});
+});
+
+for (const durable of [false, true]) test(`terminal method records do not consume pending quota (${durable ? 'SQLite' : 'memory'})`, async t => {
+  const env = await environment(t, durable);
+  const options = { issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: [], metadata: env.metadata,
+    store: env.db ? env.db.issuer(ISSUER) : env.store, coordinator: env.db ?? { run: action => action() }, now: () => env.clock.now, requireDpopNonce: false, maxPendingAuthorizations: 1,
+    device: { endpoint: DEVICE, verificationUri: VERIFY, scopes: ['poppy:read'] }, mediated: env.config };
+  env.issuer = createReferenceIssuer(options);
+  const start = (await startDevice(env, 'poppy:read')).body;
+  assert.equal((await startDevice(env, 'poppy:read')).status, 429);
+  await env.issuer.beginDeviceAuthorization(start.user_code, BROWSER); await env.issuer.completeDeviceAuthorization(start.user_code, BROWSER, { denied: true });
+  const next = await startDevice(env, 'poppy:read'); assert.equal(next.status, 200);
+  await env.issuer.beginDeviceAuthorization(next.body.user_code, BROWSER); await env.issuer.completeDeviceAuthorization(next.body.user_code, BROWSER, { denied: true });
+  const session = (await env.send()).body;
+  assert.equal((await mediated(env, session.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } })).body.status, 'complete');
+  assert.equal((await mediated(env, session.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } })).body.status, 'complete');
+});
+
+test('Mediated challenge verifies once under concurrency and rejects non-boolean host decisions', async t => {
+  let deliver, waiting; const ready = new Promise(resolve => { waiting = resolve; });
+  const env = await environment(t, true, { authenticate: async () => ({ accountId: 'acct_1', challenge: { id: 'host-id', sentTo: 'Your phone' } }), verifyCode: async () => { waiting(); return new Promise(resolve => { deliver = resolve; }); } });
+  const session = (await env.send()).body, first = await mediated(env, session.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } });
+  const active = mediated(env, session.access_token, { code: '123456' }, first.body.sign_in_id); await ready;
+  assert.equal((await mediated(env, session.access_token, { code: '123456' }, first.body.sign_in_id)).status, 429);
+  deliver('false'); const invalid = await active; assert.equal(invalid.status, 503); assert.equal(invalid.body.error, 'temporarily_unavailable');
+  assert.equal((await env.db.issuer(ISSUER).read({ kind: 'principal', sessionId: session.session_id })).sessions[session.session_id].grantId, null);
 });

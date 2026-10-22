@@ -273,7 +273,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const replayKey = `assertion ${clientId} ${client.jti}`;
     await commit({ kind: 'sign_in', ids: [id], clientId, replayKeys: [replayKey], at: now() }, draft => {
       if (draft.generation !== generation || !current(client)) throw new TokenError('invalid_client');
-      const pending = Object.values(draft.signIns).filter(row => row.kind !== 'attempts' && row.expiresAt > now());
+      const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
       if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
       consumeReplay(draft, replayKey, client.exp * 1000);
       draft.signIns[id] = { kind: 'device', clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs };
@@ -366,7 +366,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
           if (window.count >= maximum) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil((window.expiresAt - now()) / 1000)) });
           window.count++; draft.signIns[limitKey] = window;
         }
-        const pending = Object.values(draft.signIns).filter(row => row.kind !== 'attempts' && row.expiresAt > now());
+        const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
         if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === context.clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
         record = { kind: 'mediated', clientId: context.clientId, userId: context.userId, sessionId: context.sessionId, scopes, expiresAt: now() + AUTHORIZATION_MS, status: 'verifying', attempts: 0, executionId };
         draft.signIns[key] = record; return { record };
@@ -375,18 +375,19 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const record = claim.record;
       let decision: { accountId: string; scopes?: string[]; challenge?: { id: string; sentTo: string } } | null = null, correct = false;
       try {
-        if (challenge) correct = await config.verifyCode({ challengeId: record.challengeId!, code }, context);
+        if (challenge) { correct = await config.verifyCode({ challengeId: record.challengeId!, code }, context); if (typeof correct !== 'boolean') throw 0; }
         else decision = await config.authenticate(credentials, context);
       } catch { throw new TokenError('temporarily_unavailable'); }
       const credentialValues = Object.values(credentials);
       if (decision && (typeof decision.accountId !== 'string' || !decision.accountId || decision.accountId.length > 256 || (decision.challenge && (typeof decision.challenge.id !== 'string' || !decision.challenge.id || typeof decision.challenge.sentTo !== 'string' || decision.challenge.sentTo.length > 512)))) throw new TokenError('temporarily_unavailable');
-      if (decision?.scopes && (!Array.isArray(decision.scopes) || !decision.scopes.length || !decision.scopes.every(scope => record.scopes.includes(scope)))) throw new TokenError('temporarily_unavailable');
+      if (decision?.scopes !== undefined && (!Array.isArray(decision.scopes) || !decision.scopes.length || !decision.scopes.every(scope => record.scopes.includes(scope)))) throw new TokenError('temporarily_unavailable');
       const body = await commit(selection, draft => {
         if (draft.generation !== state.generation) throw new TokenError('invalid_token');
         const current = own(draft.signIns, key), { token, session } = mediatedToken(draft, accessHash, proof.jkt);
         if (!current || current.kind !== 'mediated' || current.executionId !== executionId || current.status !== 'verifying') throw new TokenError('sign_in_not_found');
         if (current.expiresAt <= now()) { current.status = 'expired'; return { status: 'expired' }; }
         if ((!challenge && !decision) || (challenge && !correct && current.attempts >= maxCodeAttempts)) { current.status = 'failed'; return { status: 'failed' }; }
+        if (decision) current.accountId = decision.accountId;
         if (decision?.scopes) current.scopes = [...new Set(decision.scopes)];
         if (decision?.challenge) {
           current.accountId = decision.accountId; current.challengeId = decision.challenge.id;
@@ -722,7 +723,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     disconnect: (clientId, accountId) => commit({ kind: 'disconnect', clientId, accountId }, draft => {
       for (const [grantId, grant] of Object.entries(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) revokeGrant(draft, grantId);
       for (const [key, code] of Object.entries(draft.codes)) if (code.clientId === clientId && code.accountId === accountId) delete draft.codes[key];
-      for (const [key, record] of Object.entries(draft.signIns)) if (record.kind !== 'attempts' && record.clientId === clientId && record.accountId === accountId) delete draft.signIns[key];
+      // An in-flight credential check has not learned its account yet. Cancel it rather than let it undo disconnect.
+      for (const [key, record] of Object.entries(draft.signIns)) if (record.kind !== 'attempts' && record.clientId === clientId && (record.accountId === undefined || record.accountId === accountId)) delete draft.signIns[key];
+      for (const [key, record] of Object.entries(draft.authorizations)) if (record.clientId === clientId) delete draft.authorizations[key];
     }),
   };
 }
