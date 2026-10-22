@@ -206,7 +206,7 @@ test('mixed DNS answers never dial a private address; all-private fails closed',
     answers = ['10.0.0.1', '192.168.0.1'];
     await assert.rejects(transport.fetch(new Request(`https://localhost:${port}/`)), { code: 'blocked_address' });
   } finally { tls.connect = connect; syncBuiltinESMExports(); }
-  assert.equal(dialed.length, 2);
+  assert.deepEqual(dialed, ['127.0.0.1'], 'all-private answers are rejected before TLS');
 });
 const bounded = (clock, calls, extra = {}) => createMetadataResolver({ async fetch(request) {
   calls.push(request.url);
@@ -317,4 +317,89 @@ test('discovery fetches are capped at 100 KB while other fetches keep the config
   const url = `https://localhost:${server.address().port}/`;
   await assert.rejects(transport.fetch(new Request(url), { mode: 'discovery' }), { code: 'body_limit' });
   assert.equal((await (await transport.fetch(new Request(url))).text()).length, 150_000);
+});
+
+test('pool reuses TLS, separates discovery and streams, rejects changed policy before bytes, and closes', async t => {
+  const key = await readFile(new URL('./fixtures/localhost-key.pem', import.meta.url));
+  const cert = await readFile(new URL('./fixtures/localhost-cert.pem', import.meta.url));
+  let connections=0, requests=0;
+  const server=createServer({key,cert},(_q,r)=>{ requests++; r.end('ok'); });
+  server.on('secureConnection',()=>connections++);
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const localExceptions=[{hostname:'localhost',addresses:['127.0.0.1']}];
+  const transport=createNodeTransport({ca:cert.toString(),localExceptions,maxPools:3});
+  t.after(()=>{transport.close();server.closeAllConnections();server.close();});
+  const make=()=>new Request(`https://localhost:${server.address().port}/`);
+  for(let i=0;i<8;i++) assert.equal(await (await transport.fetch(make())).text(),'ok');
+  assert.equal(connections,1,'8 requests / 1 TLS connection');
+  await transport.fetch(make(),{mode:'discovery'}); assert.equal(connections,2);
+  assert.equal(await (await transport.stream(make())).text(),'ok'); assert.equal(connections,3);
+  const before=requests; localExceptions[0].addresses=[];
+  await assert.rejects(transport.fetch(make()),{code:'blocked_address'}); assert.equal(requests,before);
+  transport.close(); await assert.rejects(transport.fetch(make()),{code:'closed'});
+});
+
+test('stream body cancellation releases bounded request slots and JSON queue cancellation is harmless',async t=>{
+  const key=await readFile(new URL('./fixtures/localhost-key.pem',import.meta.url));
+  const cert=await readFile(new URL('./fixtures/localhost-cert.pem',import.meta.url));
+  let requests=0;
+  const server=createServer({key,cert},(q,r)=>{requests++;if(q.url==='/stream'){r.writeHead(200,{'content-type':'text/event-stream'});r.write('data: {}\n\n');}else if(q.url==='/hold'){r.writeHead(200);r.flushHeaders();}else r.end('ok');});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const transport=createNodeTransport({ca:cert.toString(),localExceptions:[{hostname:'localhost',addresses:['127.0.0.1']}],maxRequests:2,maxSockets:1,timeoutMs:1000});
+  t.after(()=>{transport.close();server.closeAllConnections();server.close();});
+  const url=p=>`https://localhost:${server.address().port}${p}`;
+  const response=await transport.stream(new Request(url('/stream'))); await response.body.cancel();
+  const first=new AbortController(),second=new AbortController();
+  const held=transport.fetch(new Request(url('/hold'),{signal:first.signal}));
+  while(requests<2) await new Promise(resolve=>setTimeout(resolve,1));
+  const queued=transport.fetch(new Request(url('/ok'),{signal:second.signal}));
+  second.abort(); await assert.rejects(queued); first.abort(); await assert.rejects(held);
+  assert.equal(await(await transport.fetch(new Request(url('/ok')))).text(),'ok');
+});
+
+test('cache validators revalidate after expiry; invalidation refetches and never carries credentials',async()=>{
+  let now=0,calls=0;const uri='https://agent.example/client';
+  const value={client_id:uri,client_name:'Agent',jwks_uri:'https://agent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt'};
+  const resolver=createMetadataResolver({async fetch(request){calls++;assert.equal(request.headers.has('authorization'),false);if(request.headers.get('if-none-match'))return new Response(null,{status:304,headers:{'cache-control':'max-age=60'}});return Response.json(value,{headers:{etag:'"v1"','cache-control':'max-age=60'}});}},{now:()=>now});
+  await resolver.resolveClient(uri);await resolver.resolveClient(uri);assert.equal(calls,1);
+  now=60001;assert.equal((await resolver.resolveClient(uri)).client_name,'Agent');assert.equal(calls,2);
+  resolver.invalidate(uri);await resolver.resolveClient(uri);assert.equal(calls,3);
+});
+
+test('stalled TLS is counted against pool cap and abort destroys the unassigned socket',async t=>{
+  const net=await import('node:net');let connections=0,closed=0;const sockets=new Set();
+  const server=net.createServer(socket=>{connections++;sockets.add(socket);socket.on('data',()=>{});socket.on('close',()=>{closed++;sockets.delete(socket);});});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const transport=createNodeTransport({maxSockets:1,timeoutMs:2000,localExceptions:[{hostname:'127.0.0.1',addresses:['127.0.0.1']}]});
+  t.after(()=>{transport.close();for(const socket of sockets)socket.destroy();server.close();});
+  const controller=new AbortController(),url=`https://127.0.0.1:${server.address().port}/`;
+  const first=transport.fetch(new Request(url,{signal:controller.signal}));
+  while(connections===0)await new Promise(resolve=>setTimeout(resolve,1));
+  await assert.rejects(transport.fetch(new Request(url)),{code:'overloaded'});assert.equal(connections,1);
+  controller.abort();await assert.rejects(first);
+  const deadline=Date.now()+500;while(!closed&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,1));
+  assert.equal(closed,1,'aborted handshake closes before timeout');
+});
+
+test('304 inherits no-cache; invalidation fences an in-flight stale fetch',async()=>{
+  const uri='https://agent.example/client',value={client_id:uri,client_name:'old',jwks_uri:'https://agent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt'};let calls=0;
+  const resolver=createMetadataResolver({async fetch(){return ++calls===1?Response.json(value,{headers:{etag:'"v1"','cache-control':'no-cache'}}):new Response(null,{status:304});}});
+  await resolver.resolveClient(uri);await resolver.resolveClient(uri);await resolver.resolveClient(uri);assert.equal(calls,3);
+  let release,started;const gate=new Promise(resolve=>release=resolve),entered=new Promise(resolve=>started=resolve);calls=0;
+  const racing=createMetadataResolver({async fetch(){if(++calls===1){started();await gate;return Response.json(value);}return Response.json({...value,client_name:'new'});}});
+  const old=racing.resolveClient(uri);await entered;racing.invalidate(uri);assert.equal((await racing.resolveClient(uri)).client_name,'new');release();await old;assert.equal((await racing.resolveClient(uri)).client_name,'new');assert.equal(calls,2);
+});
+
+test('invalidating pending metadata preserves the global active-fetch cap',async()=>{
+  let release,entered;const gate=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);let calls=0;
+  const uri='https://agent.example/client';const value={client_id:uri,client_name:'A',jwks_uri:'https://agent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt'};
+  const resolver=createMetadataResolver({async fetch(){calls++;entered();await gate;return Response.json(value);}},{maxConcurrentFetches:1});
+  const first=resolver.resolveClient(uri);await started;resolver.invalidate(uri);await assert.rejects(resolver.resolveClient(uri),{field:'metadata.rate_limited'});assert.equal(calls,1);release();await first;await resolver.resolveClient(uri);assert.equal(calls,2);
+});
+
+test('close during DNS prevents a resumed lookup from opening any connection',async()=>{
+  const original=dns.lookup;let release,entered;const ready=new Promise(resolve=>entered=resolve);let connects=0;const connect=tls.connect;
+  dns.lookup=(_host,_opts,callback)=>{release=()=>callback(null,[{address:'8.8.8.8',family:4}]);entered();};tls.connect=(...args)=>{connects++;return connect(...args);};syncBuiltinESMExports();
+  const transport=createNodeTransport();
+  try{const pending=transport.fetch(new Request('https://late.example/'));await ready;transport.close();release();await assert.rejects(pending,{code:'closed'});assert.equal(connects,0);}finally{dns.lookup=original;tls.connect=connect;syncBuiltinESMExports();transport.close();}
 });

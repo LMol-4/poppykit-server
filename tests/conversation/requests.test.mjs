@@ -54,7 +54,7 @@ test('requestAuthorization validates scopes against the direct scopes before wri
   for (const scopes of [[], ['poppy:admin'], ['poppy:read', 'openid'], 'poppy:read', [1]]) {
     await assert.rejects(t.service.requestAuthorization(claim, 'auth', scopes), TypeError, JSON.stringify(scopes));
   }
-  await assert.rejects(setup().service.requestAuthorization(claim, 'auth', ['poppy:read']), /directScopes is not configured/);
+  await assert.rejects(setup().service.requestAuthorization(claim, 'auth', ['poppy:read']), /supportedScopes is not configured/);
   assert.deepEqual(await t.store.read(), before);
 });
 

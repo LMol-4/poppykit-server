@@ -1,16 +1,17 @@
 import { randomBytes } from 'node:crypto';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { createConversationNotifications } from './store.js';
 import { ValidationError, canonical, parseJson, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
-import type { ConversationStore, ConversationSelection } from './store.js';
+import type { ConversationStore, ConversationSelection, ConversationNotifications } from './store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
 
 export interface ConversationRecord {
   id: string; issuer: string; clientId: string; userId: string; bindingId: string;
   status: Status; responder: Sender; context: JsonObject; events: ConversationEvent[];
+  eventWindow?: { invalid?: boolean; expired?: boolean; hasMore: boolean };
   authority: AcceptedAuthority; // of the latest accepted message; staff operations act under it
   parentId?: string; // set on a Direct Conversation
   childId?: string; // the parent's open Direct Conversation
@@ -42,6 +43,12 @@ export interface ConversationOptions {
   leaseMs?: number;
   operatorLeaseMs?: number; // default 900000: a person's claim lasts this long unless renewed
   finishedWorkLimit?: number; // default 1000 finished work records kept, newest first, for inspection; older ones are dropped
+  notifications?: ConversationNotifications;
+  maxPageBytes?: number;
+  maxEventBytes?: number;
+  maxFrameBytes?: number;
+  streamMs?: number;
+  supportedScopes?: readonly string[];
   pollIntervalMs?: number; // long-poll store checks, outside all locks
   /** Mandatory for staff methods: authenticate and authorize this company operator for the conversation, or throw. */
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
@@ -132,16 +139,27 @@ export function createConversationService(options: ConversationOptions): Convers
   const historyScopes = [...(options.historyScopes ?? ['poppy:read'])];
   const leaseMs = options.leaseMs ?? 60000;
   const operatorLeaseMs = options.operatorLeaseMs ?? 900000;
-  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const finishedWorkLimit = options.finishedWorkLimit ?? 1000;
   const revocationPolicy = options.revocationPolicy ?? 'stop-account-work';
   for (const value of [pageSize, leaseMs, operatorLeaseMs, pollIntervalMs, finishedWorkLimit]) if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError('Invalid conversation option');
+  const maxPageBytes = options.maxPageBytes ?? 1048576;
+  const maxFrameBytes = options.maxFrameBytes ?? 1048576;
+  const maxEventBytes = options.maxEventBytes ?? Math.min(maxPageBytes - 1025, maxFrameBytes - 512);
+  const streamMs = options.streamMs ?? 30000;
+  if (![maxPageBytes,maxFrameBytes,maxEventBytes,streamMs].every(Number.isSafeInteger) || maxPageBytes < 2048 || maxFrameBytes < 1024 || maxEventBytes < 512 || maxEventBytes > maxPageBytes - 1025 || maxEventBytes > maxFrameBytes - 512 || streamMs < 1 || streamMs > 300000) throw new TypeError('Invalid delivery budget');
+  const notifications = options.notifications ?? createConversationNotifications();
+  const hints = (ids: string[]) => { for (const id of ids) { try { notifications.publish(id); } catch { /* Durable reconciliation recovers lost hints. */ } } };
+  function changes<T>(draft: ConversationStoreState, action: () => T) { const before = new Map(Object.values(draft.conversations).map(c => [c.id,c.events.at(-1)?.id])); const value = action(); return { value, ids: Object.values(draft.conversations).filter(c => c.events.at(-1)?.id !== before.get(c.id)).map(c => c.id) }; }
+  async function committed<T>(task: Promise<{ value: T; ids: string[] }>): Promise<T> { const result = await task; hints(result.ids); return result.value; }
   const endpoint = secureUrl(options.endpoint);
   const basePath = endpoint.pathname.replace(/\/$/, '');
 
   const timestamp = () => new Date(clock.now()).toISOString();
   function addEvent(conversation: ConversationRecord, event: JsonObject): void {
-    conversation.events.push({ id: randomId('evt_'), created_at: timestamp(), ...event } as ConversationEvent);
+    const record = { id: randomId('evt_'), created_at: timestamp(), ...event } as ConversationEvent;
+    if (Buffer.byteLength(JSON.stringify(record)) > maxEventBytes) throw new ValidationError('event.size');
+    conversation.events.push(record);
   }
   function setState(conversation: ConversationRecord, status: Status, responder = conversation.responder): void {
     if (conversation.status === status && conversation.responder === responder) return;
@@ -223,16 +241,20 @@ export function createConversationService(options: ConversationOptions): Convers
   }
   function page(conversation: ConversationRecord, cursor?: string): JsonObject {
     let start = 0;
-    if (cursor !== undefined) {
+    if (conversation.eventWindow?.expired) throw new HttpError(410, { error: 'cursor_expired' });
+    if (conversation.eventWindow?.invalid) throw new HttpError(400, { error: 'invalid_cursor' });
+    if (cursor !== undefined && !conversation.eventWindow) {
       const index = conversation.events.findIndex(event => event.id === cursor);
-      // shortcut: no retention, so cursor_expired never occurs; add expired-cursor markers with a retention job.
       if (index < 0) throw new HttpError(400, { error: 'invalid_cursor' });
       start = index + 1;
     }
-    const events = conversation.events.slice(start, start + pageSize);
+    const events: ConversationEvent[] = [];
+    let bytes = 1024; // Worst-case IDs, status, responder, cursor and JSON envelope.
+    for (const event of conversation.events.slice(start, start + pageSize)) { const size = Buffer.byteLength(JSON.stringify(event)) + 1; if (bytes + size > maxPageBytes) break; events.push(event); bytes += size; }
+    if (!events.length && (conversation.events.length > start || conversation.eventWindow?.hasMore)) throw new ValidationError('page.size');
     return {
       conversation_id: conversation.id, events: events as unknown as JsonObject[], cursor: events.at(-1)?.id ?? cursor ?? null,
-      has_more: start + events.length < conversation.events.length, status: conversation.status, responder: conversation.responder,
+      has_more: !!conversation.eventWindow?.hasMore || start + events.length < conversation.events.length, status: conversation.status, responder: conversation.responder,
     };
   }
   function ack(conversation: ConversationRecord): JsonObject {
@@ -266,9 +288,9 @@ export function createConversationService(options: ConversationOptions): Convers
         const now = target(draft);
         // Binding only ever gains an account, so a rerun with the wider scopes settles it.
         if (scopesFor(draft, principal, now === undefined ? undefined : own(draft.conversations, now), history(draft)).length > scopes.length) return { rescope: true } as const;
-        return { value: change(draft) };
+        return changes(draft, () => change(draft));
       }));
-      if (!('rescope' in result)) return result.value;
+      if (!('rescope' in result)) { hints(result.ids); return result.value; }
     }
   }
 
@@ -287,7 +309,7 @@ export function createConversationService(options: ConversationOptions): Convers
     // A retry returns the saved receipt, which is a history page if the original request waited.
     const history = (state: ConversationStoreState) => waiting || 'events' in (own(state.messages, key)?.receipt.body ?? {});
 
-    const receipt = await current(principal, { ...(conversationId ? { conversationId } : parentId ? { conversationId: parentId } : {}), messageKey: key }, target, history, draft => {
+    const receipt = await current(principal, { ...(conversationId ? { conversationId } : parentId ? { conversationId: parentId } : {}), messageKey: key, append: !waiting && read.cursor === undefined }, target, history, draft => {
       if (conversationId !== undefined) owned(draft, principal, conversationId);
       const existing = own(draft.messages, key);
       if (existing) {
@@ -349,22 +371,67 @@ export function createConversationService(options: ConversationOptions): Convers
   }
 
   async function events(request: Request, principal: Principal, url: URL, conversationId: string): Promise<Response> {
+    const streaming = request.headers.get('accept')?.split(',').some(value => value.trim().split(';')[0] === 'text/event-stream') ?? false;
+    const last = request.headers.get('last-event-id');
+    if (last !== null) url.searchParams.set('cursor', last);
     const read = parseReadOptions(url, maxWaitSeconds);
-    const deadline = clock.now() + read.waitSeconds * 1000;
-    const deliver = () => current(principal, { conversationId }, () => conversationId, () => true, draft => page(owned(draft, principal, conversationId), read.cursor));
-    const first = await deliver();
-    if ((first.events as unknown[]).length || read.waitSeconds === 0) return json(200, first);
-    // Wait outside all locks without releasing anything; events are append-only, so a new last event means news.
-    // Targeted reconciliation remains authoritative if a notification is lost (J3 wires waiting).
-    const arrived = async () => (own((await store.read({ conversationId })).conversations, conversationId)?.events.at(-1)?.id ?? null) !== first.cursor;
-    while (clock.now() < deadline && !request.signal.aborted && !await arrived()) await sleep(pollIntervalMs);
-    // Delivery rechecks the reader now: a revocation during the hold returns no data.
-    return json(200, await deliver());
+    let cursor = read.cursor;
+    const deliver = () => current(principal, { conversationId, events: { cursor, limit: pageSize, maxBytes: maxPageBytes - 1024 } }, () => conversationId, () => true, draft => page(owned(draft, principal, conversationId), cursor));
+    // Install before the first durable read. Revision catches a wake arriving during that read.
+    let revision = 0, wake: (() => void) | undefined;
+    const unsubscribe = notifications.subscribe(conversationId, () => { revision++; wake?.(); });
+    const stop = new AbortController(), signal = AbortSignal.any([request.signal,stop.signal]);
+    let cleaned = false;
+    let lifetime: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => { if (!cleaned) { cleaned = true; clearTimeout(lifetime); unsubscribe(); stop.abort(); } };
+    async function wait(ms: number, seen: number) {
+      if (revision !== seen || signal.aborted || ms <= 0) return;
+      await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal.removeEventListener('abort',done); wake = undefined; resolve(); };
+        const timer = setTimeout(done, ms); wake = done; signal.addEventListener('abort',done,{once:true});
+        if (revision !== seen || signal.aborted) done();
+      });
+    }
+    try {
+      let seen = revision, first = await deliver();
+      signal.throwIfAborted();
+      if (!streaming) {
+        const deadline = Date.now() + read.waitSeconds * 1000, logicalDeadline = clock.now() + read.waitSeconds * 1000;
+        while (!(first.events as unknown[]).length && Date.now() < deadline && clock.now() < logicalDeadline && !signal.aborted) {
+          await wait(Math.min(pollIntervalMs,deadline-Date.now(),logicalDeadline-clock.now()), seen); seen = revision;
+          if (signal.aborted) throw signal.reason;
+          first = await deliver();
+        }
+        signal.throwIfAborted(); cleanup(); return json(200, first);
+      }
+      lifetime = setTimeout(cleanup, streamMs);
+      const encoder = new TextEncoder(), deadline = Date.now()+streamMs;
+      let pending = first, index = 0, bytes = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(target) {
+          try {
+            signal.throwIfAborted();
+            while (index >= (pending.events as unknown[]).length) {
+              if (Date.now() >= deadline || pending.status === 'closed') { cleanup(); target.close(); return; }
+              if (!pending.has_more) await wait(Math.min(pollIntervalMs,deadline-Date.now()),seen);
+              signal.throwIfAborted(); seen=revision; pending=await deliver(); index=0;
+            }
+            const event = (pending.events as ConversationEvent[])[index++];
+            const frame = encoder.encode('id: '+event.id+'\ndata: '+JSON.stringify(event)+'\n\n');
+            bytes += frame.byteLength;
+            if (frame.byteLength > maxFrameBytes || bytes > 16777216) { cleanup(); target.close(); return; }
+            cursor=event.id; target.enqueue(frame);
+          } catch (error) { cleanup(); target.error(error); }
+        },
+        cancel() { cleanup(); },
+      },{highWaterMark:0});
+      return new Response(stream,{headers:{'content-type':'text/event-stream','cache-control':'no-store'}});
+    } catch (error) { cleanup(); throw error; }
   }
 
   async function lifecycle(request: Request, principal: Principal, conversationId: string, action: 'handoff' | 'close'): Promise<Response> {
     object(await readJson(request));
-    const body = await current(principal, { conversationId }, () => conversationId, () => false, draft => {
+    const body = await current(principal, { conversationId, append: true }, () => conversationId, () => false, draft => {
       const conversation = owned(draft, principal, conversationId);
       if (action === 'close') closeConversation(draft, conversation);
       else {
@@ -400,8 +467,8 @@ export function createConversationService(options: ConversationOptions): Convers
   // scopes() is evaluated on the read and again on the draft; a binding gained in between reruns with wider scopes.
   // change() gets live: whether the accepted sign-in still holds. Only account-free publications check it; others pass true.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
-    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord, live: boolean) => T, accountFree: (work: WorkRecord) => boolean = never): Promise<T> {
-    const selection = { workId: ref.workId };
+    change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord, live: boolean) => T, accountFree: (work: WorkRecord) => boolean = never, loadHistory = false): Promise<T> {
+    const selection = { workId: ref.workId, append: !loadHistory };
     for (;;) {
       const before = await store.read(selection);
       const stored = before.work.find(work => work.id === ref.workId);
@@ -411,17 +478,17 @@ export function createConversationService(options: ConversationOptions): Convers
         const work = draft.work.find(item => item.id === ref.workId);
         if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
         if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
-        return change(draft, work, draft.conversations[work.conversationId], live);
+        return changes(draft, () => change(draft, work, draft.conversations[work.conversationId], live));
       }));
       try {
-        if (!accountFree(stored)) return await run(stored.authority, true);
+        if (!accountFree(stored)) return await committed(run(stored.authority, true));
         // A publication that uses no account (failing, suspending, asking to sign in, a person's words) must stay possible after revocation,
         // or the work is reclaimed forever. Try it as if revocation stopped work first, to learn whether the sign-in is live.
         try {
-          return await run({ ...stored.authority, revocationPolicy: 'stop-account-work' }, true);
+          return await committed(run({ ...stored.authority, revocationPolicy: 'stop-account-work' }, true));
         } catch (error) {
           if (!(error instanceof AuthorityError && error.code === 'invalid_token')) throw error;
-          return await run({ ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' }, false);
+          return await committed(run({ ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' }, false));
         }
       } catch (error) {
         if (!(error instanceof Rescope)) throw error;
@@ -437,22 +504,22 @@ export function createConversationService(options: ConversationOptions): Convers
     change: (draft: ConversationStoreState, conversation: ConversationRecord, authority: AcceptedAuthority) => T): Promise<T> {
     if (!options.authorizeOperator) throw new TypeError('authorizeOperator is not configured');
     await options.authorizeOperator(operator, conversationId);
-    const selection = { conversationId };
+    const selection = { conversationId, append: true };
     for (;;) {
-      const stored = own((await store.read({ conversationId })).conversations, conversationId);
+      const stored = own((await store.read({ conversationId, append: true })).conversations, conversationId);
       if (!stored) throw new PublicationError('stale_work');
       // Conversations stored before staff support have none until the customer's next accepted message.
       if (stored.authority === undefined) throw new Error('Conversation has no stored customer authority');
       // Leaving the queue or handing back uses no account, so it stays possible after revocation.
       const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
-        return await policy.withAccepted(authority, [], () => store.transaction(selection, draft => {
+        return await committed(policy.withAccepted(authority, [], () => store.transaction(selection, draft => {
           const conversation = own(draft.conversations, conversationId);
           if (!conversation) throw new PublicationError('stale_work');
           // A message accepted in between replaced the authority that was checked.
           if (canonical(conversation.authority) !== canonical(stored.authority)) throw new Rescope();
-          return change(draft, conversation, stored.authority);
-        }));
+          return changes(draft, () => change(draft, conversation, stored.authority));
+        }))); 
       } catch (error) {
         if (!(error instanceof Rescope)) throw error;
       }
@@ -482,7 +549,7 @@ export function createConversationService(options: ConversationOptions): Convers
 
     async claim() {
       // Idle pollers only read; the transaction rechecks, since another claimer may have won in between.
-      const selection = { claimAt: clock.now() };
+      const selection = { claimAt: clock.now(), append: true };
       if (!claimable(await store.read(selection), clock.now())) return null;
       return store.transaction(selection, draft => {
         const now = clock.now();
@@ -512,7 +579,7 @@ export function createConversationService(options: ConversationOptions): Convers
         const accountId = boundAccount(draft, work);
         if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('sign_in_required');
         return linkedHistory(draft, conversation);
-      });
+      }, never, true);
     },
 
     requireAccount(ref, scopes) {
@@ -539,8 +606,8 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     async requestAuthorization(ref, outputId, scopes) {
-      const direct = options.directScopes;
-      if (!direct) throw new TypeError('directScopes is not configured');
+      const direct = options.supportedScopes ?? options.directScopes;
+      if (!direct) throw new TypeError('supportedScopes is not configured');
       if (!Array.isArray(scopes) || !scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.includes(scope))) throw new TypeError('scopes');
       const scope = [...new Set(scopes)].join(' ');
       await publish(ref, noScopes, (draft, work, conversation, live) => {

@@ -4,3 +4,5 @@ export { createRequestAuthenticator } from './auth/authenticator.js';
 export * from './conversation/service.js';
 
 export type { ConversationStore, ConversationSelection, ConversationNotifications } from './conversation/store.js';
+
+export { createConversationNotifications } from './conversation/store.js';

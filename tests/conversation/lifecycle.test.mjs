@@ -451,7 +451,7 @@ test('long poll: a reader revoked during the hold gets no data', async () => {
   assert.deepEqual([res.status, res.body], [401, { error: 'invalid_token' }]);
 });
 
-test('long poll: foreign readers are refused before any hold; an aborted wait only stops waiting', async () => {
+test('long poll: foreign readers are refused before any hold; an aborted wait cancels delivery without cancelling work', async () => {
   const t = setup({ pollIntervalMs: 1 });
   const id = (await t.start(hello)).body.conversation_id;
   assert.equal((await t.read(id, { as: 'bob', query: '?wait=30' })).status, 404);
@@ -461,8 +461,7 @@ test('long poll: foreign readers are refused before any hold; an aborted wait on
   const held = t.read(id, { query: `?cursor=${cursor}&wait=30`, signal: controller.signal });
   await holding;
   controller.abort();
-  const res = await held;
-  assert.deepEqual([res.status, res.body.events], [200, []]);
+  await assert.rejects(held, { name: 'AbortError' });
   assert.equal((await t.store.read()).work[0].phase, 'pending', 'accepted work is untouched');
 });
 

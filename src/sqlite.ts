@@ -37,6 +37,9 @@ export class SqliteCompanyDatabase {
       CREATE INDEX IF NOT EXISTS by_expiry ON records(ns,kind,json_extract(body,'$.expiresAt'));
       CREATE INDEX IF NOT EXISTS replay_expiry ON records(ns,kind,CAST(body AS REAL));
       CREATE TABLE IF NOT EXISTS events (ns TEXT NOT NULL, conversation TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(ns,conversation,seq));
+      CREATE TABLE IF NOT EXISTS event_cursors (ns TEXT NOT NULL, conversation TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(ns,conversation,id));
+      CREATE INDEX IF NOT EXISTS cursor_seq ON event_cursors(ns,conversation,seq);
+      INSERT OR IGNORE INTO event_cursors SELECT ns,conversation,json_extract(body,'$.id'),seq FROM events;
       PRAGMA busy_timeout=0;`));
   }
   close(): void { this.db.close(); }
@@ -115,30 +118,60 @@ export class SqliteCompanyDatabase {
       }
       const target = id ? this.one<ConversationRecord>(namespace, 'conversations', id) : undefined;
       if (!target) return state;
-      for (const row of this.rows(namespace, 'conversations', "AND json_extract(body,'$.bindingId')=?", [target.bindingId])) {
+      for (const row of this.rows(namespace, 'conversations', selection.events ? 'AND id=?' : "AND json_extract(body,'$.bindingId')=?", [selection.events ? target.id : target.bindingId])) {
         const conversation: ConversationRecord = JSON.parse(row.body);
-        const events = this.db.prepare('SELECT body FROM events WHERE ns=? AND conversation=? ORDER BY seq').all(namespace, row.id);
-        this.metrics.rowsRead += events.length;
+        let from = -1;
+        if (selection.events?.cursor !== undefined) {
+          const found = this.db.prepare('SELECT seq FROM event_cursors WHERE ns=? AND conversation=? AND id=?').get(namespace, row.id, selection.events.cursor);
+          if (!found) conversation.eventWindow = { invalid: true, hasMore: false };
+          else { from = Number(found.seq); if (!this.db.prepare('SELECT 1 FROM events WHERE ns=? AND conversation=? AND seq=?').get(namespace,row.id,from)) conversation.eventWindow = { expired: true, hasMore: false }; }
+        }
+        const events: Record<string, unknown>[] = [];
+        let hasMore = false;
+        if (selection.events) {
+          let bytes = 0;
+          for (const event of this.db.prepare('SELECT body FROM events WHERE ns=? AND conversation=? AND seq>? ORDER BY seq LIMIT ?').iterate(namespace,row.id,from,selection.events.limit+1)) {
+            this.metrics.rowsRead++;
+            const size = Buffer.byteLength(event.body as string)+1;
+            if (events.length >= selection.events.limit || bytes+size > (selection.events.maxBytes ?? 1048576)) { hasMore = true; break; }
+            events.push(event); bytes += size;
+          }
+          conversation.eventWindow = { ...conversation.eventWindow, hasMore };
+        } else if (!selection.append) events.push(...this.db.prepare('SELECT body FROM events WHERE ns=? AND conversation=? ORDER BY seq').all(namespace,row.id));
+        if (!selection.events) this.metrics.rowsRead += events.length;
         conversation.events = events.map(event => JSON.parse(event.body as string));
         state.conversations[row.id] = conversation;
-        state.work.push(...this.rows(namespace, 'work', "AND json_extract(body,'$.conversationId')=? ORDER BY rowid", [row.id]).map(work => JSON.parse(work.body)));
+        if (!selection.events) state.work.push(...this.rows(namespace, 'work', "AND json_extract(body,'$.conversationId')=? ORDER BY rowid", [row.id]).map(work => JSON.parse(work.body)));
       }
       const binding = this.one<ConversationStoreState['bindings'][string]>(namespace, 'bindings', target.bindingId);
       if (binding) state.bindings[target.bindingId] = binding;
       return state;
     };
     return {
+      pruneEvents: (conversationId, before, limit = 100) => {
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000 || !Number.isFinite(before)) throw new TypeError('retention limit');
+        return this.run(async () => {
+          const active = this.db.prepare("SELECT 1 FROM records WHERE ns=? AND kind='work' AND json_extract(body,'$.conversationId')=? AND json_extract(body,'$.phase') IN ('held','pending','claimed') LIMIT 1").get(namespace,conversationId);
+          if (active) return 0;
+          const removed = this.db.prepare("DELETE FROM events WHERE ns=? AND conversation=? AND seq IN (SELECT seq FROM events WHERE ns=? AND conversation=? AND json_extract(body,'$.created_at')<? ORDER BY seq LIMIT ?)").run(namespace,conversationId,namespace,conversationId,new Date(before).toISOString(),limit);
+          return Number(removed.changes);
+        });
+      },
       read: selection => this.run(async () => load(selection)),
       transaction: (selection, change) => this.run(async () => this.atomic(() => {
         const state = load(selection), before = structuredClone(state);
         const result = change(state);
         if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('async conversation transaction');
+        if (selection.events) { if (json(state) !== json(before)) throw new TypeError('event windows are read-only'); return structuredClone(result); }
         if (state.version !== before.version || state.generation !== before.generation || Object.keys(before.conversations).some(id => !Object.hasOwn(state.conversations, id))) throw new TypeError('use an explicit offline reset');
         for (const [id, conversation] of Object.entries(state.conversations)) {
           const oldEvents = before.conversations[id]?.events ?? [];
           if (conversation.events.length < oldEvents.length || oldEvents.some((event, i) => json(event) !== json(conversation.events[i]))) throw new TypeError('events must be append-only');
-          for (let seq = oldEvents.length; seq < conversation.events.length; seq++) {
-            this.db.prepare('INSERT INTO events VALUES (?,?,?,?)').run(namespace, id, seq, json(conversation.events[seq])); this.metrics.rowsWritten++;
+          const last = Number(this.db.prepare('SELECT coalesce(max(seq),-1) AS seq FROM event_cursors WHERE ns=? AND conversation=?').get(namespace,id)!.seq);
+          for (let i = oldEvents.length; i < conversation.events.length; i++) {
+            const seq = last + i - oldEvents.length + 1, event = conversation.events[i];
+            this.db.prepare('INSERT INTO events VALUES (?,?,?,?)').run(namespace, id, seq, json(event));
+            this.db.prepare('INSERT INTO event_cursors VALUES (?,?,?,?)').run(namespace, id, event.id, seq); this.metrics.rowsWritten += 2;
           }
           const { events: _events, ...record } = conversation;
           const { events: _oldEvents, ...old } = before.conversations[id] ?? {};
