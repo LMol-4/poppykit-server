@@ -132,6 +132,12 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
         let releaseCalled = false;
         const release = () => { if (!releaseCalled) { releaseCalled = true; selectedPool.active--; } };
         const response = await new Promise<Response>((resolve, reject) => {
+          const failed = (error: unknown) => {
+            const retired = () => { release(); reject(error); }, socket = outgoing.socket;
+            // A destroyed socket can still count against the Agent until its close event.
+            if (socket && !socket.closed) socket.once('close', retired);
+            else if (!outgoing.closed) outgoing.once('close', retired); else retired();
+          };
           const outgoing = httpsRequest(url, { method: request.method, headers: Object.fromEntries(request.headers), agent: selectedPool.agent, signal, ...{ transportSignal: signal } }, incoming => {
             const headers = new Headers(); for (let i = 0; i < incoming.rawHeaders.length; i += 2) headers.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1]);
             const status = incoming.statusCode ?? 502;
@@ -140,21 +146,23 @@ export function createNodeTransport(options: NetworkOptions = {}): HttpTransport
             if (streaming && !noBody) {
               incoming.pause(); let bytes = 0;
               const iterator = incoming[Symbol.asyncIterator]();
+              const retire = () => new Promise<void>(done => { const socket = incoming.socket; if (socket && !socket.closed) socket.once('close', done); else done(); incoming.destroy(); });
+              const ended = () => { const socket = incoming.socket, done = () => { release(); finish(); }; if (socket?.destroyed && !socket.closed) socket.once('close', done); else done(); };
               const stream = new ReadableStream<Uint8Array>({
-                async pull(target) { try { const item = await iterator.next(); if (item.done) { target.close(); release(); finish(); } else { bytes += item.value.length; if (bytes > limits.maxStreamBytes) throw new TransportError('body_limit'); target.enqueue(item.value); } } catch (error) { target.error(error); incoming.destroy(); release(); finish(); } },
-                async cancel() { incoming.destroy(); await iterator.return?.(); release(); finish(); },
+                async pull(target) { try { const item = await iterator.next(); if (item.done) { target.close(); release(); finish(); } else { bytes += item.value.length; if (bytes > limits.maxStreamBytes) throw new TransportError('body_limit'); target.enqueue(item.value); } } catch (error) { await retire(); release(); finish(); target.error(error); } },
+                async cancel() { await retire(); await iterator.return?.(); release(); finish(); },
               }, { highWaterMark: 0 });
-              incoming.once('close', () => { release(); finish(); });
+              incoming.once('close', ended);
               transferred = true;
               const result = new Response(stream, { status, headers }); Object.defineProperty(result, 'url', { value: url.href }); resolve(result);
             } else {
               const chunks: Buffer[] = []; let size = 0;
               incoming.on('data', (chunk: Buffer) => { size += chunk.length; if (size > (discovery ? Math.min(limits.maxResponseBytes, 102400) : limits.maxResponseBytes)) incoming.destroy(new TransportError('body_limit')); else chunks.push(chunk); });
-              incoming.on('error', reject);
+              incoming.on('error', failed);
               incoming.on('end', () => { const result = new Response(noBody ? null : Buffer.concat(chunks), { status, headers }); Object.defineProperty(result, 'url', { value: url.href }); release(); resolve(result); });
             }
           });
-          outgoing.on('error', error => { release(); reject(error); }); outgoing.end(body);
+          outgoing.on('error', failed); outgoing.end(body);
         }).catch(error => { release(); throw error; });
         if (!discovery || ![301, 302, 303, 307, 308].includes(response.status)) return response;
         if (redirects >= limits.maxRedirects) throw new TransportError('redirect_limit');

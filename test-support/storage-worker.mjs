@@ -2,6 +2,7 @@ import { SqliteCompanyDatabase } from '../dist/sqlite.js';
 import { setup, hello } from '../tests/conversation/support.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { setup as issuerSetup, ISSUER } from '../tests/auth/issuer-support.mjs';
+import { effect } from './synthetic-effect.mjs';
 const [mode, path] = process.argv.slice(2);
 const db = new SqliteCompanyDatabase(path);
 const store = db.conversations('test');
@@ -32,6 +33,10 @@ if (mode === 'rotate' || mode === 'revoke') {
   t.clock.advance(1000);
   const work = await t.service.claim();
   if (!work) throw new Error('expected pending work');
+  if(mode==='effect-contract'){
+    const result=effect(path+'.contract','tenant-a',work.workId,{record:'opaque-17',value:1});
+    process.send({ready:true,work,result});pause();
+  }
   const external = new DatabaseSync(path + '.external');
   external.exec('CREATE TABLE IF NOT EXISTS effects (id TEXT PRIMARY KEY)');
   // Application contract: the stable work ID deduplicates its own side effect.

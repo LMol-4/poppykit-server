@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { SqliteCompanyDatabase } from '../dist/sqlite.js';
 import { setup, hello } from './conversation/support.mjs';
 import { setup as issuerSetup, CLIENT, ISSUER, REDIRECT } from './auth/issuer-support.mjs';
+import { effect } from '../test-support/synthetic-effect.mjs';
 const directories = [];
 after(async () => { for (const dir of directories) await rm(dir, { recursive: true, force: true }); });
 async function fixture() { const dir = await mkdtemp(join(tmpdir(), 'poppy-company-')); directories.push(dir); return join(dir, 'state.db'); }
@@ -55,6 +56,30 @@ test('death after an external side effect needs application idempotency, and sta
   assert.equal(state.conversations[receipt.receipt.conversation_id].events.filter(e => e.message?.id === 'reply').length, 1);
   db.close();
 });
+test('process death, competing recovery and retention preserve the application effect contract', {timeout:15000},async t=>{
+  const path=await fixture(),accepted=worker(t,'accept',path),receipt=await accepted.message;await accepted.exited;
+  const child=worker(t,'effect-contract',path),old=await child.message;
+  const a=new SqliteCompanyDatabase(path),b=new SqliteCompanyDatabase(path);t.after(()=>{a.close();b.close();});
+  const one=setup({store:a.conversations('test'),leaseMs:1}),two=setup({store:b.conversations('test'),leaseMs:1});
+  assert.equal(await a.conversations('test').pruneEvents(receipt.receipt.conversation_id,one.clock.now()+1e6,100),0,'active claimed work pins its history');
+  child.child.kill();await child.exited;
+  one.clock.advance(2000);two.clock.advance(2000);
+  const claims=(await Promise.all([one.service.claim(),two.service.claim()])).filter(Boolean);assert.equal(claims.length,1);
+  const fresh=claims[0];assert.notEqual(fresh.fence,old.work.fence);
+  await assert.rejects(one.service.reply(old.work,'result',{id:'stale',sender:'agent',text:'must not publish'}),{code:'stale_work'});
+  const payload={record:'opaque-17',value:1};
+  assert.equal(effect(path+'.contract','tenant-a',fresh.workId,payload),old.result,'recovered execution uses its own retained effect receipt');
+  assert.throws(()=>effect(path+'.contract','tenant-a',fresh.workId,{...payload,value:2}),/effect_payload_conflict/);
+  effect(path+'.contract','tenant-b',fresh.workId,payload);
+  const external=new DatabaseSync(path+'.contract');assert.equal(external.prepare('SELECT count(*) AS n FROM effects').get().n,2);external.close();
+  await one.service.reply(fresh,'result',{id:'recovered_result',sender:'agent',text:old.result});await one.service.finish(fresh,'completed');
+  const id=receipt.receipt.conversation_id,cursor=(await one.read(id)).body.cursor;
+  await a.conversations('test').pruneEvents(id,one.clock.now()+1,100);
+  const [retry,read]=await Promise.all([two.start(hello),two.read(id,{query:'?cursor='+cursor})]);
+  assert.deepEqual(retry.body,receipt.receipt,'acceptance retry survives history retention');assert.ok([200,410].includes(read.status));
+  assert.equal((await two.start({...hello,text:'conflicting bytes'})).body.error,'message_id_conflict');
+});
+
 test('targeted reads and writes do not grow with unrelated conversations', async t => {
   const db = new SqliteCompanyDatabase(await fixture()); t.after(() => db.close());
   const store = db.conversations('test'), service = setup({ store });

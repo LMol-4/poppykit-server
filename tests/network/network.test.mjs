@@ -332,6 +332,7 @@ test('pool reuses TLS, separates discovery and streams, rejects changed policy b
   const make=()=>new Request(`https://localhost:${server.address().port}/`);
   for(let i=0;i<8;i++) assert.equal(await (await transport.fetch(make())).text(),'ok');
   assert.equal(connections,1,'8 requests / 1 TLS connection');
+  t.diagnostic(JSON.stringify({sequentialRequests:8,tlsConnections:connections}));
   await transport.fetch(make(),{mode:'discovery'}); assert.equal(connections,2);
   assert.equal(await (await transport.stream(make())).text(),'ok'); assert.equal(connections,3);
   const before=requests; localExceptions[0].addresses=[];
@@ -355,6 +356,52 @@ test('stream body cancellation releases bounded request slots and JSON queue can
   const queued=transport.fetch(new Request(url('/ok'),{signal:second.signal}));
   second.abort(); await assert.rejects(queued); first.abort(); await assert.rejects(held);
   assert.equal(await(await transport.fetch(new Request(url('/ok')))).text(),'ok');
+});
+
+test('aborted pooled requests retire their socket before the next live request connects',async t=>{
+  const key=await readFile(new URL('./fixtures/localhost-key.pem',import.meta.url));
+  const cert=await readFile(new URL('./fixtures/localhost-cert.pem',import.meta.url));
+  let entered;
+  const server=createServer({key,cert},(q,r)=>{if(q.url==='/hold'){r.writeHead(200);r.flushHeaders();entered();}else r.end('live');});
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const transport=createNodeTransport({ca:cert.toString(),localExceptions:[{hostname:'localhost',addresses:['127.0.0.1']}],maxSockets:1,timeoutMs:2000});
+  t.after(()=>{transport.close();server.closeAllConnections();server.close();});
+  const url=path=>`https://localhost:${server.address().port}${path}`;
+  for(let i=0;i<25;i++){
+    const controller=new AbortController(),ready=new Promise(resolve=>entered=resolve);
+    const held=transport.fetch(new Request(url('/hold'),{signal:controller.signal}));
+    const failed=assert.rejects(held,{code:'network_error'});
+    await ready;controller.abort();await failed;
+    assert.equal(await(await transport.fetch(new Request(url('/next')))).text(),'live');
+  }
+});
+
+test('JSON body failures and same-pool stream cancellation/limits retire sockets before replacement',async t=>{
+  const key=await readFile(new URL('./fixtures/localhost-key.pem',import.meta.url)),cert=await readFile(new URL('./fixtures/localhost-cert.pem',import.meta.url));
+  const server=createServer({key,cert},(q,r)=>{
+    if(q.url==='/large')r.end('x'.repeat(128));
+    else if(q.url==='/reset'){r.write('partial');setImmediate(()=>r.destroy());}
+    else if(q.url==='/stream'){r.writeHead(200);r.write('chunk');}
+    else r.end('ok');
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const transport=createNodeTransport({ca:cert.toString(),localExceptions:[{hostname:'localhost',addresses:['127.0.0.1']}],maxSockets:1,maxResponseBytes:16,maxStreamBytes:16,timeoutMs:2000});
+  t.after(()=>{transport.close();server.closeAllConnections();server.close();});
+  const request=path=>new Request(`https://localhost:${server.address().port}${path}`);
+  for(let i=0;i<10;i++){
+    await assert.rejects(transport.fetch(request('/large')),{code:'body_limit'});
+    assert.equal(await(await transport.fetch(request('/ok'))).text(),'ok');
+    await assert.rejects(transport.fetch(request('/reset')),{code:'network_error'});
+    assert.equal(await(await transport.fetch(request('/ok'))).text(),'ok');
+    const stream=await transport.stream(request('/stream'));await stream.body.cancel();
+    assert.equal(await(await transport.stream(request('/ok'))).text(),'ok');
+    const oversized=await transport.stream(request('/large'));await assert.rejects(oversized.text(),{code:'body_limit'});
+    assert.equal(await(await transport.stream(request('/ok'))).text(),'ok');
+  }
+  const completed=await transport.stream(request('/ok')),reader=completed.body.getReader();assert.equal(new TextDecoder().decode((await reader.read()).value),'ok');
+  await new Promise(resolve=>setImmediate(resolve));
+  let timer;try{await Promise.race([reader.cancel(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('cancel waited for an idle pooled socket')),500);})]);}finally{clearTimeout(timer);}
+  assert.equal(await(await transport.stream(request('/ok'))).text(),'ok');
 });
 
 test('cache validators revalidate after expiry; invalidation refetches and never carries credentials',async()=>{

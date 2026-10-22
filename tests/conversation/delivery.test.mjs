@@ -34,6 +34,27 @@ test('committed output survives a lost notification and reconciliation does boun
   }finally{db.close();}
 });
 
+test('waiting reconciliation reads stay targeted as unrelated histories grow',async t=>{
+  const counts=[];
+  for(const unrelated of [0,100]){
+    const db=new SqliteCompanyDatabase(':memory:');try{
+      const store=db.conversations('bench');let env,id,work,measuring=false,reads=0,published;
+      const measured={...store,async read(selection){
+        if(measuring&&selection.conversationId===id&&++reads===4)published=env.service.reply(work,'durable',{id:'bench_reply',sender:'agent',text:'Committed without a notification'});
+        return store.read(selection);
+      }};
+      env=setup({store:measured,pollIntervalMs:5,notifications:{subscribe(){return()=>{};},publish(){}}});
+      id=(await env.start({id:'bench_target',sender:'agent',text:'Neutral target'})).body.conversation_id;
+      const cursor=(await env.read(id)).body.cursor;work=await env.service.claim();
+      for(let i=0;i<unrelated;i++)await env.start({id:'unrelated_'+i,sender:'agent',text:'Unrelated'});
+      db.metrics.rowsRead=0;measuring=true;
+      const response=await env.service.handle(request(id,{cursor}));const page=await response.json();await published;measuring=false;
+      assert.equal(page.events.at(-1).message.id,'bench_reply');counts.push({unrelated,waitingReads:reads,rowsRead:db.metrics.rowsRead});
+    }finally{db.close();}
+  }
+  assert.equal(counts[0].waitingReads,counts[1].waitingReads);assert.equal(counts[0].rowsRead,counts[1].rowsRead);t.diagnostic(JSON.stringify({waitingReader:counts}));
+});
+
 test('maximum encoded client/company events fit JSON pages and SSE frames; one byte over rolls back',async()=>{
   for(const maxPageBytes of [2048,4096,1048576]){
     const maxEventBytes=maxPageBytes-1025,env=setup({maxPageBytes,maxFrameBytes:maxPageBytes,maxEventBytes,pageSize:100});
