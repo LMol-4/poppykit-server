@@ -79,6 +79,16 @@ test('Direct Sign-In signs in the Session with an Account Token; partial consent
   assert.deepEqual([metadata.response_types_supported, metadata.code_challenge_methods_supported], [['code'], ['S256']]);
 });
 
+test('Direct pending consent retains its account revocation snapshot without affecting other accounts', async () => {
+  const env = await signInSetup();
+  const a = await env.issuer.beginAuthorization(authorizeRequest(), BINDING), b = await env.issuer.beginAuthorization(authorizeRequest(), BINDING);
+  await env.issuer.disconnect(CLIENT, 'acct_A');
+  await assert.rejects(env.issuer.completeAuthorization(a.id, BINDING, { accountId: 'acct_A', scopes: ['poppy:read'] }), { code: 'invalid_request' });
+  const callback = await env.issuer.completeAuthorization(b.id, BINDING, { accountId: 'acct_B', scopes: ['poppy:read'] });
+  assert.ok(callback.searchParams.get('code'));
+  assert.ok((await env.code({ accountId: 'acct_A' })).code, 'fresh explicit consent is allowed');
+});
+
 test('an authorization code works once; its reuse revokes the sign-in it produced', async () => {
   const env = await signInSetup();
   const session = await env.session();
