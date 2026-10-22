@@ -7,6 +7,7 @@ import type { MetadataResolver } from '../network/discovery.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
 import type { IssuerStore, IssuerSelection } from './store.js';
+import { clientRevisionKey, accountRevisionKey } from './store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
 import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, assertUniqueJwtMembers, verifyDpopProof } from '../auth/dpop.js';
@@ -20,13 +21,14 @@ interface SessionRecord { clientId: string; userId: string; version: number; cre
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
 interface AccessTokenRecord { sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
-interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number }
+interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
-interface CodeRecord { clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null }
+interface CodeRecord { clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
 export type SignInRecord =
-  | { kind: 'device'; clientId: string; scopes: string[]; expiresAt: number; deviceHash: string; status: 'pending' | 'approved' | 'denied' | 'consumed'; nextPollAt: number; intervalMs: number; browserHash?: string; accountId?: string }
-  | { kind: 'mediated'; clientId: string; userId: string; sessionId: string; scopes: string[]; expiresAt: number; status: 'verifying' | 'pending' | 'failed' | 'expired' | 'complete'; attempts: number; executionId: string; accountId?: string; challengeId?: string; sentTo?: string }
-  | { kind: 'attempts'; clientId: string; sessionId?: string; expiresAt: number; count: number };
+  | { kind: 'device'; clientId: string; scopes: string[]; expiresAt: number; deviceHash: string; status: 'pending' | 'approved' | 'denied' | 'consumed'; nextPollAt: number; intervalMs: number; revision: number; browserHash?: string; accountId?: string }
+  | { kind: 'mediated'; clientId: string; userId: string; sessionId: string; scopes: string[]; expiresAt: number; status: 'verifying' | 'pending' | 'failed' | 'expired' | 'complete'; attempts: number; executionId: string; revision: number; accountId?: string; challengeId?: string; sentTo?: string }
+  | { kind: 'attempts'; clientId: string; sessionId?: string; expiresAt: number; count: number }
+  | { kind: 'revision'; clientId: string; accountId?: string; expiresAt: number; revision: number };
 export interface MediatedContext { clientId: string; userId: string; sessionId: string; issuer: string }
 export interface MediatedOptions {
   endpoint: string; scopes: string[]; fields: { name: string; label: string; secret: boolean }[];
@@ -37,7 +39,7 @@ export interface MediatedOptions {
 // Plain JSON. Tokens and codes are keyed by SHA-256 hash; plaintext tokens are never stored.
 export interface IssuerState {
   limits?: { sessions: number; earliestSessionExpiry: number; pending: number; pendingForClient: number };
-  version: 2;
+  version: 3;
   generation: string;
   sessions: Record<string, SessionRecord>;
   grants: Record<string, GrantRecord>;
@@ -109,12 +111,12 @@ function callback(redirectUri: string, fields: Record<string, string>): string {
 
 // Shape changes bump the version; other versions are refused instead of misread.
 function checked(state: IssuerState): IssuerState {
-  if (state.version !== 2) throw new Error('unsupported issuer state version');
+  if (state.version !== 3) throw new Error('unsupported issuer state version');
   return state;
 }
 
 export function initialIssuerState(): IssuerState {
-  return { version: 2, generation: random(16), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {}, nonces: [] };
+  return { version: 3, generation: random(16), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {}, nonces: [] };
 }
 
 class TokenError extends Error {
@@ -265,18 +267,24 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     if ((own(draft.replay, key) ?? 0) > now()) throw new TokenError('invalid_grant');
     draft.replay[key] = until;
   }
+  function revision(draft: IssuerState, key: string): number {
+    const row = own(draft.signIns, key); return row?.kind === 'revision' ? row.revision : 0;
+  }
+  function consentCurrent(draft: IssuerState, clientId: string, accountId: string, started: number): boolean {
+    return revision(draft, accountRevisionKey(clientId, accountId)) <= started;
+  }
   async function startDevice(request: Request): Promise<Response> {
     if (!options.device) throw new TokenError('unsupported_grant_type');
     const params = await readParams(request), { clientId, clientAssertion } = clientCredentials(params);
     const scopes = signInScopes(params.get('scope'), options.device.scopes), { client } = await authenticateClient(clientId, clientAssertion);
     const { generation } = await read(), userCode = random(8).toUpperCase(), deviceCode = `${userCode}.${random(32)}`, id = tokenHash(userCode);
     const replayKey = `assertion ${clientId} ${client.jti}`;
-    await commit({ kind: 'sign_in', ids: [id], clientId, replayKeys: [replayKey], at: now() }, draft => {
+    await commit({ kind: 'sign_in', ids: [id, clientRevisionKey(clientId)], clientId, replayKeys: [replayKey], at: now() }, draft => {
       if (draft.generation !== generation || !current(client)) throw new TokenError('invalid_client');
       const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
       if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
       consumeReplay(draft, replayKey, client.exp * 1000);
-      draft.signIns[id] = { kind: 'device', clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs };
+      draft.signIns[id] = { kind: 'device', clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs, revision: revision(draft, clientRevisionKey(clientId)) };
     });
     const complete = new URL(options.device.verificationUri); complete.searchParams.set('user_code', userCode);
     return json(200, { device_code: deviceCode, user_code: userCode, verification_uri: options.device.verificationUri, verification_uri_complete: complete.href, expires_in: AUTHORIZATION_MS / 1000, interval: deviceIntervalMs / 1000 });
@@ -344,7 +352,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const accessHash = tokenHash(access), proofKey = `proof ${proof.jkt} ${proof.claims.jti}`, state = await read({ kind: 'access', hash: accessHash });
       const authenticated = mediatedToken(state, accessHash, proof.jkt), context: MediatedContext = { issuer, clientId: authenticated.session.clientId, userId: authenticated.session.userId, sessionId: authenticated.token.sessionId };
       const key = tokenHash(id), limitId = tokenHash(`attempts session ${context.clientId} ${context.sessionId}`), clientLimitId = tokenHash(`attempts client ${context.clientId}`), executionId = random(16);
-      const selection: IssuerSelection = { kind: 'sign_in', ids: [key, limitId, clientLimitId], clientId: context.clientId, accessHash, replayKeys: [proofKey], at: now() };
+      const selection: IssuerSelection = { kind: 'sign_in', ids: [key, limitId, clientLimitId, clientRevisionKey(context.clientId)], clientId: context.clientId, accessHash, replayKeys: [proofKey], at: now() };
       const claim = await commit(selection, draft => {
         if (draft.generation !== state.generation) throw new TokenError('invalid_token');
         mediatedToken(draft, accessHash, proof.jkt); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
@@ -368,7 +376,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         }
         const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
         if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === context.clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
-        record = { kind: 'mediated', clientId: context.clientId, userId: context.userId, sessionId: context.sessionId, scopes, expiresAt: now() + AUTHORIZATION_MS, status: 'verifying', attempts: 0, executionId };
+        record = { kind: 'mediated', clientId: context.clientId, userId: context.userId, sessionId: context.sessionId, scopes, expiresAt: now() + AUTHORIZATION_MS, status: 'verifying', attempts: 0, executionId, revision: revision(draft, clientRevisionKey(context.clientId)) };
         draft.signIns[key] = record; return { record };
       });
       if ('status' in claim) return json(200, claim);
@@ -381,10 +389,13 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const credentialValues = Object.values(credentials);
       if (decision && (typeof decision.accountId !== 'string' || !decision.accountId || decision.accountId.length > 256 || (decision.challenge && (typeof decision.challenge.id !== 'string' || !decision.challenge.id || typeof decision.challenge.sentTo !== 'string' || decision.challenge.sentTo.length > 512)))) throw new TokenError('temporarily_unavailable');
       if (decision?.scopes !== undefined && (!Array.isArray(decision.scopes) || !decision.scopes.length || !decision.scopes.every(scope => record.scopes.includes(scope)))) throw new TokenError('temporarily_unavailable');
-      const body = await commit(selection, draft => {
+      const accountId = decision?.accountId ?? record.accountId;
+      const completionSelection: IssuerSelection = { ...selection, ids: [...selection.ids, ...(accountId ? [accountRevisionKey(context.clientId, accountId)] : [])] };
+      const body = await commit(completionSelection, draft => {
         if (draft.generation !== state.generation) throw new TokenError('invalid_token');
         const current = own(draft.signIns, key), { token, session } = mediatedToken(draft, accessHash, proof.jkt);
         if (!current || current.kind !== 'mediated' || current.executionId !== executionId || current.status !== 'verifying') throw new TokenError('sign_in_not_found');
+        if (accountId && !consentCurrent(draft, context.clientId, accountId, current.revision)) { current.accountId = accountId; current.status = 'failed'; return { error: 'invalid_grant' }; }
         if (current.expiresAt <= now()) { current.status = 'expired'; return { status: 'expired' }; }
         if ((!challenge && !decision) || (challenge && !correct && current.attempts >= maxCodeAttempts)) { current.status = 'failed'; return { status: 'failed' }; }
         if (decision) current.accountId = decision.accountId;
@@ -399,7 +410,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const result = issueSignIn(draft, token.sessionId, session, decision?.accountId ?? current.accountId!, current.scopes, proof.jkt, token.resource ?? undefined);
         current.status = 'complete'; return { status: 'complete', ...result.body };
       });
-      return json(200, body);
+      return json('error' in body ? 400 : 200, body);
     } finally {
       for (const key of Object.keys(credentials)) delete credentials[key];
       for (const key of Object.keys(input)) delete input[key]; code = '';
@@ -515,6 +526,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         if (!record || record.expiresAt <= at || record.clientId !== clientId) throw new TokenError('invalid_grant');
         if (record.grantId !== null) { revokeGrant(draft, record.grantId); return null; }
         if (record.redirectUri !== redirectUri || tokenHash(codeVerifier!) !== record.codeChallenge) throw new TokenError('invalid_grant');
+        if (!consentCurrent(draft, record.clientId, record.accountId, record.revision)) throw new TokenError('invalid_grant');
         const target = existing();
         const grantId = `grt_${random(16)}`;
         draft.grants[grantId] = { clientId, userId: target.userId, accountId: record.accountId, scopes: record.scopes, expiresAt: at + accountLifetimeMs, revoked: false, refreshHash: '', previousHash: '' };
@@ -622,12 +634,16 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     async completeDeviceAuthorization(userCode, browserBinding, decision) {
       if (!options.device || typeof userCode !== 'string' || typeof browserBinding !== 'string') throw new AuthorizationError('invalid_request');
       const id = tokenHash(userCode);
-      await commit({ kind: 'sign_in', ids: [id], replayKeys: [], at: now() }, draft => {
+      const snapshot = await read({ kind: 'sign_in', ids: [id], replayKeys: [], at: now() }), found = own(snapshot.signIns, id);
+      if (!found || found.kind !== 'device') throw new AuthorizationError('invalid_request');
+      const accountId = 'accountId' in decision && typeof decision.accountId === 'string' ? decision.accountId : undefined;
+      await commit({ kind: 'sign_in', ids: [id, ...(accountId ? [accountRevisionKey(found.clientId, accountId)] : [])], replayKeys: [], at: now() }, draft => {
         const record = own(draft.signIns, id);
         if (!record || record.kind !== 'device' || record.status !== 'pending' || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
         if ('denied' in decision && decision.denied) { record.status = 'denied'; return; }
         const { accountId, scopes } = decision as { accountId: string; scopes: string[] };
         if (typeof accountId !== 'string' || !accountId || !Array.isArray(scopes) || !scopes.length || !scopes.every(scope => record.scopes.includes(scope))) throw new TypeError('decision');
+        if (!consentCurrent(draft, record.clientId, accountId, record.revision)) throw new AuthorizationError('invalid_request');
         record.accountId = accountId; record.scopes = [...new Set(scopes)]; record.status = 'approved';
       });
     },
@@ -663,7 +679,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const pending = Object.values(draft.authorizations);
         if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(record => record.clientId === clientId).length) >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
-        draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt };
+        draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt, revision: revision(draft, clientRevisionKey(clientId)) };
         return { id, clientId, clientName: client.client_name, scopes, expiresAt };
       });
     },
@@ -671,7 +687,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Consumes the authorization once; the browser binding is checked before deny as well as approve.
     async completeAuthorization(id, browserBinding, decision) {
       if (typeof id !== 'string' || typeof browserBinding !== 'string') throw new AuthorizationError('invalid_request');
-      const href = await commit({ kind: 'authorization', id }, draft => {
+      const snapshot = own((await read({ kind: 'authorization', id })).authorizations, id);
+      const accountId = 'accountId' in decision && typeof decision.accountId === 'string' ? decision.accountId : undefined;
+      const href = await commit({ kind: 'authorization', id, ...(snapshot && accountId ? { revocationKey: accountRevisionKey(snapshot.clientId, accountId) } : {}) }, draft => {
         const record = own(draft.authorizations, id);
         if (!record || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
         const fields = { state: record.state, iss: issuer };
@@ -679,9 +697,10 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const { accountId, scopes } = decision as { accountId: unknown; scopes: unknown };
         // Partial consent narrows; the host may never grant more than was requested.
         if (typeof accountId !== 'string' || !accountId || !Array.isArray(scopes) || !scopes.length || !scopes.every(scope => record.scopes.includes(scope))) throw new TypeError('decision');
+        if (!consentCurrent(draft, record.clientId, accountId, record.revision)) throw new AuthorizationError('invalid_request');
         delete draft.authorizations[id];
         const code = random(32);
-        draft.codes[tokenHash(code)] = { clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId, scopes: [...new Set(scopes as string[])], expiresAt: now() + CODE_MS, grantId: null };
+        draft.codes[tokenHash(code)] = { clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId, scopes: [...new Set(scopes as string[])], expiresAt: now() + CODE_MS, grantId: null, revision: record.revision };
         return callback(record.redirectUri, { code, ...fields });
       });
       return new URL(href);
@@ -723,9 +742,12 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     disconnect: (clientId, accountId) => commit({ kind: 'disconnect', clientId, accountId }, draft => {
       for (const [grantId, grant] of Object.entries(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) revokeGrant(draft, grantId);
       for (const [key, code] of Object.entries(draft.codes)) if (code.clientId === clientId && code.accountId === accountId) delete draft.codes[key];
-      // An in-flight credential check has not learned its account yet. Cancel it rather than let it undo disconnect.
-      for (const [key, record] of Object.entries(draft.signIns)) if (record.kind !== 'attempts' && record.clientId === clientId && (record.accountId === undefined || record.accountId === accountId)) delete draft.signIns[key];
-      for (const [key, record] of Object.entries(draft.authorizations)) if (record.clientId === clientId) delete draft.authorizations[key];
+      for (const [key, record] of Object.entries(draft.signIns)) if ((record.kind === 'device' || record.kind === 'mediated') && record.clientId === clientId && record.accountId === accountId) delete draft.signIns[key];
+      const next = revision(draft, clientRevisionKey(clientId)) + 1;
+      if (!Number.isSafeInteger(next)) throw new TokenError('temporarily_unavailable');
+      // Retain account fences until explicit issuer reset; unrelated users sharing a client remain unaffected.
+      draft.signIns[clientRevisionKey(clientId)] = { kind: 'revision', clientId, revision: next, expiresAt: Number.MAX_SAFE_INTEGER };
+      draft.signIns[accountRevisionKey(clientId, accountId)] = { kind: 'revision', clientId, accountId, revision: next, expiresAt: Number.MAX_SAFE_INTEGER };
     }),
   };
 }

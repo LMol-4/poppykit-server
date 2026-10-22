@@ -19,7 +19,7 @@ through SDK-validated operations; storage adapters supply atomic persistence.
 Company-side TypeScript SDK for authentication verification and agent conversations.
 
 Status (2026-10-22): unpublished implementation of request authentication,
-an optional Direct Sign-In reference issuer, and JSON conversation lifecycle and
+an optional Direct/Device/Mediated reference issuer, and JSON conversation lifecycle and
 publication. Known correctness issues remain; durable production adapters and
 complete protocol conformance have not been established.
 
@@ -27,7 +27,8 @@ Targets the current [Personal Agent Protocol draft 0.2 specification](https://pe
 and [guides](https://personalagentprotocol.org/docs/0.2/guides).
 
 The October 19 source pin is historical evidence, not overriding authority.
-The reviewed programme adds targeted durable storage, Device/Mediated support,
+See [AUTH.md](AUTH.md) for method configuration, trusted hooks, scope/attempt
+policy and account-isolated revocation fences. The reviewed programme also adds
 streaming, API/browser integration, and feedback. These are planned capabilities,
 not features available in this checkout. The personal-agent hosted identity
 reference belongs with the client SDK and remains separate from this company's

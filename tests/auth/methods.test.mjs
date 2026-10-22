@@ -30,7 +30,7 @@ async function environment(t, durable, extra = {}) {
   const reopen = () => createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: [], metadata: env.metadata,
     store: db ? db.issuer(ISSUER) : env.store, coordinator: db ?? { run: action => action() }, now: () => env.clock.now, requireDpopNonce: false,
     device: { endpoint: DEVICE, verificationUri: VERIFY, scopes: ['poppy:read', 'poppy:write'] }, mediated: config });
-  return { ...env, db, seen, config, reopen };
+  return Object.assign(env, { db, seen, config, reopen });
 }
 
 for (const durable of [false, true]) {
@@ -120,7 +120,7 @@ for (const durable of [false, true]) test(`disconnect cancels delayed credential
   const session = (await env.send()).body;
   const active = mediated(env, session.access_token, { scope: 'poppy:read', credentials: { password: 'private-password' } });
   await ready; await env.issuer.disconnect(CLIENT, 'acct_1'); deliver({ accountId: 'acct_1' });
-  const result = await active; assert.equal(result.body.error, 'sign_in_not_found'); assert.equal(result.status, 404);
+  const result = await active; assert.equal(result.body.error, 'invalid_grant'); assert.equal(result.status, 400);
   if (durable) assert.equal((await env.db.issuer(ISSUER).read({ kind: 'principal', sessionId: session.session_id })).sessions[session.session_id].grantId, null);
   else assert.deepEqual(env.store.state.grants, {});
 });
@@ -149,4 +149,41 @@ test('Mediated challenge verifies once under concurrency and rejects non-boolean
   assert.equal((await mediated(env, session.access_token, { code: '123456' }, first.body.sign_in_id)).status, 429);
   deliver('false'); const invalid = await active; assert.equal(invalid.status, 503); assert.equal(invalid.body.error, 'temporarily_unavailable');
   assert.equal((await env.db.issuer(ISSUER).read({ kind: 'principal', sessionId: session.session_id })).sessions[session.session_id].grantId, null);
+});
+
+for (const durable of [false, true]) test(`account-specific disconnect fences preserve unrelated pending users (${durable ? 'SQLite' : 'memory'})`, async t => {
+  const env = await environment(t, durable);
+  const deviceA = (await startDevice(env)).body, deviceB = (await startDevice(env)).body;
+  await env.issuer.beginDeviceAuthorization(deviceA.user_code, BROWSER); await env.issuer.beginDeviceAuthorization(deviceB.user_code, BROWSER);
+  await env.issuer.disconnect(CLIENT, 'acct_A'); env.issuer = env.reopen();
+  await assert.rejects(env.issuer.completeDeviceAuthorization(deviceA.user_code, BROWSER, { accountId: 'acct_A', scopes: ['poppy:read'] }));
+  await env.issuer.completeDeviceAuthorization(deviceB.user_code, BROWSER, { accountId: 'acct_B', scopes: ['poppy:read'] });
+  const sessionB = (await env.send()).body; env.clock.now += 5000;
+  assert.equal((await pollDevice(env, deviceB.device_code, sessionB.session_id)).status, 200);
+  // New explicit consent after disconnect captures the new revision.
+  const fresh = (await startDevice(env)).body; await env.issuer.beginDeviceAuthorization(fresh.user_code, BROWSER);
+  await env.issuer.completeDeviceAuthorization(fresh.user_code, BROWSER, { accountId: 'acct_A', scopes: ['poppy:read'] });
+});
+
+for (const durable of [false, true]) test(`delayed Mediated checks resolving other accounts survive disconnect (${durable ? 'SQLite' : 'memory'})`, async t => {
+  const pending = new Map(); let waiting; const ready = new Promise(resolve => { waiting = resolve; });
+  const env = await environment(t, durable, { authenticate: async credentials => new Promise(resolve => { pending.set(credentials.password, resolve); if (pending.size === 2) waiting(); }) });
+  const a = (await env.send()).body, b = (await env.send()).body;
+  const activeA = mediated(env, a.access_token, { scope: 'poppy:read', credentials: { password: 'A' } });
+  const activeB = mediated(env, b.access_token, { scope: 'poppy:read', credentials: { password: 'B' } });
+  await ready; await env.issuer.disconnect(CLIENT, 'acct_A'); env.issuer = env.reopen();
+  pending.get('A')({ accountId: 'acct_A' }); pending.get('B')({ accountId: 'acct_B' });
+  assert.equal((await activeA).body.error, 'invalid_grant'); assert.equal((await activeB).body.status, 'complete');
+});
+
+test('Device nonce challenge uses fresh assertions and proof before consuming the code', async t => {
+  const env = await environment(t, true);
+  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: [], metadata: env.metadata,
+    store: env.db.issuer(ISSUER), coordinator: env.db, now: () => env.clock.now, device: { endpoint: DEVICE, verificationUri: VERIFY, scopes: ['poppy:read'] } });
+  await env.challenge(); const session = (await env.send()).body, start = (await startDevice(env, 'poppy:read')).body;
+  await env.issuer.beginDeviceAuthorization(start.user_code, BROWSER); await env.issuer.completeDeviceAuthorization(start.user_code, BROWSER, { accountId: 'acct_1', scopes: ['poppy:read'] });
+  env.clock.now += 5000;
+  const challenge = await env.send({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', assertion: undefined, device_code: start.device_code, session_id: session.session_id }, { dpop: await env.proof({ nonce: undefined }) });
+  assert.equal(challenge.body.error, 'use_dpop_nonce');
+  assert.equal((await pollDevice(env, start.device_code, session.session_id)).status, 200);
 });

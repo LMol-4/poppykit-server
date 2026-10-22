@@ -43,6 +43,18 @@ SQLite persists attempt windows and bounded tombstones; `cleanup` removes sign-i
 records only after their original expiry plus 30 seconds. A failed/expired code
 continues returning the same terminal status through that retained window.
 
+Each pending request captures a client revision. Account disconnect increments
+the revision and records that account's fence; later credential/consent results
+for that account cannot undo disconnect. Requests for other accounts sharing the
+same personal-agent client continue. A fresh explicit sign-in captures the new
+revision. Revision and per-account fence records remain until explicit issuer
+reset and never count as pending requests. Terminal method tombstones also do
+not consume pending quota.
+
+Issuer state is version 3. Older development state is refused without mutation;
+there is no automatic migration. Follow the explicit stop/backup/reset procedure
+in [STORAGE.md](STORAGE.md) only for state you choose to discard.
+
 Advertise only configured methods in your `poppy.json`; `authorizationMetadata()`
 adds the device endpoint only when enabled. There is no login/consent UI, identity
 provider, CLI or application workflow in this package.
