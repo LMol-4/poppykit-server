@@ -8,4 +8,3 @@ runConversationAdapterContract(async () => {
   store.inspect = () => store.read(); store.adminTransaction = change => store.transaction(change);
   return { store, second: { inspect: () => store.read(), adminTransaction: change => store.transaction(change), read: () => store.read(), transaction: (selection, change) => store.transaction(selection, change) }, close: async () => {} };
 });
-

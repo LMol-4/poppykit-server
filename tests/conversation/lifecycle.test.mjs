@@ -505,4 +505,3 @@ test('a failed finish adds no canned message for a person, but the agent still a
   await t.service.finish(person, 'failed');
   assert.equal((await t.store.read()).conversations[id].events.length, before);
 });
-

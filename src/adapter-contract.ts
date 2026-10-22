@@ -144,4 +144,3 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     assert.equal((await call(a, `/${id}/events`, 'signedOut')).status, 404);
   }));
 }
-
