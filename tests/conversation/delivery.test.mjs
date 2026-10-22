@@ -96,3 +96,22 @@ test('waited POST distinguishes expired and foreign cursors without accepting th
     assert.equal((await env.send(id,message)).status,202);
   }finally{db.close();}
 });
+
+import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:https';
+import { Readable } from 'node:stream';
+import { createNodeTransport } from '../../dist/network/transport.js';
+test('HTTPS JSON and streaming paths deliver the same durable conversation end to end',async t=>{
+  const key=await readFile(new URL('../network/fixtures/localhost-key.pem',import.meta.url)),cert=await readFile(new URL('../network/fixtures/localhost-cert.pem',import.meta.url));let env,url;
+  const server=createServer({key,cert},async(q,r)=>{
+    const abort=new AbortController();q.on('aborted',()=>abort.abort());r.on('close',()=>abort.abort());
+    try{const chunks=[];for await(const chunk of q)chunks.push(chunk);const request=new Request(url+q.url,{method:q.method,headers:q.headers,body:q.method==='GET'?undefined:Buffer.concat(chunks),signal:abort.signal});const response=await env.service.handle(request);r.writeHead(response.status,Object.fromEntries(response.headers));if(response.body){const body=Readable.fromWeb(response.body);body.on('error',()=>r.destroy());body.pipe(r);}else r.end();}catch{r.destroy();}
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));url=`https://localhost:${server.address().port}`;
+  const db=new SqliteCompanyDatabase(':memory:');env=setup({endpoint:url+'/conversations',store:db.conversations('test'),pageSize:2});
+  const transport=createNodeTransport({ca:cert.toString(),localExceptions:[{hostname:'localhost',addresses:['127.0.0.1']}]});t.after(()=>{transport.close();server.closeAllConnections();server.close();db.close();});
+  const post=(path,body)=>transport.fetch(new Request(url+'/conversations'+path,{method:'POST',headers:{authorization:'DPoP alice','content-type':'application/json'},body:JSON.stringify(body)}));
+  const first=await post('',{message:hello});assert.equal(first.status,201);const id=(await first.json()).conversation_id,work=await env.service.claim();await env.service.reply(work,'out',{id:'reply_tls',sender:'agent',text:'Through HTTPS'});await env.service.finish(work,'completed');await post(`/${id}/close`,{});
+  let cursor;const jsonIds=[];for(;;){const response=await transport.fetch(new Request(url+`/conversations/${id}/events`+(cursor?'?cursor='+cursor:''),{headers:{authorization:'DPoP alice'}}));const page=await response.json();jsonIds.push(...page.events.map(event=>event.id));cursor=page.cursor;if(!page.has_more)break;}
+  const response=await transport.stream(new Request(url+`/conversations/${id}/events`,{headers:{authorization:'DPoP alice',accept:'text/event-stream'}}));const streamIds=[];for await(const frame of parseEventStream(response.body))streamIds.push(frame.event.id);assert.deepEqual(streamIds,jsonIds);assert.ok(jsonIds.length>2);
+});
