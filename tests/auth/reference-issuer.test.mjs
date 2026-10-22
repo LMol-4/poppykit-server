@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { SignJWT } from 'jose';
+import { ValidationError } from '../../dist/protocol/wire.js';
 import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { createRequestAuthenticator } from '../../dist/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
@@ -54,7 +55,7 @@ test('client assertion defects are invalid_client', async () => {
     audienceOtherIssuer: await env.clientAssertion({ aud: 'https://auth.other.test' }),
     lifetimeTooLong: await env.clientAssertion({ iat: now, exp: now + 301 }),
     expired: await env.clientAssertion({ iat: now - 120, exp: now - 60 }),
-    futureIat: await env.clientAssertion({ iat: now + 30, exp: now + 90 }),
+    futureIat: await env.clientAssertion({ iat: now + 31, exp: now + 91 }),
     issuer: await env.clientAssertion({ iss: 'https://agent.test/other.json' }),
     subject: await env.clientAssertion({ sub: 'usr_1' }),
     shortJti: await env.clientAssertion({ jti: 'short' }),
@@ -220,4 +221,23 @@ test('the core entry point does not load the reference issuer module', async () 
   }
   assert.ok(seen.size > 3);
   assert.ok([...seen].every(href => !href.includes('reference-auth')));
+});
+
+test('client assertion clock skew is 30 s and ES384 is not an accepted algorithm', async () => {
+  const env = await setup(); await env.challenge(); const now = Math.floor(NOW / 1000);
+  assert.equal((await env.send({ client_assertion: await env.clientAssertion({ iat: now + 30, exp: now + 90 }) })).status, 200);
+  expectError(await env.send({ client_assertion: await env.clientAssertion({ iat: now + 31, exp: now + 91 }) }), 'invalid_client');
+  const es384 = await keyPair('ES384'); env.jwks = { keys: [...env.jwks.keys, { ...es384.jwk, kid: 'k3', alg: 'ES384', use: 'sig' }] };
+  expectError(await env.send({ client_assertion: await env.clientAssertion({}, { key: es384, header: { alg: 'ES384', kid: 'k3' } }) }), 'invalid_client');
+});
+
+test('a metadata resolver rate limit is rate_limited with Retry-After; other fetch failures stay invalid_client', async () => {
+  const env = await setup(); await env.challenge();
+  env.onClient = () => { throw new ValidationError('metadata.rate_limited'); };
+  const limited = await env.send();
+  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
+  env.onClient = () => { throw new ValidationError('metadata.status'); };
+  expectError(await env.send(), 'invalid_client');
+  env.onClient = undefined;
+  assert.equal((await env.send()).status, 200);
 });

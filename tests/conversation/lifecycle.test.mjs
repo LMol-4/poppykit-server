@@ -37,6 +37,7 @@ test('Direct Conversation: opens linked, suspends the parent, and closing it res
   assert.deepEqual((await t.direct(child, human('msg_d3'))).body, { error: 'conversation_not_found' });
   // Direct messages carry the User's own words.
   assert.equal((await t.send(child, { id: 'msg_a', sender: 'agent', text: 'summary' })).status, 400);
+  assert.equal((await t.send(child, { id: 'msg_a2', sender: 'agent', data: { k: 1 } })).status, 400);
   assert.equal((await t.send(child, human('msg_d4', 'Medium, please.'))).status, 202);
   // Both workers' history is the linked history: parent events with the child's spliced in after direct_opened.
   await t.service.reply(childClaim, 'out_1', reply('msg_r1'));
@@ -59,6 +60,7 @@ test('Direct Conversation: opens linked, suspends the parent, and closing it res
   const again = await t.direct(parent, human('msg_d5'));
   assert.equal(again.status, 201);
   assert.deepEqual((await t.direct(parent, human('msg_d5'))).body, again.body);
+  assert.equal((await t.send(again.body.conversation_id, { id: 'msg_a3', sender: 'agent', context: { page: 'cart' } })).status, 202);
 });
 
 test('Direct Conversation: parent must exist, belong to the caller and be open', async () => {

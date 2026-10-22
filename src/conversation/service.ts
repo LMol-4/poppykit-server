@@ -3,13 +3,11 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { ValidationError, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
+import { own } from '../store.js';
+import type { StateStore } from '../store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
 
-interface StateStore<State> {
-  read(): Promise<State>;
-  transaction<T>(change: (draft: State) => T): Promise<T>;
-}
 export interface ConversationRecord {
   id: string; issuer: string; clientId: string; userId: string; bindingId: string;
   status: Status; responder: Sender; context: JsonObject; events: ConversationEvent[];
@@ -49,6 +47,8 @@ export interface ConversationOptions {
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
   /** Mandatory for requestAuthorization: the scopes the issuer's Direct Sign-In grants; work may ask only for these. */
   directScopes?: readonly string[];
+  /** Scopes that allow reading account-bound history; default ['poppy:read']. A Company offering only custom scopes sets its own. */
+  historyScopes?: readonly string[];
 }
 export interface WorkRef { workId: string; fence: string }
 export interface WorkClaim extends WorkRef { conversationId: string; message: Message; context: JsonObject }
@@ -82,10 +82,11 @@ export class PublicationError extends Error {
   constructor(readonly code: 'stale_work' | 'output_conflict') { super(`Publication rejected: ${code}`); this.name = 'PublicationError'; }
 }
 
+// Spec 7.10: text or data in a Direct Conversation is the User's own words; context-only messages may come from the agent.
+const directWords = (message: Message) => message.sender !== 'human' && (message.text !== undefined || message.data !== undefined);
 const maxBodyBytes = 1048576;
 const maxWaitSeconds = 30;
 const randomId = (prefix: string) => prefix + randomBytes(16).toString('base64url');
-const own = <T>(record: Record<string, T>, key: string): T | undefined => Object.hasOwn(record, key) ? record[key] : undefined;
 
 export function initialConversationState(): ConversationStoreState {
   return { version: 1, generation: randomId(''), conversations: {}, bindings: {}, messages: {}, work: [] };
@@ -138,6 +139,7 @@ async function readJson(request: Request): Promise<unknown> {
 export function createConversationService(options: ConversationOptions): ConversationService {
   const { store, authenticator, policy, clock } = options;
   const pageSize = options.pageSize ?? 100;
+  const historyScopes = [...(options.historyScopes ?? ['poppy:read'])];
   const leaseMs = options.leaseMs ?? 60000;
   const operatorLeaseMs = options.operatorLeaseMs ?? 900000;
   const pollIntervalMs = options.pollIntervalMs ?? 25;
@@ -250,7 +252,7 @@ export function createConversationService(options: ConversationOptions): Convers
   const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
     // Only an owner may see a scope error; for anyone else ownership fails first with 404, so existence never leaks.
     conversation && history && conversation.issuer === principal.issuer && conversation.clientId === principal.clientId && principal.accountId !== undefined
-      && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? ['poppy:read'] : [];
+      && own(state.bindings, conversation.bindingId)?.accountId === principal.accountId ? historyScopes : [];
 
   // Spec 7.2: owned by client_id + User ID until account use, then by client_id + account instead.
   function owned(state: ConversationStoreState, principal: Principal, id: string): ConversationRecord {
@@ -286,7 +288,7 @@ export function createConversationService(options: ConversationOptions): Convers
     const body: ConversationRequest = parseConversationRequest(await readJson(request));
     const parentId = conversationId === undefined ? body.parent_conversation_id : undefined;
     // A Direct Conversation carries the User's own words (7.10).
-    if (parentId !== undefined && body.message.sender !== 'human') throw new ValidationError('message.sender');
+    if (parentId !== undefined && directWords(body.message)) throw new ValidationError('message.sender');
     const key = JSON.stringify([principal.issuer, principal.clientId, principal.userId, body.message.id]);
     const fingerprint = canonical({ target: conversationId ?? null, request: body });
     const authority = JSON.parse(JSON.stringify({ principal, acceptedAt: clock.now(), revocationPolicy })) as AcceptedAuthority;
@@ -332,7 +334,7 @@ export function createConversationService(options: ConversationOptions): Convers
         conversation = owned(draft, principal, conversationId);
         if (conversation.status === 'closed') throw closed();
         if (conversation.childId !== undefined) throw directOpen(conversation.childId);
-        if (conversation.parentId !== undefined && body.message.sender !== 'human') throw new ValidationError('message.sender');
+        if (conversation.parentId !== undefined && directWords(body.message)) throw new ValidationError('message.sender');
         if (read.cursor !== undefined) page(conversation, read.cursor);
         conversation.authority = authority;
       }
@@ -390,7 +392,11 @@ export function createConversationService(options: ConversationOptions): Convers
     if (url.origin !== endpoint.origin || !(url.pathname === basePath || url.pathname.startsWith(basePath + '/'))) throw new HttpError(404, { error: 'not_found' });
     const rest = url.pathname.slice(basePath.length);
     const match = /^\/([A-Za-z0-9_-]{1,256})\/(messages|events|handoff|close)$/.exec(rest);
-    if (rest !== '' && !match) throw new HttpError(404, { error: 'not_found' });
+    if (rest !== '' && !match) {
+      // Spec 7.13: a conversation path whose ID fails the pattern is a bad request, not a missing resource.
+      if (/^\/[^/]+\/(messages|events|handoff|close)$/.test(rest)) throw new HttpError(400, { error: 'invalid_request' });
+      throw new HttpError(404, { error: 'not_found' });
+    }
     const method = match?.[2] === 'events' ? 'GET' : 'POST';
     if (request.method !== method) throw new HttpError(405, { error: 'method_not_allowed' }, { Allow: method });
     const principal = await authenticator.authenticate(request);
@@ -509,7 +515,7 @@ export function createConversationService(options: ConversationOptions): Convers
     },
 
     history(ref) {
-      return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : ['poppy:read'], (draft, work, conversation) => {
+      return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : historyScopes, (draft, work, conversation) => {
         const accountId = boundAccount(draft, work);
         if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('sign_in_required');
         return linkedHistory(draft, conversation);

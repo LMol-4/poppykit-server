@@ -67,7 +67,7 @@ test('each DPoP proof defect is rejected as invalid_dpop_proof', async () => {
     hash: await proof(key, { htu: ENDPOINT, token: 'different' }),
     noHash: await proof(key, { htu: ENDPOINT }),
     old: await proof(key, { htu: ENDPOINT, token: TOKEN, iat: NOW / 1000 - 61 }),
-    future: await proof(key, { htu: ENDPOINT, token: TOKEN, iat: NOW / 1000 + 6 }),
+    future: await proof(key, { htu: ENDPOINT, token: TOKEN, iat: NOW / 1000 + 31 }),
     typ: await proof(key, { htu: ENDPOINT, token: TOKEN, header: { typ: 'JWT' } }),
     privateKey: await proof(key, { htu: ENDPOINT, token: TOKEN, header: { jwk: key.privateJwk } }),
     longJti: await proof(key, { htu: ENDPOINT, token: TOKEN, jti: 'x'.repeat(257) }),
@@ -79,6 +79,8 @@ test('each DPoP proof defect is rejected as invalid_dpop_proof', async () => {
     const headers = { authorization: `DPoP ${TOKEN}`, ...(dpop ? { dpop } : {}) };
     await rejects(authenticator.authenticate(request(ENDPOINT, headers)), 'invalid_dpop_proof').catch(error => { throw new Error(name, { cause: error }); });
   }
+  // 30 s of skew is allowed (the boundary), 31 s is not (cases above).
+  await authenticator.authenticate(request(ENDPOINT, { authorization: `DPoP ${TOKEN}`, dpop: await proof(key, { htu: ENDPOINT, token: TOKEN, iat: NOW / 1000 + 30 }) }));
   const two = new Headers({ authorization: `DPoP ${TOKEN}` }); const good = await proof(key, { htu: ENDPOINT, token: TOKEN }); two.append('dpop', good); two.append('dpop', good);
   await rejects(authenticator.authenticate(new Request(ENDPOINT, { method: 'POST', headers: two })), 'invalid_dpop_proof');
 });
