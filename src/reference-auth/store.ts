@@ -7,7 +7,8 @@ export type IssuerSelection =
   | { kind: 'access'; hash: string }
   | { kind: 'authorize'; clientId: string; at: number }
   | { kind: 'authorization'; id: string }
-  | { kind: 'disconnect'; clientId: string; accountId: string };
+  | { kind: 'disconnect'; clientId: string; accountId: string }
+  | { kind: 'sign_in'; ids: string[]; clientId?: string; sessionId?: string; accessHash?: string; replayKeys: string[]; at: number };
 export interface IssuerStore {
   read(selection: IssuerSelection): Promise<IssuerState>;
   transaction<T>(selection: IssuerSelection, change: (draft: IssuerState) => T): Promise<T>;

@@ -152,9 +152,9 @@ export class SqliteCompanyDatabase {
     };
   }
   issuer(namespace: string): IssuerStore {
-    const kinds = ['sessions', 'grants', 'refreshTokens', 'authorizations', 'codes', 'accessTokens', 'replay'] as const;
+    const kinds = ['sessions', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
     const load = (selection: IssuerSelection): IssuerState => {
-      const state: IssuerState = { ...this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, accessTokens: {}, replay: {} };
+      const state: IssuerState = { ...this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {} };
       const get = (kind: typeof kinds[number], id: string | undefined) => {
         if (!id) return;
         const value = this.one(namespace, kind, id);
@@ -164,6 +164,14 @@ export class SqliteCompanyDatabase {
         for (const row of this.rows(namespace, kind, where, params)) (state[kind] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
       };
       if (selection.kind === 'access') get('accessTokens', selection.hash);
+      if (selection.kind === 'sign_in') {
+        for (const id of selection.ids) get('signIns', id);
+        get('sessions', selection.sessionId);
+        get('accessTokens', selection.accessHash);
+        for (const key of selection.replayKeys) get('replay', key);
+        const counts = this.db.prepare("SELECT count(*) AS n, sum(CASE WHEN json_extract(body,'$.clientId')=? THEN 1 ELSE 0 END) AS client FROM records WHERE ns=? AND kind='signIns' AND json_extract(body,'$.kind')!='attempts' AND json_extract(body,'$.expiresAt')>?").get(selection.clientId ?? '', namespace, selection.at)!;
+        state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(counts.n), pendingForClient: Number(counts.client ?? 0) };
+      }
       if (selection.kind === 'principal') { get('sessions', selection.sessionId); get('grants', selection.grantId); }
       if (selection.kind === 'authorization') get('authorizations', selection.id);
       if (selection.kind === 'token') {
@@ -178,7 +186,7 @@ export class SqliteCompanyDatabase {
         const client = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.clientId, selection.at)!;
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(pending.n), pendingForClient: Number(client.n) };
       }
-      if (selection.kind === 'disconnect') for (const kind of ['grants', 'codes'] as const) find(kind, "AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.accountId')=?", selection.clientId, selection.accountId);
+      if (selection.kind === 'disconnect') for (const kind of ['grants', 'codes', 'signIns'] as const) find(kind, "AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.accountId')=?", selection.clientId, selection.accountId);
       for (const record of Object.values(state.accessTokens)) { get('sessions', record.sessionId); if (record.grantId) get('grants', record.grantId); }
       for (const record of [...Object.values(state.sessions), ...Object.values(state.codes)]) if (record.grantId) get('grants', record.grantId);
       for (const id of Object.values(state.refreshTokens)) get('grants', id);
@@ -206,7 +214,7 @@ export class SqliteCompanyDatabase {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('cleanup limit');
     return this.run(async () => {
       const rows = this.db.prepare(`SELECT kind,id FROM records WHERE ns=? AND
-        ((kind IN ('authorizations','codes','accessTokens') AND json_extract(body,'$.expiresAt')<=?) OR (kind='replay' AND CAST(body AS REAL)<?)) LIMIT ?`).all(namespace, now, now, limit);
+        ((kind IN ('authorizations','codes','accessTokens') AND json_extract(body,'$.expiresAt')<=?) OR (kind='signIns' AND json_extract(body,'$.expiresAt')+30000<?) OR (kind='replay' AND CAST(body AS REAL)<?)) LIMIT ?`).all(namespace, now, now, now, limit);
       for (const row of rows) this.db.prepare('DELETE FROM records WHERE ns=? AND kind=? AND id=?').run(namespace, row.kind, row.id);
       return rows.length;
     });
