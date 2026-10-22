@@ -6,6 +6,7 @@ export type IssuerSelection =
   | { kind: 'token'; clientId: string; sessionId?: string; codeHash?: string; refreshHash?: string; replayKeys: string[]; at: number }
   | { kind: 'revoke'; refreshHash: string; replayKey: string }
   | { kind: 'principal'; sessionId: string; grantId?: string }
+  | { kind: 'browser'; sessionId: string; replayKey?: string }
   | { kind: 'access'; hash: string }
   | { kind: 'authorize'; clientId: string; at: number }
   | { kind: 'authorization'; id: string; revocationKey?: string }

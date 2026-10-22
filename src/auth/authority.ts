@@ -13,11 +13,11 @@ export interface AuthorityPolicy {
   withAccepted<T>(authority: AcceptedAuthority, scopes: readonly string[], action: () => Promise<T>): Promise<T>;
 }
 export interface RequestAuthenticator { authenticate(request: Request): Promise<Principal> }
-export interface ResourceEndpoint { origin: string; pathPrefix: string; resource?: string }
+export interface ResourceEndpoint { origin: string; pathPrefix: string; resource?: string; mcp?: { dpop: boolean; metadataUrl: string } }
 export interface ExternalAuthorityAdapter {
   issuer: string;
   revocationVisibility: string; // explicit latency and ordering guarantee
-  introspect(token: string, resource?: string): Promise<{ principal: Principal; dpopJkt: string }>;
+  introspect(token: string, resource?: string): Promise<{ principal: Principal; dpopJkt: string | null }>;
   policy: AuthorityPolicy;
 }
 

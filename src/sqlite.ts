@@ -217,6 +217,7 @@ export class SqliteCompanyDatabase {
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(counts.n), pendingForClient: Number(counts.client ?? 0) };
       }
       if (selection.kind === 'principal') { get('sessions', selection.sessionId); get('grants', selection.grantId); }
+      if (selection.kind === 'browser') { get('sessions', selection.sessionId); get('replay', selection.replayKey); }
       if (selection.kind === 'authorization') { get('authorizations', selection.id); get('signIns', selection.revocationKey); }
       if (selection.kind === 'token') {
         get('sessions', selection.sessionId); get('codes', selection.codeHash); get('refreshTokens', selection.refreshHash);

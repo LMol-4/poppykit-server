@@ -27,7 +27,8 @@
     "README.md",
     "STORAGE.md",
     "AUTH.md",
-    "DELIVERY.md"
+    "DELIVERY.md",
+    "INTEGRATIONS.md"
   ],
   "exports": {
     ".": {
