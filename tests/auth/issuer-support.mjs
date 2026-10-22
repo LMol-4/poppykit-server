@@ -19,7 +19,7 @@ export function memoryStore(initial) {
   let state = structuredClone(initial);
   return {
     async read() { return structuredClone(state); },
-    async transaction(change) { const draft = structuredClone(state); const result = change(draft); state = draft; return structuredClone(result); },
+    async transaction(selection, change = selection) { const draft = structuredClone(state); const result = change(draft); state = draft; return structuredClone(result); },
     get state() { return state; },
     set state(value) { state = value; },
   };

@@ -6,12 +6,12 @@ import type { AssertionClaims } from '../protocol/wire.js';
 import type { MetadataResolver } from '../network/discovery.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
-import type { StateStore } from '../store.js';
+import type { IssuerStore, IssuerSelection } from './store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
 import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, assertUniqueJwtMembers, verifyDpopProof } from '../auth/dpop.js';
 
-export type { StateStore };
+export type { IssuerStore, IssuerSelection };
 export { createMetadataResolver } from '../network/discovery.js';
 export { createNodeTransport } from '../network/transport.js';
 // accountId is sticky (spec 4.4): it stays after sign-out; grantId is the active sign-in, null when signed out.
@@ -25,6 +25,7 @@ interface AuthorizationRecord { clientId: string; redirectUri: string; state: st
 interface CodeRecord { clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null }
 // Plain JSON. Tokens and codes are keyed by SHA-256 hash; plaintext tokens are never stored.
 export interface IssuerState {
+  limits?: { sessions: number; earliestSessionExpiry: number; pending: number; pendingForClient: number };
   version: 2;
   generation: string;
   sessions: Record<string, SessionRecord>;
@@ -41,7 +42,7 @@ export interface ReferenceIssuerOptions {
   poppyDomains: string[]; directScopes: string[];
   resources?: string[]; // exact supported resource identifiers; absent resource means default
   metadata: MetadataResolver;
-  store: StateStore<IssuerState>;
+  store: IssuerStore;
   coordinator: AuthorityCoordinator; // deployment-wide, shared with conversation work and reset
   now: () => number;
   tokenLifetimeSeconds?: number; // default 3600
@@ -148,14 +149,14 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const requireNonce = options.requireDpopNonce ?? true;
   const resources = options.resources ?? [];
   // Every issuer mutation is ordered with conversation work by the shared coordinator.
-  const read = async () => checked(await store.read());
-  const commit = <T>(change: (draft: IssuerState) => T) => options.coordinator.run(() => store.transaction(draft => change(checked(draft))));
+  const read = async (selection: IssuerSelection = { kind: 'metadata' }) => checked(await store.read(selection));
+  const commit = <T>(selection: IssuerSelection, change: (draft: IssuerState) => T) => options.coordinator.run(() => store.transaction(selection, draft => change(checked(draft))));
 
   // Reuse the current nonce while it has more than half its life left, so challenges cannot grow state.
   async function currentNonce(state: IssuerState): Promise<string> {
     const fresh = state.nonces.find(nonce => nonce.expiresAt - now() > NONCE_SECONDS * 500);
     if (fresh) return fresh.value;
-    return commit(draft => {
+    return commit({ kind: 'metadata' }, draft => {
       const value = random(16);
       draft.nonces = [...draft.nonces.filter(nonce => nonce.expiresAt > now()), { value, expiresAt: now() + NONCE_SECONDS * 1000 }].slice(-2);
       return value;
@@ -264,7 +265,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Identity keys and DPoP keys must differ (spec 4.1).
     for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
 
-    const body = await commit(draft => {
+    const body = await commit({ kind: 'token', clientId, ...(sessionId === undefined ? {} : { sessionId }), ...(code ? { codeHash: tokenHash(code) } : {}), ...(refreshToken ? { refreshHash: tokenHash(refreshToken) } : {}), replayKeys: [...(session ? [client, session] : [client]).map(claims => `assertion ${clientId} ${claims.jti}`), `proof ${proof.jkt} ${proof.claims.jti}`], at: now() }, draft => {
       // A reset between verification and commit must not recreate state from a stale verification.
       if (draft.generation !== generation) throw new TokenError('invalid_grant');
       // Re-check freshness at commit time with the same clock used to prune, so a slow fetch cannot outlive its replay entry.
@@ -290,7 +291,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const create = (userId: string): [string, SessionRecord] => {
         // Pruned above, so these are live; a slot frees when the soonest of them ends (spec 4.2 rate_limited).
         const live = Object.values(draft.sessions).filter(record => record.clientId === clientId);
-        if (live.length >= maxSessionsPerClient) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil((Math.min(...live.map(record => record.expiresAt)) - at) / 1000)) });
+        if ((draft.limits?.sessions ?? live.length) >= maxSessionsPerClient) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil(((draft.limits?.earliestSessionExpiry ?? Math.min(...live.map(record => record.expiresAt))) - at) / 1000)) });
         const id = `ses_${random(16)}`;
         return [id, draft.sessions[id] = { clientId, userId, version: 1, createdAt: at, expiresAt: at, accountId: null, grantId: null }];
       };
@@ -357,7 +358,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     if (!token) throw new TokenError('invalid_request');
     const { generation } = await read();
     const { client } = await authenticateClient(clientId, clientAssertion);
-    await commit(draft => {
+    await commit({ kind: 'revoke', refreshHash: tokenHash(token), replayKey: `assertion ${clientId} ${client.jti}` }, draft => {
       if (draft.generation !== generation) return; // reset already removed every grant
       const at = now();
       if (client.exp * 1000 <= at) throw new TokenError('invalid_client');
@@ -395,7 +396,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   // Order: coordinator -> issuer snapshot -> caller's conversation transaction, released in run's finally.
   const policy: AuthorityPolicy = {
     withCurrent: (principal, scopes, action) => options.coordinator.run(async () => {
-      const state = await read();
+      const state = await read({ kind: 'principal', sessionId: principal.sessionId, ...(principal.grantId ? { grantId: principal.grantId } : {}) });
       const session = own(state.sessions, principal.sessionId);
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
         || session.userId !== principal.userId || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
@@ -403,8 +404,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       return action();
     }),
     withAccepted: (authority, scopes, action) => options.coordinator.run(async () => {
-      const state = await read();
       const { principal } = authority;
+      const state = await read({ kind: 'principal', sessionId: principal.sessionId, ...(principal.grantId ? { grantId: principal.grantId } : {}) });
       // Admission token expiry is ignored: accepted work outlives its token. A reset (new generation) never is.
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation) throw new AuthorityError('invalid_token');
       if (authority.revocationPolicy !== 'allow-accepted-work-to-finish' && !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
@@ -441,12 +442,12 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       // resource is accepted and ignored here: grants cover every resource, and each token request selects one (spec 4.3).
       const resource = params.get('resource');
       if (resource !== undefined && !resources.includes(resource)) throw fail('invalid_target');
-      return commit(draft => {
+      return commit({ kind: 'authorize', clientId, at: now() }, draft => {
         if (draft.generation !== generation) throw new AuthorizationError('invalid_request');
         const at = now(); prune(draft, at);
         // shortcut: an unauthenticated caller can fill one client's slots for AUTHORIZATION_MS (10 minutes); hosts must rate-limit /authorize.
         const pending = Object.values(draft.authorizations);
-        if (pending.length >= maxPending || pending.filter(record => record.clientId === clientId).length >= maxPendingPerClient) throw fail('temporarily_unavailable');
+        if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(record => record.clientId === clientId).length) >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
         draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt };
         return { id, clientId, clientName: client.client_name, scopes, expiresAt };
@@ -456,7 +457,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Consumes the authorization once; the browser binding is checked before deny as well as approve.
     async completeAuthorization(id, browserBinding, decision) {
       if (typeof id !== 'string' || typeof browserBinding !== 'string') throw new AuthorizationError('invalid_request');
-      const href = await commit(draft => {
+      const href = await commit({ kind: 'authorization', id }, draft => {
         const record = own(draft.authorizations, id);
         if (!record || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
         const fields = { state: record.state, iss: issuer };
@@ -484,7 +485,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       issuer,
       revocationVisibility: 'immediate: every introspection and policy check reads the shared issuer store; policy checks are ordered by the shared coordinator',
       async introspect(token, resource) {
-        const state = await read(); const at = now();
+        const state = await read({ kind: 'access', hash: tokenHash(token) }); const at = now();
         const record = own(state.accessTokens, tokenHash(token));
         const session = record && own(state.sessions, record.sessionId);
         if (!record || !session || !(session.expiresAt > at) || record.expiresAt <= at || record.resource !== (resource ?? null)) throw new AuthorityError('invalid_token');
@@ -504,7 +505,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     },
     // The User disconnected this Personal Agent: revoke its grants for the account and sign out their Sessions (spec 4.9).
     // Its codes for the account go too, so none consented before can sign in again; pending authorizations name no account until consent.
-    disconnect: (clientId, accountId) => commit(draft => {
+    disconnect: (clientId, accountId) => commit({ kind: 'disconnect', clientId, accountId }, draft => {
       for (const [grantId, grant] of Object.entries(draft.grants)) if (grant.clientId === clientId && grant.accountId === accountId) revokeGrant(draft, grantId);
       for (const [key, code] of Object.entries(draft.codes)) if (code.clientId === clientId && code.accountId === accountId) delete draft.codes[key];
     }),

@@ -18,7 +18,7 @@ export function memoryStore(initial) {
     },
     // Resolves once the store has served `count` reads in total: lets a test act exactly when a long poll is holding.
     untilReads(count) { return new Promise(resolve => { if (store.reads >= count) resolve(); else store.readWaiters.push({ count, resolve }); }); },
-    transaction(change) {
+    transaction(selection, change = selection) {
       const run = queue.then(() => {
         const draft = structuredClone(state);
         const result = change(draft);

@@ -9,7 +9,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.12.0"
   },
   "packageManager": "pnpm@11.25.0",
   "scripts": {
@@ -24,7 +24,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "STORAGE.md"
   ],
   "exports": {
     ".": {
@@ -38,6 +39,10 @@
     "./reference-auth": {
       "types": "./dist/reference-auth/index.d.ts",
       "import": "./dist/reference-auth/index.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite.d.ts",
+      "import": "./dist/sqlite.js"
     }
   },
   "dependencies": {

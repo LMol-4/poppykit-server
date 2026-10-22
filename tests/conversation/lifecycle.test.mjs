@@ -393,7 +393,7 @@ test('waited POST receipt survives a crash after commit: a retry on a fresh serv
   const crashing = createConversationService({
     endpoint, authenticator: { authenticate: async () => principals.alice },
     policy: t.policy, clock: t.clock,
-    store: { read: () => t.store.read(), transaction: change => t.store.transaction(change).then(() => { throw new Error('crash after commit'); }) },
+    store: { read: () => t.store.read(), transaction: (selection, change) => t.store.transaction(selection, change).then(() => { throw new Error('crash after commit'); }) },
   });
   await assert.rejects(crashing.handle(new Request(`${endpoint}?wait=10`, { method: 'POST', body: JSON.stringify({ message: hello }) })), { message: 'crash after commit' });
   const retry = await t.start(hello, { query: '?wait=3' });
@@ -505,3 +505,4 @@ test('a failed finish adds no canned message for a person, but the agent still a
   await t.service.finish(person, 'failed');
   assert.equal((await t.store.read()).conversations[id].events.length, before);
 });
+

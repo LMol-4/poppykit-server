@@ -4,7 +4,7 @@ import { ValidationError, canonical, parseJson, object, parseConversationRequest
 import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
-import type { StateStore } from '../store.js';
+import type { ConversationStore, ConversationSelection } from './store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticator, WorkRevocationPolicy } from '../auth/authority.js';
 
@@ -33,7 +33,7 @@ export interface ConversationStoreState {
 }
 export interface ConversationOptions {
   endpoint: string;
-  store: StateStore<ConversationStoreState>;
+  store: ConversationStore;
   authenticator: RequestAuthenticator;
   policy: AuthorityPolicy;
   clock: { now(): number };
@@ -256,13 +256,13 @@ export function createConversationService(options: ConversationOptions): Convers
   }
 
   // Runs change under withCurrent; target() and history() decide the scopes from the state being checked.
-  async function current<T>(principal: Principal, target: (state: ConversationStoreState) => string | undefined, history: (state: ConversationStoreState) => boolean,
+  async function current<T>(principal: Principal, selection: ConversationSelection, target: (state: ConversationStoreState) => string | undefined, history: (state: ConversationStoreState) => boolean,
     change: (draft: ConversationStoreState) => T): Promise<T> {
     for (;;) {
-      const before = await store.read();
+      const before = await store.read(selection);
       const id = target(before);
       const scopes = scopesFor(before, principal, id === undefined ? undefined : own(before.conversations, id), history(before));
-      const result = await policy.withCurrent(principal, scopes, () => store.transaction(draft => {
+      const result = await policy.withCurrent(principal, scopes, () => store.transaction(selection, draft => {
         const now = target(draft);
         // Binding only ever gains an account, so a rerun with the wider scopes settles it.
         if (scopesFor(draft, principal, now === undefined ? undefined : own(draft.conversations, now), history(draft)).length > scopes.length) return { rescope: true } as const;
@@ -287,7 +287,7 @@ export function createConversationService(options: ConversationOptions): Convers
     // A retry returns the saved receipt, which is a history page if the original request waited.
     const history = (state: ConversationStoreState) => waiting || 'events' in (own(state.messages, key)?.receipt.body ?? {});
 
-    const receipt = await current(principal, target, history, draft => {
+    const receipt = await current(principal, { ...(conversationId ? { conversationId } : parentId ? { conversationId: parentId } : {}), messageKey: key }, target, history, draft => {
       if (conversationId !== undefined) owned(draft, principal, conversationId);
       const existing = own(draft.messages, key);
       if (existing) {
@@ -351,12 +351,12 @@ export function createConversationService(options: ConversationOptions): Convers
   async function events(request: Request, principal: Principal, url: URL, conversationId: string): Promise<Response> {
     const read = parseReadOptions(url, maxWaitSeconds);
     const deadline = clock.now() + read.waitSeconds * 1000;
-    const deliver = () => current(principal, () => conversationId, () => true, draft => page(owned(draft, principal, conversationId), read.cursor));
+    const deliver = () => current(principal, { conversationId }, () => conversationId, () => true, draft => page(owned(draft, principal, conversationId), read.cursor));
     const first = await deliver();
     if ((first.events as unknown[]).length || read.waitSeconds === 0) return json(200, first);
     // Wait outside all locks without releasing anything; events are append-only, so a new last event means news.
-    // shortcut: every waiting reader re-reads the whole state each pollIntervalMs; add change notification for many readers.
-    const arrived = async () => (own((await store.read()).conversations, conversationId)?.events.at(-1)?.id ?? null) !== first.cursor;
+    // Targeted reconciliation remains authoritative if a notification is lost (J3 wires waiting).
+    const arrived = async () => (own((await store.read({ conversationId })).conversations, conversationId)?.events.at(-1)?.id ?? null) !== first.cursor;
     while (clock.now() < deadline && !request.signal.aborted && !await arrived()) await sleep(pollIntervalMs);
     // Delivery rechecks the reader now: a revocation during the hold returns no data.
     return json(200, await deliver());
@@ -364,7 +364,7 @@ export function createConversationService(options: ConversationOptions): Convers
 
   async function lifecycle(request: Request, principal: Principal, conversationId: string, action: 'handoff' | 'close'): Promise<Response> {
     object(await readJson(request));
-    const body = await current(principal, () => conversationId, () => false, draft => {
+    const body = await current(principal, { conversationId }, () => conversationId, () => false, draft => {
       const conversation = owned(draft, principal, conversationId);
       if (action === 'close') closeConversation(draft, conversation);
       else {
@@ -401,12 +401,13 @@ export function createConversationService(options: ConversationOptions): Convers
   // change() gets live: whether the accepted sign-in still holds. Only account-free publications check it; others pass true.
   async function publish<T>(ref: WorkRef, scopes: (state: ConversationStoreState, work: WorkRecord) => string[],
     change: (draft: ConversationStoreState, work: WorkRecord, conversation: ConversationRecord, live: boolean) => T, accountFree: (work: WorkRecord) => boolean = never): Promise<T> {
+    const selection = { workId: ref.workId };
     for (;;) {
-      const before = await store.read();
+      const before = await store.read(selection);
       const stored = before.work.find(work => work.id === ref.workId);
       if (!stored) throw new PublicationError('stale_work');
       const granted = scopes(before, stored);
-      const run = (authority: AcceptedAuthority, live: boolean) => policy.withAccepted(authority, granted, () => store.transaction(draft => {
+      const run = (authority: AcceptedAuthority, live: boolean) => policy.withAccepted(authority, granted, () => store.transaction(selection, draft => {
         const work = draft.work.find(item => item.id === ref.workId);
         if (!work || work.phase !== 'claimed' || work.fence !== ref.fence || (work.leaseUntil ?? 0) <= clock.now()) throw new PublicationError('stale_work');
         if (scopes(draft, work).length > granted.length) throw new Rescope(); // nothing changed yet, so the rollback is free
@@ -436,15 +437,16 @@ export function createConversationService(options: ConversationOptions): Convers
     change: (draft: ConversationStoreState, conversation: ConversationRecord, authority: AcceptedAuthority) => T): Promise<T> {
     if (!options.authorizeOperator) throw new TypeError('authorizeOperator is not configured');
     await options.authorizeOperator(operator, conversationId);
+    const selection = { conversationId };
     for (;;) {
-      const stored = own((await store.read()).conversations, conversationId);
+      const stored = own((await store.read({ conversationId })).conversations, conversationId);
       if (!stored) throw new PublicationError('stale_work');
       // Conversations stored before staff support have none until the customer's next accepted message.
       if (stored.authority === undefined) throw new Error('Conversation has no stored customer authority');
       // Leaving the queue or handing back uses no account, so it stays possible after revocation.
       const authority: AcceptedAuthority = accountFree ? { ...stored.authority, revocationPolicy: 'allow-accepted-work-to-finish' } : stored.authority;
       try {
-        return await policy.withAccepted(authority, [], () => store.transaction(draft => {
+        return await policy.withAccepted(authority, [], () => store.transaction(selection, draft => {
           const conversation = own(draft.conversations, conversationId);
           if (!conversation) throw new PublicationError('stale_work');
           // A message accepted in between replaced the authority that was checked.
@@ -480,8 +482,9 @@ export function createConversationService(options: ConversationOptions): Convers
 
     async claim() {
       // Idle pollers only read; the transaction rechecks, since another claimer may have won in between.
-      if (!claimable(await store.read(), clock.now())) return null;
-      return store.transaction(draft => {
+      const selection = { claimAt: clock.now() };
+      if (!claimable(await store.read(selection), clock.now())) return null;
+      return store.transaction(selection, draft => {
         const now = clock.now();
         pruneWork(draft);
         for (let work = claimable(draft, now); work; work = claimable(draft, now)) {

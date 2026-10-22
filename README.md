@@ -1,5 +1,9 @@
 # PoppyKit server
 
+J1 supplies targeted storage contracts and an optional SQLite company database.
+See [STORAGE.md](STORAGE.md) for Node requirements, adapter setup, atomic
+authorization/revocation ordering, recovery guarantees and reset instructions.
+
 Designed to be integrated into an existing company's backend. The SDK implements
 Poppy protocol handling through adapters; the company owns its account system,
 authorization policy, persistence, agent runtime and business tools. No hosted
