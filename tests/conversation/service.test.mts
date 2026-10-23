@@ -1,3 +1,6 @@
+import type {Message,Sender,ConversationEvent} from '../../dist/protocol/wire.js';
+import type {ConversationOptions} from '../../dist/conversation/service.js';
+import { expectValue,messageValue,optionalMessage } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AuthorityError, createConversationService, initialConversationState, PublicationError } from '../../dist/index.js';
@@ -12,7 +15,7 @@ test('start returns 201 three-field ack, records events and pending work', async
   assert.equal(res.headers.get('cache-control'), 'no-store');
   const state = await t.store.read();
   const conversation = state.conversations[res.body.conversation_id];
-  assert.deepEqual(conversation.events.map(event => event.type), ['message', 'state']);
+  assert.deepEqual(conversation.events.map((event:ConversationEvent) => event.type), ['message', 'state']);
   assert.deepEqual(conversation.events[0].message, { ...hello, role: 'user' });
   assert.equal(state.work.length, 1);
   assert.equal(state.work[0].phase, 'pending');
@@ -121,7 +124,7 @@ test('ownership moves from User ID to account once bound (spec 7.2)', async () =
   const t = setup();
   const { body } = await t.start(hello);
   const id = body.conversation_id;
-  const next = n => ({ id: `msg_${n}`, sender: 'agent', text: 'more' });
+  const next = (n: string) => ({ id: `msg_${n}`, sender: 'agent', text: 'more' });
   // Unbound: client_id + User ID, so another User on the same account is a stranger.
   assert.equal((await t.read(id, { as: 'carolSameAccount' })).status, 404);
   assert.equal((await t.send(id, next('c1'), { as: 'carolSameAccount' })).status, 404);
@@ -151,7 +154,7 @@ test('multi-page idle history uses real cursors and six-field pages', async () =
   for (const n of [2, 3]) assert.equal((await t.send(id, { id: `msg_${n}`, sender: 'agent', context: { user_available: n === 2 } })).status, 202);
   // Finish the work so the conversation is idle with history remaining.
   const claim = await t.service.claim();
-  await t.service.finish(claim, 'completed');
+  await t.service.finish(expectValue(claim), 'completed');
   const seen = [];
   let cursor;
   let res;
@@ -164,8 +167,8 @@ test('multi-page idle history uses real cursors and six-field pages', async () =
     seen.push(...res.body.events);
     cursor = res.body.cursor;
   } while (res.body.has_more);
-  assert.deepEqual(seen.map(event => event.type), ['message', 'state', 'message', 'message', 'state']);
-  assert.equal(new Set(seen.map(event => event.id)).size, 5);
+  assert.deepEqual(seen.map((event:ConversationEvent) => event.type), ['message', 'state', 'message', 'message', 'state']);
+  assert.equal(new Set(seen.map((event:ConversationEvent) => event.id)).size, 5);
   const empty = await t.read(id, { query: `?cursor=${cursor}` });
   assert.deepEqual([empty.body.events, empty.body.cursor, empty.body.has_more], [[], cursor, false]);
   assert.deepEqual((await t.store.read()).conversations[id].context, { user_available: false });
@@ -174,7 +177,7 @@ test('multi-page idle history uses real cursors and six-field pages', async () =
 test('context-only message is recorded without creating work', async () => {
   const t = setup();
   const { body } = await t.start(hello);
-  await t.service.finish(await t.service.claim(), 'completed');
+  await t.service.finish(expectValue(await t.service.claim()), 'completed');
   const res = await t.send(body.conversation_id, { id: 'msg_ctx', sender: 'agent', context: { locale: 'en-US' } });
   assert.deepEqual([res.status, res.body.status], [202, 'idle']);
   assert.equal(await t.service.claim(), null);
@@ -220,10 +223,10 @@ test('POST with wait returns a page receipt that a retry repeats unchanged', asy
   const t = setup();
   const res = await t.start(hello, { query: '?wait=0' });
   assert.equal(res.status, 201);
-  assert.deepEqual(res.body.events.map(event => event.type), ['message', 'state']);
+  assert.deepEqual(res.body.events.map((event:ConversationEvent) => event.type), ['message', 'state']);
   assert.equal(res.body.has_more, false);
   const claim = await t.service.claim();
-  await t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'Shipped yesterday.' });
+  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'Shipped yesterday.' });
   const retry = await t.start(hello, { query: '?wait=5' });
   assert.deepEqual([retry.status, retry.body], [res.status, res.body]);
 });
@@ -282,7 +285,7 @@ test('only AuthorityError becomes an auth response; other errors are re-thrown',
 
 test('construction rejects invalid options', () => {
   const store = memoryStore(initialConversationState());
-  const base = { endpoint, store, authenticator: {}, policy: {}, clock: { now: () => 0 } };
+  const base={endpoint,store,authenticator:{async authenticate(){return principals.alice;}},policy:setup().policy,clock:{now:()=>0}};
   assert.throws(() => createConversationService({ ...base, pageSize: 0 }), TypeError);
   assert.throws(() => createConversationService({ ...base, leaseMs: -1 }), TypeError);
   assert.throws(() => createConversationService({ ...base, finishedWorkLimit: 0 }), TypeError);
@@ -293,17 +296,17 @@ test('deterministic handler: claim, reply, finish; reply visible on read and con
   const t = setup();
   const { body } = await t.start(hello);
   const claim = await t.service.claim();
-  assert.equal(claim.conversationId, body.conversation_id);
-  assert.deepEqual(claim.message, hello);
-  assert.ok(claim.workId && claim.fence);
+  assert.equal(expectValue(claim).conversationId, body.conversation_id);
+  assert.deepEqual(expectValue(claim).message, hello);
+  assert.ok(expectValue(claim).workId && expectValue(claim).fence);
   assert.equal(await t.service.claim(), null, 'claimed work is not handed out twice');
-  await t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: `Order 1042 shipped.` });
-  await t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: `Order 1042 shipped.` });
-  await t.service.finish(claim, 'completed');
+  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: `Order 1042 shipped.` });
+  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: `Order 1042 shipped.` });
+  await t.service.finish(expectValue(claim), 'completed');
   assert.deepEqual(t.calls.filter(call => call.kind === 'accepted').map(call => call.userId), ['u_alice', 'u_alice', 'u_alice']);
   const page = (await t.read(body.conversation_id)).body;
   assert.equal(page.status, 'idle');
-  assert.deepEqual(page.events.map(event => event.type), ['message', 'state', 'message', 'state']);
+  assert.deepEqual(page.events.map((event:ConversationEvent) => event.type), ['message', 'state', 'message', 'state']);
   assert.deepEqual(page.events[2].message, { id: 'msg_r1', sender: 'agent', text: 'Order 1042 shipped.', role: 'company' });
   assert.deepEqual([page.events[3].status, page.events[3].responder], ['idle', 'agent']);
 });
@@ -312,9 +315,9 @@ test('output ID reuse with different content is rejected', async () => {
   const t = setup();
   await t.start(hello);
   const claim = await t.service.claim();
-  await t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'one' });
-  await assert.rejects(t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'two' }), { code: 'output_conflict' });
-  await assert.rejects(t.service.reply(claim, 'out_2', { id: 'msg_r2', sender: 'agent', context: { a: 1 } }), { name: 'ValidationError' });
+  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'one' });
+  await assert.rejects(t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'two' }), { code: 'output_conflict' });
+  await assert.rejects(t.service.reply(expectValue(claim), 'out_2', { id: 'msg_r2', sender: 'agent', context: { a: 1 } }), { name: 'ValidationError' });
 });
 
 test('stale fence after lease reclaim cannot publish or finish', async () => {
@@ -322,21 +325,21 @@ test('stale fence after lease reclaim cannot publish or finish', async () => {
   const { body } = await t.start(hello);
   const old = await t.service.claim();
   t.clock.advance(1000);
-  await assert.rejects(t.service.reply(old, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'late' }), PublicationError);
+  await assert.rejects(t.service.reply(expectValue(old), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'late' }), PublicationError);
   const fresh = await t.service.claim();
-  assert.equal(fresh.workId, old.workId);
-  assert.notEqual(fresh.fence, old.fence);
-  await assert.rejects(t.service.reply(old, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'stale' }), { code: 'stale_work' });
-  await assert.rejects(t.service.finish(old, 'completed'), { code: 'stale_work' });
-  await assert.rejects(t.service.reply({ workId: 'wrk_unknown', fence: fresh.fence }, 'o', { id: 'm', sender: 'agent', text: 'x' }), { code: 'stale_work' });
+  assert.equal(expectValue(fresh).workId, expectValue(old).workId);
+  assert.notEqual(expectValue(fresh).fence, expectValue(old).fence);
+  await assert.rejects(t.service.reply(expectValue(old), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'stale' }), { code: 'stale_work' });
+  await assert.rejects(t.service.finish(expectValue(old), 'completed'), { code: 'stale_work' });
+  await assert.rejects(t.service.reply({ workId: 'wrk_unknown', fence: expectValue(fresh).fence }, 'o', { id: 'm', sender: 'agent', text: 'x' }), { code: 'stale_work' });
   t.clock.advance(500);
-  await t.service.renew(fresh);
+  await t.service.renew(expectValue(fresh));
   t.clock.advance(800);
-  await t.service.reply(fresh, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'fresh' });
-  await t.service.finish(fresh, 'completed');
-  await assert.rejects(t.service.finish(fresh, 'completed'), { code: 'stale_work' }, 'finished work rejects further publication');
+  await t.service.reply(expectValue(fresh), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'fresh' });
+  await t.service.finish(expectValue(fresh), 'completed');
+  await assert.rejects(t.service.finish(expectValue(fresh), 'completed'), { code: 'stale_work' }, 'finished work rejects further publication');
   const events = (await t.read(body.conversation_id)).body.events;
-  assert.deepEqual(events.filter(event => event.type === 'message').map(event => event.message.text), [hello.text, 'fresh']);
+  assert.deepEqual(events.filter((event: { type: string; }) => event.type === 'message').map((event:ConversationEvent) => messageValue(event.message).text), [hello.text, 'fresh']);
 });
 
 test('withAccepted denial blocks publication and leaves state unchanged', async () => {
@@ -344,7 +347,7 @@ test('withAccepted denial blocks publication and leaves state unchanged', async 
   const { body } = await t.start(hello);
   const claim = await t.service.claim();
   t.policy.deny = new AuthorityError('invalid_token');
-  await assert.rejects(t.service.reply(claim, 'out_1', { id: 'msg_r1', sender: 'agent', text: 'x' }), AuthorityError);
+  await assert.rejects(t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'x' }), AuthorityError);
   t.policy.deny = null;
   assert.equal((await t.store.read()).conversations[body.conversation_id].events.length, 2);
 });
@@ -356,17 +359,17 @@ test('work is serial per conversation and finish keeps working while more is pen
   const b = (await t.start({ id: 'msg_b', sender: 'agent', text: 'b' })).body.conversation_id;
   const first = await t.service.claim();
   const second = await t.service.claim();
-  assert.deepEqual([first.conversationId, second.conversationId], [a, b]);
+  assert.deepEqual([expectValue(first).conversationId, expectValue(second).conversationId], [a, b]);
   assert.equal(await t.service.claim(), null);
-  await t.service.finish(first, 'completed');
+  await t.service.finish(expectValue(first), 'completed');
   assert.equal((await t.read(a)).body.status, 'working');
   const third = await t.service.claim();
-  assert.equal(third.message.id, 'msg_2');
-  await t.service.finish(third, 'failed');
+  assert.equal(expectValue(third).message.id, 'msg_2');
+  await t.service.finish(expectValue(third), 'failed');
   const page = (await t.read(a)).body;
   assert.equal(page.status, 'idle');
   assert.equal(page.events.at(-2).message.role, 'company');
-  await t.service.finish(second, 'suspended');
+  await t.service.finish(expectValue(second), 'suspended');
   assert.equal(await t.service.claim(), null, 'suspended work is not resumed automatically');
 });
 
@@ -376,12 +379,12 @@ test('an idle claim only reads; a claim that loses the race after its read retur
   assert.equal(t.store.transactions, 0, 'no candidate, no write transaction');
   await t.start(hello);
   const before = t.store.transactions;
-  let winner;
+  let winner!:Awaited<ReturnType<ReturnType<typeof setup>['service']['claim']>>;
   t.store.afterRead = async () => { winner = await t.service.claim(); };
   assert.equal(await t.service.claim(), null, 'the transaction rechecks the candidate');
-  assert.equal(winner.message.id, hello.id);
+  assert.equal(expectValue(winner).message.id, hello.id);
   assert.equal(t.store.transactions, before + 2);
-  assert.equal((await t.store.read()).work[0].fence, winner.fence, 'the loser changed nothing');
+  assert.equal((await t.store.read()).work[0].fence, expectValue(winner).fence, 'the loser changed nothing');
 });
 
 test('finished work is pruned oldest first beyond the limit; held and unfinished work and receipts are kept', async () => {
@@ -390,37 +393,37 @@ test('finished work is pruned oldest first beyond the limit; held and unfinished
   for (const n of [1, 2, 3]) {
     ids.push((await t.start({ id: `msg_${n}`, sender: 'agent', text: `q${n}` })).body.conversation_id);
     claims.push(await t.service.claim());
-    await t.service.finish(claims.at(-1), 'completed');
+    await t.service.finish(expectValue(claims.at(-1)), 'completed');
   }
   await t.handoff(ids[0]);
   await t.send(ids[0], { id: 'msg_held', sender: 'agent', text: 'for the person' });
   const phases = async () => (await t.store.read()).work.map(work => [work.message.id, work.phase]);
   assert.deepEqual(await phases(), [['msg_2', 'completed'], ['msg_3', 'completed'], ['msg_held', 'held']]);
   await t.start({ id: 'msg_4', sender: 'agent', text: 'q4' });
-  await t.service.finish(await t.service.claim(), 'failed');
+  await t.service.finish(expectValue(await t.service.claim()), 'failed');
   await t.start({ id: 'msg_5', sender: 'agent', text: 'q5' });
   assert.deepEqual(await phases(), [['msg_3', 'completed'], ['msg_held', 'held'], ['msg_4', 'failed'], ['msg_5', 'pending']]);
   assert.equal(Object.keys((await t.store.read()).messages).length, 6, 'message receipts are kept as long as the conversation (spec 7.3)');
-  await assert.rejects(t.service.finish(claims[1], 'completed'), { code: 'stale_work' }, 'a pruned fence is stale, as it was once finished');
+  await assert.rejects(t.service.finish(expectValue(claims[1]), 'completed'), { code: 'stale_work' }, 'a pruned fence is stale, as it was once finished');
   assert.equal((await t.start({ id: 'msg_1', sender: 'agent', text: 'q1' })).body.conversation_id, ids[0], 'dedupe outlives the pruned work');
 });
 
 const childMessage = { id: 'msg_child', sender: 'human', text: 'Hi, I have a question.' };
-const openChild = async (t, parent, as) => (await t.direct(parent, childMessage, { as })).body.conversation_id;
-const bindingOf = async (t, id) => { const state = await t.store.read(); return state.bindings[state.conversations[id].bindingId]; };
+const openChild = async (t:ReturnType<typeof setup>,parent:string,as:string) => (await t.direct(parent, childMessage, { as })).body.conversation_id;
+const bindingOf = async (t:ReturnType<typeof setup>,id:string) => { const state = await t.store.read(); return state.bindings[state.conversations[id].bindingId]; };
 
 test('requireAccount binds the shared parent/child ownership once and checks the accepted scopes', async () => {
   const t = setup();
   const parent = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
   const child = await openChild(t, parent, 'aliceSignedIn');
   const claim = await t.service.claim();
-  assert.equal(claim.conversationId, child, 'the parent is suspended while its Direct Conversation is open');
+  assert.equal(expectValue(claim).conversationId, child, 'the parent is suspended while its Direct Conversation is open');
   t.calls.length = 0;
-  assert.deepEqual(await t.service.requireAccount(claim, ['poppy:read']), { accountId: 'acct_1' });
+  assert.deepEqual(await t.service.requireAccount(expectValue(claim), ['poppy:read']), { accountId: 'acct_1' });
   assert.deepEqual(t.calls, [{ kind: 'accepted', userId: 'u_alice', scopes: ['poppy:read'] }]);
   assert.deepEqual(await bindingOf(t, parent), { accountId: 'acct_1' });
   // Idempotent for the same account; the parent is bound by the child's account use.
-  assert.deepEqual(await t.service.requireAccount(claim, []), { accountId: 'acct_1' });
+  assert.deepEqual(await t.service.requireAccount(expectValue(claim), []), { accountId: 'acct_1' });
   for (const id of [parent, child]) {
     assert.equal((await t.read(id, { as: 'carolSameAccount' })).status, 200);
     assert.equal((await t.read(id)).status, 403);
@@ -435,35 +438,35 @@ test('requireAccount refuses signed-out work, missing scopes and stale fences wi
   const noScopes = (await t.start({ ...hello, id: 'msg_n' }, { as: 'aliceNoScopes' })).body.conversation_id;
   const first = await t.service.claim();
   const second = await t.service.claim();
-  await assert.rejects(t.service.requireAccount(first, []), { code: 'sign_in_required' });
-  await assert.rejects(t.service.requireAccount(second, ['poppy:read']), { code: 'insufficient_scope' });
-  await assert.rejects(t.service.requireAccount({ ...second, fence: 'stale' }, []), { code: 'stale_work' });
+  await assert.rejects(t.service.requireAccount(expectValue(first), []), { code: 'sign_in_required' });
+  await assert.rejects(t.service.requireAccount(expectValue(second), ['poppy:read']), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.requireAccount(expectValue({ ...expectValue(second), fence: 'stale' }), []), { code: 'stale_work' });
   for (const id of [signedOut, noScopes]) assert.deepEqual(await bindingOf(t, id), {});
 });
 
 // Alice's parent work (account 1) races Alice opening a Direct Conversation on account 2 and that child's first account use.
 test('race: Direct Conversation creation, first account use and reads have exactly one winner', async () => {
-  const orders = {
+  type Order=(bind:()=>Promise<string>,child:()=>Promise<string>,t:ReturnType<typeof setup>,parent:string)=>Promise<string[]>;
+  const orders:Record<string,Order> = {
     'bind, then child': async (bind, child) => [await bind(), await child()],
     'child, then bind': async (bind, child) => [await child(), await bind()],
-    'child commits inside the bind gap': async (bind, child, t) => { let opened; t.store.afterRead = () => { opened = child(); return opened; }; const bound = await bind(); return [bound, await opened]; },
-    'bind commits inside the child gap': async (bind, child, t) => { let bound; t.store.afterRead = () => { bound = bind(); return bound; }; const opened = await child(); return [opened, await bound]; },
+    'child commits inside the bind gap': async (bind, child, t) => { let opened!:Promise<string>; t.store.afterRead = () => { opened = child(); return opened; }; const bound = await bind(); return [bound, await opened]; },
+    'bind commits inside the child gap': async (bind, child, t) => { let bound!:Promise<string>; t.store.afterRead = () => { bound = bind(); return bound; }; const opened = await child(); return [opened, await bound]; },
     concurrent: async (bind, child, t, parent) => {
-      const results = await Promise.all([bind(), child(), t.read(parent, { as: 'aliceSignedIn' }), t.read(parent, { as: 'aliceOtherAccount' })]);
-      for (const read of results.slice(2)) assert.ok([200, 403].includes(read.status));
-      return results.slice(0, 2);
+      const [bound,opened,...reads]=await Promise.all([bind(),child(),t.read(parent,{as:'aliceSignedIn'}),t.read(parent,{as:'aliceOtherAccount'})]);
+      for(const read of reads)assert.ok([200,403].includes(read.status));return [bound,opened];
     },
   };
   for (const [name, run] of Object.entries(orders)) {
     const t = setup();
     const parent = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
     const parentClaim = await t.service.claim();
-    const outcome = promise => promise.then(value => value.accountId, error => error.code);
-    const bind = () => outcome(t.service.requireAccount(parentClaim, ['poppy:read']));
+    const outcome=(promise:Promise<{accountId:string}>)=>promise.then(value=>value.accountId,(error:unknown)=>{assert.ok(error&&typeof error==='object'&&'code' in error&&typeof error.code==='string');return error.code;});
+    const bind = () => outcome(t.service.requireAccount(expectValue(parentClaim), ['poppy:read']));
     const child = async () => {
       const res = await t.direct(parent, childMessage, { as: 'aliceOtherAccount' });
       if (res.status !== 201) return res.body.error;
-      return outcome(t.service.claim().then(claim => t.service.requireAccount(claim, ['poppy:read'])));
+      return outcome(t.service.claim().then(claim => t.service.requireAccount(expectValue(claim), ['poppy:read'])));
     };
     const results = await run(bind, child, t, parent);
     const winners = results.filter(result => result.startsWith('acct_'));
@@ -487,7 +490,7 @@ test('account use committed between a read and its transaction: the read sees th
   const child = await openChild(t, parent, 'aliceSignedIn');
   const childClaim = await t.service.claim();
   // The signed-out read snapshots an unbound child, then the child's worker binds before the read commits.
-  t.store.afterRead = () => t.service.requireAccount(childClaim, []);
+  t.store.afterRead = () => t.service.requireAccount(expectValue(childClaim), []);
   assert.deepEqual((await t.read(child)).body, { error: 'sign_in_required' });
   // A different account's message racing the binding is refused and leaves no trace.
   t.store.afterRead = null;
@@ -500,7 +503,7 @@ test('account use committed between a read and its transaction: the read sees th
   const claim = await t2.service.claim();
   t2.store.afterRead = state => { state.bindings[id].accountId = 'acct_1'; };
   t2.calls.length = 0;
-  assert.equal((await t2.service.history(claim)).length, 2);
+  assert.equal((await t2.service.history(expectValue(claim))).length, 2);
   assert.deepEqual(t2.calls.map(call => call.scopes), [[], ['poppy:read']]);
 });
 
@@ -509,21 +512,21 @@ test('history: unbound needs no scope; bound needs the bound account and poppy:r
   const out = (await t.start(hello)).body.conversation_id;
   const noScopes = (await t.start({ ...hello, id: 'msg_n' }, { as: 'aliceNoScopes' })).body.conversation_id;
   const [outClaim, noScopesClaim] = [await t.service.claim(), await t.service.claim()];
-  assert.deepEqual((await t.service.history(outClaim)).map(event => event.type), ['message', 'state']);
+  assert.deepEqual((await t.service.history(expectValue(outClaim))).map((event:ConversationEvent) => event.type), ['message', 'state']);
   t.store.set(state => { state.bindings[out].accountId = 'acct_1'; state.bindings[noScopes].accountId = 'acct_1'; });
   // Signed-out work holds no read scope; signed-in work without poppy:read is over its ceiling.
-  await assert.rejects(t.service.history(outClaim), { code: 'insufficient_scope' });
-  await assert.rejects(t.service.history(noScopesClaim), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.history(expectValue(outClaim)), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.history(expectValue(noScopesClaim)), { code: 'insufficient_scope' });
   const other = (await t.start({ ...hello, id: 'msg_x' }, { as: 'aliceOtherAccount' })).body.conversation_id;
   const otherClaim = await t.service.claim();
-  assert.equal(otherClaim.conversationId, other);
+  assert.equal(expectValue(otherClaim).conversationId, other);
   t.store.set(state => { state.bindings[other].accountId = 'acct_1'; });
-  await assert.rejects(t.service.history(otherClaim), { code: 'sign_in_required' });
+  await assert.rejects(t.service.history(expectValue(otherClaim)), { code: 'sign_in_required' });
 });
 
 test('history scopes default to poppy:read and can be set to a Company custom scope (spec 4.4)', async () => {
-  for (const [options, allowed, denied] of [[{}, 'aliceSignedIn', 'aliceCustomScope'], [{ historyScopes: ['shop:history'] }, 'aliceCustomScope', 'aliceSignedIn']]) {
-    const t = setup(options);
+  for (const [options, allowed, denied] of ([[{},'aliceSignedIn','aliceCustomScope'],[{historyScopes:['shop:history']},'aliceCustomScope','aliceSignedIn']] satisfies [Partial<ConversationOptions>,string,string][])) {
+    const t = setup(expectValue(options));
     const id = (await t.start(hello)).body.conversation_id;
     t.store.set(state => { state.bindings[id].accountId = 'acct_1'; });
     assert.equal((await t.read(id, { as: allowed })).status, 200);

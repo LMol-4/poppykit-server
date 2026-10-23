@@ -18,3 +18,32 @@ reset persisted data. Pull requests must explain checks actually run and limitat
 Use the repository's Issues for non-sensitive defects and feature discussions.
 No public contribution license/CLA has been selected; ask the owner before accepting
 third-party rights or publishing code.
+
+## TypeScript test harness and coverage
+
+First-party tests, executable fixtures, process workers and packaged verification
+scripts are canonical `.mts` files. Run `npm run typecheck:tests` for the complete
+strict program and `npm run build:tests` before individual
+`node scripts/run-checks.mjs GROUP` commands (unit, contracts, integration or
+validation). `npm test` performs that checked harness build and runs all groups.
+Build production first with `npm run build`; tests import compiled `dist/*.js`,
+not TypeScript source. No loader or native type stripping replaces the compiler.
+
+The existing TypeScript compiler emits ignored adjacent `.mjs` files only after
+all strict diagnostics pass. Failed builds remove stale canonical outputs.
+`scripts/build-tests.mjs` is compiler/bootstrap tooling, not an unchecked test
+runner. Canonical test sources use LF, enforced by `.gitattributes`, so Linux and
+Windows validate the same exact source bytes. Test output stays outside the npm
+package allowlist. Retained JavaScript release/build tools and packaged examples
+are genuine production tooling/examples; retained protocol captures are references.
+
+Run `npm run coverage` for a production build, checked harness and native Node
+24.12.0 line/branch/function report. `coverage/summary.txt`, `coverage/lcov.info`,
+`coverage/report.json` and `coverage/raw/` are generated local reports. Metrics
+refer to first-party compiled `dist` JavaScript; production emits no source maps
+and no TypeScript remapping is claimed. Third-party `node_modules` is excluded;
+unloaded modules are listed explicitly. Raw child-process reports are retained,
+but arbitrary subprocess execution is not guaranteed to be merged into the native
+runner summary, and killed/crashed workers may not flush counters. Actual installed
+package/OS checks remain separate evidence. No percentage threshold substitutes
+for protocol, negative/security, process and platform assertions.

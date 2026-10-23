@@ -1,3 +1,5 @@
+import type {ResourceEndpoint,ExternalAuthorityAdapter} from '../../dist/auth/authority.js';
+import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateJwkThumbprint } from 'jose';
@@ -8,14 +10,14 @@ const ENDPOINT = 'https://api.shop.test/poppy/conversations';
 const TOKEN = 'opaque-session-token';
 const principal = { issuer: 'https://auth.shop.test', clientId: 'https://agent.test/agent.json', userId: 'usr_1', sessionId: 'ses_1', scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1 };
 
-async function setup({ endpoints = [{ origin: 'https://api.shop.test', pathPrefix: '/poppy' }], expiresAt = principal.tokenExpiresAt } = {}) {
-  const key = await keyPair(); const jkt = await calculateJwkThumbprint(key.jwk); const calls = [];
-  const authority = { async introspect(token, resource) { calls.push({ token, resource }); if (token !== TOKEN) throw new AuthorityError('invalid_token'); return { principal: { ...principal, tokenExpiresAt: expiresAt }, dpopJkt: jkt }; } };
+async function setup({ endpoints = [{ origin: 'https://api.shop.test', pathPrefix: '/poppy' }], expiresAt = principal.tokenExpiresAt }:{endpoints?:ResourceEndpoint[];expiresAt?:number} = {}) {
+  const key = await keyPair(); const jkt = await calculateJwkThumbprint(key.jwk); const calls:{token:string;resource?:string}[] = [];
+  const authority:Pick<ExternalAuthorityAdapter,'introspect'> = { async introspect(token, resource) { calls.push({ token, resource }); if (token !== TOKEN) throw new AuthorityError('invalid_token'); return { principal: { ...principal, tokenExpiresAt: expiresAt }, dpopJkt: jkt }; } };
   return { key, calls, authenticator: createRequestAuthenticator({ authority, endpoints, now: () => NOW }) };
 }
-const request = (url, headers, method = 'POST') => new Request(url, { method, headers });
-async function rejects(promise, code) {
-  await assert.rejects(promise, error => error instanceof AuthorityError && error.code === code && error.headers.get('www-authenticate').startsWith(`DPoP error="${code}"`) && !error.headers.get('www-authenticate').includes(TOKEN));
+const request = (url:string,headers:HeadersInit, method = 'POST') => new Request(url, { method, headers });
+async function rejects(promise:Promise<unknown>,code:string) {
+  await assert.rejects(promise, error => error instanceof AuthorityError && error.code === code && expectValue(error.headers.get('www-authenticate')).startsWith(`DPoP error="${code}"`) && !expectValue(error.headers.get('www-authenticate')).includes(TOKEN));
 }
 
 test('accepts a DPoP-bound token at a configured endpoint and passes the endpoint resource', async () => {
@@ -52,8 +54,8 @@ test('URL matching uses exact configured origin and path boundary; forwarding he
     await rejects(authenticator.authenticate(request(url, headers)), 'invalid_token');
   }
   assert.equal(calls.length, 0);
-  assert.throws(() => createRequestAuthenticator({ authority: {}, endpoints: [{ origin: 'https://api.shop.test/', pathPrefix: '/' }], now: () => NOW }));
-  assert.throws(() => createRequestAuthenticator({ authority: {}, endpoints: [{ origin: 'http://api.shop.test', pathPrefix: '/' }], now: () => NOW }));
+  assert.throws(() => createRequestAuthenticator({ authority:{async introspect(){throw new Error('unexpected introspection');}}, endpoints: [{ origin: 'https://api.shop.test/', pathPrefix: '/' }], now: () => NOW }));
+  assert.throws(() => createRequestAuthenticator({ authority:{async introspect(){throw new Error('unexpected introspection');}}, endpoints: [{ origin: 'http://api.shop.test', pathPrefix: '/' }], now: () => NOW }));
 });
 
 test('each DPoP proof defect is rejected as invalid_dpop_proof', async () => {

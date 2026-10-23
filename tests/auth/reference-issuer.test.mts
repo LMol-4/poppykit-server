@@ -1,3 +1,6 @@
+function streamedRequest(url:string,options:RequestInit&{duplex:'half'}){return new Request(url,options);}
+import type {JWTHeaderParameters} from 'jose';
+import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -12,13 +15,13 @@ import { API, CLIENT, ISSUER, JWKS_URI, RESOURCE, TOKEN_ENDPOINT, expectError, s
 test('issues and renews a signed-out DPoP session after a nonce challenge', async () => {
   const env = await setup();
   const challenge = await env.challenge();
-  assert.equal(challenge.status, 400); assert.equal(challenge.headers.get('cache-control'), 'no-store'); assert.ok(env.nonce.length >= 16);
+  assert.equal(challenge.status, 400); assert.equal(challenge.headers.get('cache-control'), 'no-store'); assert.ok(expectValue(env.nonce).length >= 16);
   const first = await env.send();
   assert.equal(first.status, 200); assert.equal(first.headers.get('cache-control'), 'no-store');
   assert.deepEqual(Object.keys(first.body).sort(), ['access_token', 'expires_in', 'scope', 'session_id', 'signed_in', 'token_type']);
   assert.equal(first.body.token_type, 'DPoP'); assert.equal(first.body.expires_in, 3600); assert.equal(first.body.scope, ''); assert.equal(first.body.signed_in, false);
-  assert.ok(Buffer.from(first.body.access_token, 'base64url').length >= 32);
-  assert.ok(!JSON.stringify(env.store.state).includes(first.body.access_token), 'plaintext token is not persisted');
+  assert.ok(Buffer.from(expectValue(first.body.access_token), 'base64url').length >= 32);
+  assert.ok(!JSON.stringify(env.store.state).includes(expectValue(first.body.access_token)), 'plaintext token is not persisted');
   const renewed = await env.send({ session_id: first.body.session_id });
   assert.equal(renewed.status, 200); assert.equal(renewed.body.session_id, first.body.session_id); assert.notEqual(renewed.body.access_token, first.body.access_token);
 
@@ -102,7 +105,7 @@ test('replay retention survives a restart and expires with the assertion', async
   const env = await setup(); await env.challenge();
   const assertion = await env.assertion();
   assert.equal((await env.send({ assertion })).status, 200);
-  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
+  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains:['shop.test'],directScopes:[],metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
   env.issuer = restarted;
   expectError(await env.send({ assertion }), 'invalid_grant');
   env.clock.now += 61_000; env.nonce = undefined; await env.challenge();
@@ -148,7 +151,7 @@ test('token-endpoint DPoP proofs are verified against the configured URL with re
 test('unknown kid triggers exactly one JWKS refresh', async () => {
   const env = await setup(); await env.challenge();
   const rotated = await keyPair(); env.refreshedJwks = { keys: [{ ...rotated.jwk, kid: 'k2', alg: 'ES256' }] };
-  const signed = async (sub) => env.assertion({ sub }, { key: rotated, header: { kid: 'k2' } });
+  const signed = async (sub: string) => env.assertion({ sub }, { key: rotated, header: { kid: 'k2' } });
   assert.equal((await env.send({ assertion: await signed('usr_1'), client_assertion: await signed(CLIENT) })).status, 200);
   assert.equal(env.calls.refresh, 1);
   expectError(await env.send({ client_assertion: await env.clientAssertion({}, { key: rotated, header: { kid: 'k9' } }) }), 'invalid_client');
@@ -170,10 +173,10 @@ test('session, scope, resource and request shape checks', async () => {
   const json = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }));
   assert.equal(json.status, 400);
   // Rejected before reading: the unread body stream is cancelled, not left open.
-  for (const [contentType, length] of [['application/json', undefined], ['application/x-www-form-urlencoded', '65537']]) {
+  for (const [contentType,length] of ([['application/json',undefined],['application/x-www-form-urlencoded','65537']] satisfies [string,string|undefined][])) {
     let cancelled = false;
     const body = new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(1)); }, cancel() { cancelled = true; } });
-    const rejected = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': contentType, ...(length ? { 'content-length': length } : {}) }, body, duplex: 'half' }));
+    const rejected = await env.issuer.token(streamedRequest(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': contentType, ...(length ? { 'content-length': length } : {}) }, body, duplex: 'half' }));
     assert.equal(rejected.status, 400); assert.ok(cancelled, contentType);
   }
 
@@ -181,7 +184,7 @@ test('session, scope, resource and request shape checks', async () => {
   assert.equal(declared.status, 400); assert.deepEqual(await declared.json(), { error: 'invalid_request' });
   let pulled = 0; // endless stream: the reader must stop on its own once the limit is passed
   const endless = new ReadableStream({ pull(controller) { pulled++; controller.enqueue(new Uint8Array(16384).fill(97)); } });
-  const streamed = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: endless, duplex: 'half' }));
+  const streamed = await env.issuer.token(streamedRequest(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: endless, duplex: 'half' }));
   assert.equal(streamed.status, 400); assert.deepEqual(await streamed.json(), { error: 'invalid_request' }); assert.ok(pulled <= 6);
   const multibyte = await env.issuer.token(new Request(TOKEN_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'é'.repeat(40000) }));
   assert.equal(multibyte.status, 400, 'limit counts bytes, not UTF-16 units');
@@ -189,12 +192,12 @@ test('session, scope, resource and request shape checks', async () => {
   const scoped = await env.send({ resource: RESOURCE });
   assert.equal(scoped.status, 200);
   const authority = env.issuer.authority;
-  assert.equal((await authority.introspect(scoped.body.access_token, RESOURCE)).principal.sessionId, scoped.body.session_id);
-  await assert.rejects(authority.introspect(scoped.body.access_token), { code: 'invalid_token' });
-  await assert.rejects(authority.introspect(first.body.access_token, RESOURCE), { code: 'invalid_token' });
+  assert.equal((await authority.introspect(expectValue(scoped.body.access_token), RESOURCE)).principal.sessionId, scoped.body.session_id);
+  await assert.rejects(authority.introspect(expectValue(scoped.body.access_token)), { code: 'invalid_token' });
+  await assert.rejects(authority.introspect(expectValue(first.body.access_token), RESOURCE), { code: 'invalid_token' });
   await assert.rejects(authority.introspect('unknown'), { code: 'invalid_token' });
   env.clock.now += 3600_000;
-  await assert.rejects(authority.introspect(first.body.access_token), { code: 'invalid_token' });
+  await assert.rejects(authority.introspect(expectValue(first.body.access_token)), { code: 'invalid_token' });
 });
 
 test('a reset between verification and commit fails issuance without recreating state', async () => {
@@ -213,10 +216,10 @@ test('store failures propagate instead of becoming protocol errors', async () =>
 test('the core entry point does not load the reference issuer module', async () => {
   const { readFile } = await import('node:fs/promises');
   const { fileURLToPath } = await import('node:url');
-  const seen = new Set(); const queue = [new URL('../../dist/index.js', import.meta.url)];
+  const seen=new Set<string>(); const queue = [new URL('../../dist/index.js', import.meta.url)];
   while (queue.length) {
-    const file = queue.pop(); if (seen.has(file.href)) continue; seen.add(file.href);
-    const source = await readFile(fileURLToPath(file), 'utf8');
+    const file = queue.pop(); if (seen.has(expectValue(file).href)) continue; seen.add(expectValue(file).href);
+    const source = await readFile(fileURLToPath(expectValue(file)), 'utf8');
     for (const [, specifier] of source.matchAll(/(?:from|import)\s*\(?\s*'(\.[^']+)'/g)) queue.push(new URL(specifier, file));
   }
   assert.ok(seen.size > 3);
@@ -243,7 +246,7 @@ test('a metadata resolver rate limit is rate_limited with Retry-After; other fet
 });
 
 // Signs a payload given as raw JSON text, so it can carry duplicate members that SignJWT cannot produce.
-const signRaw = (key, header, payloadText) => new CompactSign(new TextEncoder().encode(payloadText)).setProtectedHeader(header).sign(key.privateKey);
+const signRaw=(key:Awaited<ReturnType<typeof keyPair>>,header:JWTHeaderParameters,payloadText:string) => new CompactSign(new TextEncoder().encode(payloadText)).setProtectedHeader(header).sign(key.privateKey);
 
 test('a client assertion or DPoP proof with a duplicate member is rejected', async () => {
   const env = await setup(); await env.challenge(); const iat = Math.floor(NOW / 1000);
@@ -263,8 +266,8 @@ test('a client assertion or DPoP proof with a duplicate member is rejected', asy
 
 test('the real metadata resolver limits map to rate_limited, not invalid_client', async () => {
   const doc = { client_id: CLIENT, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [], token_endpoint_auth_method: 'private_key_jwt' };
-  const build = async options => {
-    let env; const transport = { async fetch(request) { return Response.json(request.url === CLIENT ? doc : env.jwks); } };
+  const build = async (options: { now?: () => number; maxEntries?: number; maxConcurrentFetches?: number; maxFetchesPerMinute?: number; }|undefined) => {
+    let env!:Awaited<ReturnType<typeof setup>>; const transport = { async fetch(request: { url: string; }) { return Response.json(request.url === CLIENT ? doc : env.jwks); } };
     env = await setup({ metadata: createMetadataResolver(transport, { now: () => NOW, ...options }) }); await env.challenge();
     return env;
   };

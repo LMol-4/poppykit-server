@@ -7,8 +7,8 @@ import {spawnSync} from 'node:child_process';
 const consumer=resolve(process.argv[2]),directory=join(consumer,'node_modules/@poppykit/server');
 const pkg=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));
 await validateContents(directory,pkg);
-for(const entry of Object.values(pkg.exports)){await access(join(directory,entry.types));await import(pathToFileURL(join(directory,entry.import)));}
-const {SqliteCompanyDatabase}=await import(pathToFileURL(join(directory,pkg.exports['./sqlite'].import)));
+for(const entry of Object.values(pkg.exports)){assert.ok(entry&&typeof entry==='object'&&'types' in entry&&typeof entry.types==='string'&&'import' in entry&&typeof entry.import==='string');await access(join(directory,entry.types));await import(pathToFileURL(join(directory,entry.import)).href);}
+const {SqliteCompanyDatabase}=await import(pathToFileURL(join(directory,pkg.exports['./sqlite'].import)).href);
 const db=new SqliteCompanyDatabase(':memory:');db.close();
 for(const path of pkg.files)await access(join(directory,path));
 const result=spawnSync(process.execPath,[join(directory,'examples/quickstart.mjs')],{stdio:'inherit',windowsHide:true});assert.equal(result.status,0);

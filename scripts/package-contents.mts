@@ -3,7 +3,7 @@ import {readFile,writeFile,readdir,access} from 'node:fs/promises';
 import {resolve,join,dirname} from 'node:path';
 import {pathToFileURL,fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
-export async function validateContents(directory,manifest){
+export async function validateContents(directory:string,manifest:{files:string[]}){
   async function visit(relative=''){
     for(const entry of await readdir(join(directory,relative),{withFileTypes:true})){
       const path=(relative?relative+'/':'')+entry.name;

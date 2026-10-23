@@ -1,27 +1,28 @@
 {
   "unit": [],
   "contracts": [
-    "tests/storage.test.mjs",
-    "tests/network/network.test.mjs",
-    "tests/auth/authenticator.test.mjs",
-    "tests/auth/methods.test.mjs",
-    "tests/auth/policy.test.mjs",
-    "tests/auth/reference-issuer.test.mjs",
-    "tests/auth/sign-in.test.mjs",
-    "tests/conversation/adapter-contract.test.mjs",
-    "tests/conversation/authority.test.mjs",
-    "tests/conversation/delivery.test.mjs",
-    "tests/conversation/lifecycle.test.mjs",
-    "tests/conversation/requests.test.mjs",
-    "tests/conversation/service.test.mjs"
+    "tests/storage.test.mts",
+    "tests/network/network.test.mts",
+    "tests/auth/authenticator.test.mts",
+    "tests/auth/methods.test.mts",
+    "tests/auth/policy.test.mts",
+    "tests/auth/reference-issuer.test.mts",
+    "tests/auth/sign-in.test.mts",
+    "tests/conversation/adapter-contract.test.mts",
+    "tests/conversation/authority.test.mts",
+    "tests/conversation/delivery.test.mts",
+    "tests/conversation/lifecycle.test.mts",
+    "tests/conversation/requests.test.mts",
+    "tests/conversation/service.test.mts"
   ],
   "integration": [
-    "tests/integrations.test.mjs",
-    "tests/independent-peer.test.mjs"
+    "tests/integrations.test.mts",
+    "tests/independent-peer.test.mts"
   ],
   "validation": [
-    "tests/release.test.mjs",
-    "tests/workflows.test.mjs",
-    "tests/registry.test.mjs"
+    "tests/release.test.mts",
+    "tests/workflows.test.mts",
+    "tests/registry.test.mts",
+    "tests/harness.test.mts"
   ]
 }

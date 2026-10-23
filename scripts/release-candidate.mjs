@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFile,writeFile,readdir} from 'node:fs/promises';
-import {join,resolve} from 'node:path';
+import {join,resolve,dirname,basename} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
 
@@ -34,8 +34,8 @@ async function expected(){
   return {pkg,repository,sources};
 }
 function metadata(path){
-  const result=spawnSync('tar',['-xOf',resolve(path),'package/package.json'],{encoding:'utf8',windowsHide:true,maxBuffer:1024*1024});
-  assert.equal(result.status,0,'unreadable candidate tarball');return JSON.parse(result.stdout);
+  const result=spawnSync('tar',['-xOf',basename(path),'package/package.json'],{cwd:dirname(resolve(path)),encoding:'utf8',windowsHide:true,maxBuffer:1024*1024});
+  assert.equal(result.status,0,'unreadable candidate tarball: '+(result.error?.message??result.stderr));return JSON.parse(result.stdout);
 }
 export async function inspect(directory){
   const {pkg,repository,sources}=await expected();

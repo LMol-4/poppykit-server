@@ -1,3 +1,6 @@
+import type {Environment,Reply} from './issuer-support.mjs';
+import type {ReferenceIssuerOptions} from '../../dist/reference-auth/index.js';
+import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
@@ -13,33 +16,35 @@ function pkce() {
   const verifier = randomBytes(32).toString('base64url');
   return { verifier, challenge: createHash('sha256').update(verifier).digest('base64url') };
 }
-function authorizeRequest(params = {}) {
+function authorizeRequest(params:Record<string,string|undefined> = {}) {
   const url = new URL(`${ISSUER}/oauth/authorize`);
   const query = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'poppy:read poppy:write', state: 'state-1', code_challenge: pkce().challenge, code_challenge_method: 'S256', ...params };
   for (const [name, value] of Object.entries(query)) if (value !== undefined) url.searchParams.set(name, value);
   return new Request(url);
 }
 
-async function signInSetup(overrides) {
-  const env = await setup({ requireDpopNonce: false, ...overrides });
-  env.session = async (fields) => (await env.send(fields)).body;
-  // Runs begin and complete as the host's login/consent page would, returning the code and its verifier.
-  env.code = async ({ accountId = 'acct_1', scopes, params } = {}) => {
-    const { verifier, challenge } = pkce();
-    const view = await env.issuer.beginAuthorization(authorizeRequest({ code_challenge: challenge, ...params }), BINDING);
-    const url = await env.issuer.completeAuthorization(view.id, BINDING, { accountId, scopes: scopes ?? view.scopes });
-    return { code: url.searchParams.get('code'), verifier, url, view };
-  };
-  env.exchange = (sessionId, { code, verifier }, fields = {}) => env.send({ grant_type: 'authorization_code', assertion: undefined, code, redirect_uri: REDIRECT, code_verifier: verifier, session_id: sessionId, ...fields });
-  env.signIn = async (sessionId, options) => env.exchange(sessionId, await env.code(options));
-  env.refresh = (refresh_token, fields = {}) => env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token, ...fields });
-  env.revoke = async (token, fields = {}) => {
-    const form = { token, token_type_hint: 'refresh_token', client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...fields };
-    const body = new URLSearchParams(Object.entries(form).filter(([, value]) => value !== undefined));
-    const response = await env.issuer.revoke(new Request(REVOKE, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body }));
-    return { status: response.status, headers: response.headers, text: await response.text() };
-  };
-  env.introspect = token => env.issuer.authority.introspect(token);
+type Fields=Record<string,string|undefined>;
+type ConsentOptions={accountId?:string;scopes?:string[];params?:Fields};
+type Code={code:string;verifier:string;url:URL;view:Awaited<ReturnType<Environment['issuer']['beginAuthorization']>>};
+async function signInSetup(overrides:Partial<ReferenceIssuerOptions>={}) {
+  async function session(fields:Fields={}):Promise<Reply['body']>{return (await env.send(fields)).body;}
+  async function code({accountId='acct_1',scopes,params}:ConsentOptions={}):Promise<Code>{
+    const {verifier,challenge}=pkce();
+    const view=await env.issuer.beginAuthorization(authorizeRequest({code_challenge:challenge,...params}),BINDING);
+    const url=await env.issuer.completeAuthorization(view.id,BINDING,{accountId,scopes:scopes??view.scopes});
+    const code=url.searchParams.get('code');assert.ok(code);return {code,verifier,url,view};
+  }
+  function exchange(sessionId:string|undefined,{code,verifier}:{code:string|null;verifier:string},fields:Fields={}):Promise<Reply>{return env.send({grant_type:'authorization_code',assertion:undefined,code:expectValue(code),redirect_uri:REDIRECT,code_verifier:verifier,session_id:sessionId,...fields});}
+  async function signIn(sessionId:string|undefined,options?:ConsentOptions):Promise<Reply>{return env.exchange(sessionId,await env.code(options));}
+  function refresh(refresh_token:string|undefined,fields:Fields={}):Promise<Reply>{return env.send({grant_type:'refresh_token',assertion:undefined,refresh_token,...fields});}
+  async function revoke(token:string|undefined,fields:Fields={}):Promise<{status:number;headers:Headers;text:string}>{
+    const form={token,token_type_hint:'refresh_token',client_id:CLIENT,client_assertion_type:'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',client_assertion:await env.clientAssertion(),...fields};
+    const body=new URLSearchParams(Object.entries(form).filter((entry):entry is [string,string]=>entry[1]!==undefined));
+    const response=await env.issuer.revoke(new Request(REVOKE,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body}));
+    return {status:response.status,headers:response.headers,text:await response.text()};
+  }
+  function introspect(token:string|undefined):ReturnType<Environment['issuer']['authority']['introspect']>{return env.issuer.authority.introspect(expectValue(token));}
+  const env=Object.assign(await setup({requireDpopNonce:false,...overrides}),{session,code,exchange,signIn,refresh,revoke,introspect});
   return env;
 }
 
@@ -60,9 +65,9 @@ test('Direct Sign-In signs in the Session with an Account Token; partial consent
   assert.deepEqual(Object.keys(response.body).sort(), ['access_token', 'expires_in', 'refresh_token', 'refresh_token_expires_in', 'scope', 'session_id', 'signed_in', 'token_type']);
   assert.deepEqual([response.body.scope, response.body.session_id, response.body.signed_in, response.body.token_type, response.body.refresh_token_expires_in], ['poppy:read', signedOut.session_id, true, 'DPoP', 2_592_000]);
   const persisted = JSON.stringify(env.store.state);
-  for (const secret of [code, response.body.refresh_token, response.body.access_token, verifier, BINDING]) assert.ok(!persisted.includes(secret), 'secrets are stored only as hashes');
+  for (const secret of [code, response.body.refresh_token, response.body.access_token, verifier, BINDING]) assert.ok(!persisted.includes(expectValue(secret)), 'secrets are stored only as hashes');
 
-  const { principal } = await env.issuer.authority.introspect(response.body.access_token, RESOURCE);
+  const { principal } = await env.issuer.authority.introspect(expectValue(response.body.access_token), RESOURCE);
   const [grantId] = Object.keys(env.store.state.grants);
   assert.deepEqual(principal, { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: signedOut.session_id, accountId: 'acct_1', grantId, scopes: ['poppy:read'], tokenExpiresAt: NOW + 3_600_000, sessionVersion: 1, issuerGeneration: env.store.state.generation });
   // The grant lasts the account sign-in lifetime, not the access-token lifetime.
@@ -99,7 +104,7 @@ test('an authorization code works once; its reuse revokes the sign-in it produce
   expectError(await env.exchange(second.session_id, grant), 'invalid_grant');
   expectError(await env.refresh(first.body.refresh_token), 'invalid_grant');
   await assert.rejects(env.introspect(first.body.access_token), { code: 'invalid_token' });
-  assert.equal(env.store.state.sessions[session.session_id].grantId, null, 'the Session was signed out');
+  assert.equal(env.store.state.sessions[expectValue(session.session_id)].grantId, null, 'the Session was signed out');
 });
 
 test('PKCE mismatch, wrong redirect, wrong client and expired codes are invalid_grant and leave the code unused', async () => {
@@ -151,15 +156,15 @@ test('beginAuthorization validates the request before persisting it', async () =
     emptyScope: { scope: ' ' },
     invalid_target: { resource: 'https://api.shop.test/other' },
   };
-  const codes = { plainPkce: 'invalid_request', noPkce: 'invalid_request', shortChallenge: 'invalid_request', emptyScope: 'invalid_scope' };
+  const codes:Record<string,string> = { plainPkce: 'invalid_request', noPkce: 'invalid_request', shortChallenge: 'invalid_request', emptyScope: 'invalid_scope' };
   for (const [name, params] of Object.entries(redirected)) {
     const error = await env.issuer.beginAuthorization(authorizeRequest(params), BINDING).catch(error => error);
     assert.ok(error instanceof AuthorizationError, name);
     assert.equal(error.code, codes[name] ?? name, name);
-    assert.equal(`${error.redirectTo.origin}${error.redirectTo.pathname}`, REDIRECT, name);
-    assert.equal(error.redirectTo.searchParams.get('error'), error.code, name);
-    assert.equal(error.redirectTo.searchParams.get('iss'), ISSUER, name);
-    assert.equal(error.redirectTo.searchParams.get('state'), params.state === undefined && 'state' in params ? null : 'state-1', name);
+    assert.equal(`${expectValue(error.redirectTo).origin}${expectValue(error.redirectTo).pathname}`, REDIRECT, name);
+    assert.equal(expectValue(error.redirectTo).searchParams.get('error'), error.code, name);
+    assert.equal(expectValue(error.redirectTo).searchParams.get('iss'), ISSUER, name);
+    assert.equal(expectValue(error.redirectTo).searchParams.get('state'), ('state' in params?params.state:undefined) === undefined && 'state' in params ? null : 'state-1', name);
   }
   const duplicate = new Request(`${authorizeRequest().url}&scope=poppy:read`);
   assert.equal((await env.issuer.beginAuthorization(duplicate, BINDING).catch(error => error)).code, 'invalid_request');
@@ -224,7 +229,7 @@ test('refresh rotates the Account Token under a stable lineage without extending
   const fresh = await env.refresh(rotated.body.refresh_token, { resource: RESOURCE });
   assert.equal(fresh.status, 200); assert.notEqual(fresh.body.session_id, session.session_id);
   assert.equal(fresh.body.scope, 'poppy:read poppy:write', 'an earlier narrow request does not narrow the grant');
-  assert.equal((await env.issuer.authority.introspect(fresh.body.access_token, RESOURCE)).principal.accountId, 'acct_1');
+  assert.equal((await env.issuer.authority.introspect(expectValue(fresh.body.access_token), RESOURCE)).principal.accountId, 'acct_1');
   const general = await env.refresh(fresh.body.refresh_token, { session_id: fresh.body.session_id });
   assert.equal(general.status, 200); assert.equal((await env.introspect(general.body.access_token)).principal.accountId, 'acct_1');
 
@@ -239,7 +244,7 @@ test('refresh rotates the Account Token under a stable lineage without extending
   // Concurrent use of one Account Token: exactly one successor, and the loser's reuse revokes the lineage.
   const results = await Promise.all([env.refresh(general.body.refresh_token), env.refresh(general.body.refresh_token)]);
   assert.deepEqual(results.map(result => result.status).sort(), [200, 400]);
-  const winner = results.find(result => result.status === 200).body;
+  const winner = expectValue(results.find((result: { status: number; }) => result.status === 200)).body;
   expectError(await env.refresh(winner.refresh_token), 'invalid_grant');
   await assert.rejects(env.introspect(winner.access_token), { code: 'invalid_token' });
 
@@ -286,8 +291,8 @@ test('disconnect revokes the account sign-ins of that client and signs out their
   const a = await env.signIn(one.session_id);
   const b = await env.signIn(two.session_id, { accountId: 'acct_2' });
   await env.issuer.disconnect(CLIENT, 'acct_1');
-  assert.equal(env.store.state.sessions[one.session_id].grantId, null);
-  assert.equal(env.store.state.sessions[one.session_id].accountId, 'acct_1');
+  assert.equal(env.store.state.sessions[expectValue(one.session_id)].grantId, null);
+  assert.equal(env.store.state.sessions[expectValue(one.session_id)].accountId, 'acct_1');
   await assert.rejects(env.introspect(a.body.access_token), { code: 'invalid_token' });
   expectError(await env.refresh(a.body.refresh_token), 'invalid_grant');
   assert.equal((await env.introspect(b.body.access_token)).principal.accountId, 'acct_2');
@@ -305,7 +310,7 @@ test('disconnect deletes the unredeemed codes of that client and account; other 
   expectError(await env.exchange(session.session_id, mine), 'invalid_grant');
   assert.deepEqual(env.store.state.grants, {}, 'no sign-in was created from the deleted code');
   assert.equal((await env.exchange(session.session_id, otherAccount)).status, 200);
-  assert.equal(Object.values(env.store.state.codes).find(code => code.clientId === OTHER_CLIENT).accountId, 'acct_1');
+  assert.equal(expectValue(Object.values(env.store.state.codes).find(code => code.clientId === OTHER_CLIENT)).accountId, 'acct_1');
 });
 
 test('Sessions end after a day without tokens and expired records are pruned', async () => {
@@ -362,7 +367,7 @@ test('pending authorizations are capped until older ones expire', async () => {
   const refused = await env.issuer.beginAuthorization(authorizeRequest(), BINDING).catch(error => error);
   assert.ok(refused instanceof AuthorizationError);
   assert.equal(refused.code, 'temporarily_unavailable');
-  assert.deepEqual(Object.fromEntries(refused.redirectTo.searchParams), { error: 'temporarily_unavailable', state: 'state-1', iss: ISSUER });
+  assert.deepEqual(Object.fromEntries(expectValue(refused.redirectTo).searchParams), { error: 'temporarily_unavailable', state: 'state-1', iss: ISSUER });
   assert.equal(Object.keys(env.store.state.authorizations).length, 2);
   // Completing one frees a slot; so does expiry.
   await env.issuer.completeAuthorization(second.id, BINDING, { denied: true });
@@ -402,7 +407,7 @@ test('a rate_limited Session request rolls back: the same assertions and proof s
   const fields = { assertion: await env.assertion(), client_assertion: await env.clientAssertion() };
   const dpop = await env.proof();
   expectError(await env.send(fields, { dpop }), 'rate_limited', 429);
-  delete env.store.state.sessions[first.session_id]; // the Session ends
+  delete env.store.state.sessions[expectValue(first.session_id)]; // the Session ends
   assert.equal((await env.send(fields, { dpop })).status, 200, 'no jti was consumed by the refused request');
   expectError(await env.send(fields, { dpop }), 'invalid_grant'); // the accepted request did consume them
 });
@@ -421,7 +426,7 @@ test('only the current and previous Account Token hashes are retained per lineag
 test('issuer state of another version is refused, not misread', async () => {
   const env = await signInSetup();
   const session = await env.session();
-  env.store.state = { ...env.store.state, version: 1 };
+  Object.assign(env.store.state,{version:1});
   await assert.rejects(env.send({ session_id: session.session_id }), /unsupported issuer state version/);
   await assert.rejects(env.introspect(session.access_token), /unsupported issuer state version/);
   await assert.rejects(env.issuer.disconnect(CLIENT, 'acct_1'), /unsupported issuer state version/);

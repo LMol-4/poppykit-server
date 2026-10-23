@@ -23,6 +23,14 @@ counts, SHA256 and npm SHA512 integrity to those unchanged tarballs.
 | validation | Release failure simulations, registry/toolchain guards and actual workflow wiring assertions |
 | gate | Always report; require each allowlisted job result to equal success and recheck artifact identity |
 
+The candidate job strictly typechecks and compiles the complete TypeScript test
+harness once before packing. It uploads a separate same-run `test-harness`
+artifact, never inside an npm candidate. Each unprivileged test/OS job checks the
+full source commit, complete canonical source inventory, exact LF source hashes
+and exact emitted-output hashes before using that harness. Runtime/packaged checks
+still import the unchanged candidate's installed JavaScript and execute real npm
+shims. The publisher consumes only tested npm tarballs and never the harness.
+
 All deterministic source tests run once on Linux, partitioned by
 `.github/test-groups.json`. Its runner rejects unassigned/duplicate test files.
 The CLI does not rerun complete SDK suites. It checks out the exact full client
@@ -174,3 +182,10 @@ version, update dependent pins/lockfiles/release notes and verify a new candidat
 
 This runbook does not authorize publication, tag pushes, package ownership changes,
 external settings, deployment or demo implementation.
+
+Candidate metadata is inspected with the archive basename and its directory as
+`cwd`. This avoids GNU tar interpreting a Windows drive colon as a remote archive;
+stderr is preserved in failure diagnostics. Negative checks exercise GNU tar on
+Windows with space/Unicode candidate paths and retain wrong/missing/changed bytes
+and fail-closed gate cases. Local success does not certify a future hosted run or
+any newly packed bytes.

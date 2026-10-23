@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,access} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,delimiter} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {mandatory,successful,identity,inspect,check} from '../scripts/release-candidate.mjs';
@@ -19,8 +19,11 @@ test('release identity rejects wrong commit version tag ref and repository',()=>
   const good={commit,expectedCommit:commit,version:'1.2.3',expectedVersion:'1.2.3',tag:'v1.2.3',ref:'refs/tags/v1.2.3',release:true,repository:'o/r',expectedRepository:'o/r'};identity(good);
   for(const [key,value] of [['commit','b'.repeat(40)],['expectedCommit',''],['version','1.2.4'],['expectedVersion','2.0.0'],['tag','latest'],['ref','refs/heads/main'],['repository','attacker/r']])assert.throws(()=>identity({...good,[key]:value}),key);
 });
-test('real candidate checks reject missing artifacts tampering and changed manifests',async()=>{
+test('real candidate checks reject missing artifacts tampering and changed manifests',async t=>{
   const dir=await mkdtemp(join(tmpdir(),'release gate ü '));
+  const originalPath=process.env.PATH;
+  // Git Bash selects GNU tar, whose archive parser treats a drive colon as a remote host.
+  if(process.platform==='win32'){const tools=join(process.env.ProgramFiles??'C:/Program Files','Git/usr/bin');await access(join(tools,'tar.exe'));process.env.PATH=tools+delimiter+(originalPath??'');}
   const old=process.env.GITHUB_SHA;process.env.GITHUB_SHA=commit;
   try{
     const root=new URL('../',import.meta.url),pkg=JSON.parse(await readFile(new URL('package.json',root),'utf8'));
@@ -31,10 +34,10 @@ test('real candidate checks reject missing artifacts tampering and changed manif
     }
     for(const spec of specs){
       const source=join(dir,spec.name.split('/')[1]);await mkdir(join(source,'package'),{recursive:true});await writeFile(join(source,'package/package.json'),JSON.stringify(spec));
-      const tar=spawnSync('tar',['-czf',join(dir,`${spec.name.replace('@','').replace('/','-')}-${spec.version}.tgz`),'-C',source,'package'],{windowsHide:true});assert.equal(tar.status,0);
+      const tar=spawnSync('tar',['-czf',`${spec.name.replace('@','').replace('/','-')}-${spec.version}.tgz`,'-C',source,'package'],{cwd:dir,windowsHide:true,encoding:'utf8'});assert.equal(tar.status,0,tar.stderr);
     }
     const manifest=await inspect(dir),bytes=JSON.stringify(manifest),sha=createHash('sha256').update(bytes).digest('hex');await writeFile(join(dir,'release-manifest.json'),bytes);
-    assert.deepEqual(await check(dir,sha),manifest);
+    await t.test('GNU tar inspects absolute space and Unicode candidate paths',async()=>assert.deepEqual(await check(dir,sha),manifest));
     // Exercise the real gate executable and its output boundary without any publisher.
     const actualCommit=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8',windowsHide:true}).stdout.trim();
     process.env.GITHUB_SHA=actualCommit;
@@ -58,5 +61,5 @@ test('real candidate checks reject missing artifacts tampering and changed manif
     await rm(file);await assert.rejects(check(dir,sha));await writeFile(file,original);
     await writeFile(file,Buffer.concat([original,Buffer.from('tampered')]));await assert.rejects(check(dir,sha));await writeFile(file,original);
     await writeFile(join(dir,'release-manifest.json'),bytes+' ');await assert.rejects(check(dir,sha));
-  }finally{if(old===undefined)delete process.env.GITHUB_SHA;else process.env.GITHUB_SHA=old;await rm(dir,{recursive:true,force:true});}
+  }finally{if(originalPath===undefined)delete process.env.PATH;else process.env.PATH=originalPath;if(old===undefined)delete process.env.GITHUB_SHA;else process.env.GITHUB_SHA=old;await rm(dir,{recursive:true,force:true});}
 });
