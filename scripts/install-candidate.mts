@@ -9,7 +9,10 @@ const npmCli=process.env.npm_execpath??join(dirname(process.execPath),'node_modu
 if(process.platform==='win32')await access(npmCli);
 const executable=process.platform==='win32'?process.execPath:'npm';
 const prefix=process.platform==='win32'?[npmCli]:[];
-const result=spawnSync(executable,[...prefix,'install','--prefix',target,'--ignore-scripts','--no-package-lock','--no-audit','--no-fund',...manifest.files.map((row:{name:string})=>join(base,row.name))],{stdio:'inherit',windowsHide:true});
+// All-subpath verification deliberately opts into the optional PostgreSQL driver.
+const driver:unknown=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8')).devDependencies?.pg;
+assert.ok(typeof driver==='string'&&/^\d+\.\d+\.\d+$/.test(driver),'exact Postgres test driver pin required');
+const result=spawnSync(executable,[...prefix,'install','--prefix',target,'--ignore-scripts','--no-package-lock','--no-audit','--no-fund',...manifest.files.map((row:{name:string})=>join(base,row.name)),'pg@'+driver],{stdio:'inherit',windowsHide:true});
 assert.equal(result.status,0,'candidate install failed');
 if(mode==='source')await cp(join(target,'node_modules',manifest.package,'dist'),resolve('dist'),{recursive:true});
 console.log(target);
