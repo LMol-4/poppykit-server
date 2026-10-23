@@ -1,0 +1,16 @@
+CREATE SCHEMA poppy_server;
+CREATE TABLE poppy_server.schema_version (version integer PRIMARY KEY CHECK(version > 0));
+INSERT INTO poppy_server.schema_version VALUES (1);
+CREATE TABLE poppy_server.records (ns text NOT NULL, kind text NOT NULL, id text NOT NULL, body text NOT NULL CHECK (body::jsonb IS NOT NULL), ordinal bigint GENERATED ALWAYS AS IDENTITY, PRIMARY KEY(ns,kind,id));
+CREATE INDEX by_conversation ON poppy_server.records (ns,kind,(body::jsonb#>>'{conversationId}'));
+CREATE INDEX by_binding ON poppy_server.records (ns,kind,(body::jsonb#>>'{bindingId}'));
+CREATE INDEX by_client ON poppy_server.records (ns,kind,(body::jsonb#>>'{clientId}'));
+CREATE INDEX by_account ON poppy_server.records (ns,kind,(body::jsonb#>>'{accountId}'));
+CREATE INDEX by_grant ON poppy_server.records (ns,kind,(body::jsonb#>>'{grantId}'));
+CREATE INDEX by_phase ON poppy_server.records (ns,kind,(body::jsonb#>>'{phase}'));
+CREATE INDEX by_expiry ON poppy_server.records (ns,kind,((body::jsonb#>>'{expiresAt}')::double precision));
+CREATE INDEX by_connection ON poppy_server.records (ns,kind,(body::jsonb#>>'{connectionId}'));
+CREATE INDEX by_callback ON poppy_server.records (ns,kind,(body::jsonb#>>'{direct,stateHash}'));
+CREATE TABLE poppy_server.events (ns text NOT NULL, conversation text NOT NULL, seq bigint NOT NULL, body text NOT NULL, PRIMARY KEY(ns,conversation,seq));
+CREATE INDEX last_user_event ON poppy_server.events(ns,conversation,((body::jsonb)->>'type'),((body::jsonb)#>>'{message,role}'),seq);
+CREATE TABLE poppy_server.event_cursors (ns text NOT NULL, conversation text NOT NULL, id text NOT NULL, seq bigint NOT NULL, PRIMARY KEY(ns,conversation,id), UNIQUE(ns,conversation,seq));

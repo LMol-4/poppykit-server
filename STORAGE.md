@@ -110,3 +110,71 @@ state. Default payload retention is indefinite; operators should retain at least
 30 days and explicitly choose any shorter policy. See [DELIVERY.md](DELIVERY.md)
 for distinct lifetimes and client recovery behavior. No automatic destructive
 reset or history deletion was added.
+
+## Postgres
+
+`@poppykit/server/postgres` ships `PostgresCompanyDatabase`, explicit migrations,
+and `createPostgresPool` in this package. Install optional peer `pg@8.23.1` when
+using that subpath. Core/reference-auth imports load neither database driver.
+Supported baseline: Node 24.12+, PostgreSQL 17, including Supabase transaction pooling.
+No application, Google login or Supabase Auth dependency is required.
+
+```ts
+import { createPostgresPool, migratePostgres,
+  PostgresCompanyDatabase } from '@poppykit/server/postgres';
+const pool = createPostgresPool({ connectionString: process.env.DATABASE_URL });
+// Explicit operator/deployment migration; do this before handling requests.
+await migratePostgres(pool, 'poppy_server');
+const database = new PostgresCompanyDatabase(pool);
+const issuerStore = database.issuer('https://company.example/issuer');
+const conversationStore = database.conversations('https://company.example/issuer');
+// Reference issuer: store: issuerStore, coordinator: database.
+// Conversation service: store: conversationStore, policy: issuer.authority.policy.
+await database.close(); // after in-flight requests end; leaves caller pool open
+await pool.end();
+```
+
+Use one database object for issuer/coordinator/conversations. `withTransaction`
+passes a generic query connection to host DB work inside that same transaction:
+
+```ts
+await issuer.authority.policy.withCurrent(principal, ['records:write'], () =>
+  database.withTransaction(async connection => {
+    await connection.query('UPDATE application.records SET value=$1 WHERE owner=$2',
+      [validatedValue, trustedAccountId]);
+  }));
+```
+
+The policy holds the issuer authority fence through commit; revocation waits or
+wins before mutation. The host must still validate ownership, payload digests,
+current business revisions and its own idempotency receipts. Issuer namespace
+metadata and per-conversation binding/message locks use transaction-scoped advisory
+locks, including absent keys; no process mutex or session lock substitutes for them.
+Nested mutations use savepoints. Await nested mutations sequentially: overlapping
+siblings reject explicitly, while recursion is supported. Escaped query handles
+reject after their scope ends. External model/network/KMS calls belong outside this
+boundary. Fences do not make arbitrary external effects exactly-once.
+
+Pool defaults are max 2, acquisition 3s/idle 10s, verified TLS; configure a trusted
+CA through `ssl`, never insecure TLS URL overrides. Explicit `ssl:false` is for a
+trusted local test server. Caller-created pools remain their owner's responsibility.
+Transactions/statements are bounded to 5s, lock waits 2s, with unnamed parameterized
+queries and one checkout from BEGIN to COMMIT/ROLLBACK. No LISTEN, named prepares
+or session state is required. `close` never closes a caller-supplied pool; callers
+of `createPostgresPool` own and must end that pool.
+
+Immutable SQL ships at `migrations/postgres/0001_poppy_server.sql`.
+`postgresMigration('poppy_server')` returns reviewable SQL and
+`migratePostgres(pool,'poppy_server')` is the explicit atomic apply/version check.
+No constructor/request-time DDL or automatic SQLite import/reset exists. Unknown or
+missing versions fail closed. Version 1 does not certify arbitrary manual table
+edits: inspect migration history and reconcile drift before applying new versions.
+Applied migrations are immutable, corrections require new versioned files. Back up,
+review and rehearse live changes; roll application code back only to compatible
+schemas, or restore a reviewed backup for destructive reversal. No populated-schema
+drop/downgrade is automated. The disposable test runner is development tooling,
+never a production migration command.
+
+`runIssuerAdapterContract` joins the existing reusable conversation contract in
+`@poppykit/server/adapter-contract`. Run both against two fresh shared handles;
+process death, lock ordering and DB durability still require backend-specific tests.

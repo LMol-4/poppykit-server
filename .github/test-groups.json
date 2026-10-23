@@ -15,7 +15,11 @@
     "tests/conversation/delivery.test.mts",
     "tests/conversation/lifecycle.test.mts",
     "tests/conversation/requests.test.mts",
-    "tests/conversation/service.test.mts"
+    "tests/conversation/service.test.mts",
+    "tests/postgres-storage.test.mts",
+    "tests/postgres-lifecycle.test.mts",
+    "tests/issuer-contract.test.mts",
+    "tests/conversation/postgres-adapter-contract.test.mts"
   ],
   "integration": [
     "tests/integrations.test.mts",

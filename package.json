@@ -1,6 +1,6 @@
 {
   "name": "@poppykit/server",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": false,
   "description": "Personal Agent Protocol company SDK",
   "repository": {
@@ -24,7 +24,9 @@
   },
   "devDependencies": {
     "@types/node": "24.10.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "pg": "8.23.1",
+    "@types/pg": "8.23.1"
   },
   "files": [
     "dist",
@@ -39,7 +41,8 @@
     "CHANGELOG.md",
     "RELEASING.md",
     "examples",
-    "LICENSE"
+    "LICENSE",
+    "migrations"
   ],
   "exports": {
     ".": {
@@ -57,6 +60,10 @@
     "./sqlite": {
       "types": "./dist/sqlite.d.ts",
       "import": "./dist/sqlite.js"
+    },
+    "./postgres": {
+      "types": "./dist/postgres.d.ts",
+      "import": "./dist/postgres.js"
     }
   },
   "dependencies": {
@@ -65,5 +72,13 @@
   "license": "MIT",
   "publishConfig": {
     "access": "public"
+  },
+  "peerDependencies": {
+    "pg": "^8.23.1"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
   }
 }

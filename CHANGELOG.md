@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 (release candidate)
+
+Add bundled Postgres company stores/coordinator with explicit migrations, atomic host transaction composition, savepoints and pool lifecycle.
+
 ## 0.1.1
 
 Documentation refresh: registry installation, runnable quickstarts, focused guides

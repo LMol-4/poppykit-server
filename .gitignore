@@ -79,3 +79,16 @@ coverage/
 /scripts/install-candidate.mjs
 
 /tests/license.test.mjs
+
+/scripts/postgres-check.mjs
+/scripts/postgres-check.mjs.map
+/test-support/postgres.mjs
+/test-support/postgres.mjs.map
+/tests/conversation/postgres-adapter-contract.test.mjs
+/tests/conversation/postgres-adapter-contract.test.mjs.map
+/tests/issuer-contract.test.mjs
+/tests/issuer-contract.test.mjs.map
+/tests/postgres-lifecycle.test.mjs
+/tests/postgres-lifecycle.test.mjs.map
+/tests/postgres-storage.test.mjs
+/tests/postgres-storage.test.mjs.map

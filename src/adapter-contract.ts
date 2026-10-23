@@ -7,6 +7,21 @@ import { AuthorityError } from './auth/authority.js';
 import type { AuthorityPolicy, Principal } from './auth/authority.js';
 import { createConversationService, resetConversationState } from './conversation/service.js';
 import type { ConversationOptions, ConversationService, WorkRef } from './conversation/service.js';
+import type { IssuerStore } from './reference-auth/store.js';
+export type IssuerAdapterFixture = () => Promise<{store:IssuerStore;second:IssuerStore;close():Promise<void>}>;
+/** A fresh shared namespace, including absent-row serialization; no vendor-specific fixture is required. */
+export function runIssuerAdapterContract(fixture:IssuerAdapterFixture):void {
+  test('issuer adapter contract: replay updates serialize, snapshots detach and failed callbacks roll back',async()=>{
+    const f=await fixture(), selection={kind:'browser',sessionId:'absent',replayKey:'counter'} as const;
+    try {
+      await Promise.all(Array.from({length:10},(_,i)=>(i%2?f.store:f.second).transaction(selection,state=>{state.replay.counter=(state.replay.counter??0)+1;})));
+      const state=await f.store.read(selection);assert.equal(state.replay.counter,10);state.replay.counter=999;
+      await assert.rejects(f.store.transaction(selection,draft=>{draft.replay.counter=0;throw new Error('rollback');}),/rollback/);
+      await assert.rejects(f.store.transaction(selection,async draft=>{draft.replay.counter=0;}));
+      assert.equal((await f.second.read(selection)).replay.counter,10);
+    } finally {await f.close();}
+  });
+}
 
 type Store = ConversationOptions['store'] & { inspect(): Promise<import('./conversation/service.js').ConversationStoreState>; adminTransaction<T>(change: (draft: import('./conversation/service.js').ConversationStoreState) => T): Promise<T> };
 export type ConversationAdapterFixture = () => Promise<{ store: Store; second: Store; close(): Promise<void> }>;
@@ -52,6 +67,17 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     const opened = await fixture();
     try { await body(opened); } finally { await opened.close(); }
   }
+
+  test('adapter contract: concurrent conflicting output retries publish one immutable result',()=>withFixture(async({store,second})=>{
+    const a=serviceOn(store,clock),b=serviceOn(second,clock);
+    const id=(await call(a,'','signedOut',{message})).body.conversation_id;
+    const work=(await a.claim())!;
+    const results=await Promise.allSettled([a.reply(work,'same-call',reply),b.reply(work,'same-call',{...reply,text:'conflicting result'})]);
+    assert.equal(results.filter(result=>result.status==='fulfilled').length,1);
+    const failed=results.find(result=>result.status==='rejected');assert.ok(failed&&failed.status==='rejected');assert.equal(failed.reason.code,'output_conflict');
+    const events=(await call(a,`/${id}/events`,'signedOut')).body.events as {message?:{id:string}}[];
+    assert.equal(events.filter(event=>event.message?.id===reply.id).length,1);
+  }));
 
   test('adapter contract: reads and results are detached; failed, non-JSON and async changes roll back', () => withFixture(async ({ store, second }) => {
     const snapshot = await store.inspect();

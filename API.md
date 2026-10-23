@@ -19,3 +19,7 @@ and do not need the optional reference issuer. Your framework owns HTTPS routing
 trusted public URLs, ingress limits, request cancellation and private-error handling.
 
 Run the [quickstart](examples/quickstart.mjs) without a listener or external service.
+
+The optional Postgres entry point ships its adapters, `createPostgresPool`,
+`postgresMigration`, `migratePostgres` and schema-version export; see [storage](STORAGE.md).
+TypeScript Postgres consumers also install `@types/pg@8.23.1` as a development dependency.
