@@ -1,9 +1,11 @@
 # Release preparation and owner runbook
 
-These packages are private, unpublished development version **0.0.0**. Their
-metadata records **UNLICENSED** because no public license grant has been selected.
-That is a reserved-rights state, not a new license. Do not remove private, select
-a license, reserve package names or publish without owner authorization.
+The owner selected the **MIT** license and initial development version **0.1.0**.
+`private: false`, `publishConfig.access: public` and the shipped [LICENSE](LICENSE)
+prepare these candidates for a public release; they do not publish anything.
+No package has been published. Tags, npm publication and external settings remain
+separate owner-authorized actions. This is an initial 0.x release, not a stable 1.0
+compatibility promise.
 
 ## Verification graph
 
@@ -103,10 +105,10 @@ Rechecked against [npm trusted publishers](https://docs.npmjs.com/trusted-publis
 [deployment environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
 on **2026-10-23**. Recheck those live requirements before first publication:
 
-1. Confirm npm scope/package-name ownership and authorized maintainers. Select
-   the actual license, add its complete license file to the allowlist if applicable,
-   choose a public semantic version and record release notes. Only then authorize
-   changing private to false and UNLICENSED to the owner's selected license.
+1. The owner confirmed the `@poppykit` scope and selected MIT/version 0.1.0.
+   Confirm the actual publishing account has package-name/maintainer rights and
+   the chosen version is unused. The complete LICENSE is in the package allowlist
+   and release notes describe this initial development candidate.
    Confirm repository.url exactly matches the actual GitHub repository.
 2. Protect main, release tags, Actions files/scripts and candidate pins with
    repository rules and review/CODEOWNERS appropriate to the actual team. Require
@@ -159,8 +161,8 @@ publication must be manual, an authorized owner uses their own current npm login
 2FA or narrowly scoped supported bootstrap credential to publish those exact bytes,
 then removes temporary credentials and configures the trusted publisher. Record
 the resulting version/integrity/provenance. A dry run is not proof of bootstrap
-permissions or production OIDC authentication. Current 0.0.0/private candidates
-cannot be published through the prepared workflow.
+permissions or production OIDC authentication. Current 0.1.0 candidates have public-ready metadata, but publication still
+requires all exact-byte checks, owner settings and separate authorization.
 
 ## Package order, existing versions and partial recovery
 

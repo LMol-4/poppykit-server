@@ -1,5 +1,7 @@
 {
-  "unit": [],
+  "unit": [
+    "tests/license.test.mts"
+  ],
   "contracts": [
     "tests/storage.test.mts",
     "tests/network/network.test.mts",

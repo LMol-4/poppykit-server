@@ -11,10 +11,11 @@ Requires Node **24.12.0 or later** and ESM. CI certifies Node 24.12.0; later maj
 have no separate certification. Optional SQLite uses experimental `node:sqlite`
 and requires local filesystem locking.
 
-The package is **private and unpublished, version 0.0.0**. Install a verified tarball:
+Version **0.1.0** is an initial development release candidate under the [MIT license](LICENSE).
+It has not been published. Install a verified tarball:
 
 ```sh
-npm install ./poppykit-server-0.0.0.tgz
+npm install ./poppykit-server-0.1.0.tgz
 ```
 
 The only production dependency is `jose@6.2.12`. Neither client SDK nor CLI is required.

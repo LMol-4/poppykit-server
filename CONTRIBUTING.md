@@ -16,8 +16,9 @@ Keep changes small and complete: include callers, declarations, regression check
 and documentation. Do not log credentials, weaken destination validation or silently
 reset persisted data. Pull requests must explain checks actually run and limitations.
 Use the repository's Issues for non-sensitive defects and feature discussions.
-No public contribution license/CLA has been selected; ask the owner before accepting
-third-party rights or publishing code.
+Code is licensed under [MIT](LICENSE). No separate contribution agreement is
+configured; confirm permission for third-party contributions and obtain owner
+authorization before publishing.
 
 ## TypeScript test harness and coverage
 

@@ -1,7 +1,7 @@
 {
   "name": "@poppykit/server",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "private": false,
   "description": "Personal Agent Protocol company SDK",
   "repository": {
     "type": "git",
@@ -38,7 +38,8 @@
     "SECURITY.md",
     "CHANGELOG.md",
     "RELEASING.md",
-    "examples"
+    "examples",
+    "LICENSE"
   ],
   "exports": {
     ".": {
@@ -61,5 +62,8 @@
   "dependencies": {
     "jose": "6.2.12"
   },
-  "license": "UNLICENSED"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }
