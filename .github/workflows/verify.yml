@@ -1,0 +1,292 @@
+name: Verify candidate
+on:
+  workflow_call:
+    inputs:
+      release-context:
+        type: boolean
+        default: false
+      version:
+        type: string
+        default: ''
+      tag:
+        type: string
+        default: ''
+      expected-sha:
+        type: string
+        default: ''
+    outputs:
+      ready:
+        value: ${{ jobs.gate.outputs.ready }}
+      manifest-sha:
+        value: ${{ jobs.candidate.outputs.manifest-sha }}
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+env:
+  RELEASE_CONTEXT: ${{ inputs.release-context }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  EXPECTED_SHA: ${{ inputs.expected-sha }}
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      manifest-sha: ${{ steps.manifest.outputs.manifest-sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: '11.25.0'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4; release builds never restore dependency caches
+        if: ${{ !inputs.release-context }}
+        with:
+          node-version: '24.12.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run build
+      - run: mkdir -p .candidate/artifacts
+      - run: npm pack --ignore-scripts --pack-destination .candidate/artifacts
+      - id: manifest
+        run: node scripts/release-candidate.mjs write .candidate/artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4; consumed only within this run
+        with:
+          name: candidates
+          path: .candidate/artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+  fast:
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: '11.25.0'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node scripts/install-candidate.mjs .candidate/artifacts source
+      - run: node scripts/check-docs.mjs 2>&1 | tee .candidate/docs.log
+      - run: node scripts/run-checks.mjs unit 2>&1 | tee .candidate/unit.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  contracts:
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: '11.25.0'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node scripts/install-candidate.mjs .candidate/artifacts source
+      - run: node scripts/run-checks.mjs contracts 2>&1 | tee .candidate/contracts.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  integration:
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: '11.25.0'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node scripts/install-candidate.mjs .candidate/artifacts source
+      - run: node scripts/run-checks.mjs integration 2>&1 | tee .candidate/integration.log
+      - run: node scripts/declaration-check.mjs ".candidate/artifacts/clean install ü" 2>&1 | tee .candidate/declarations.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  packaged-linux:
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: node scripts/install-candidate.mjs .candidate/artifacts
+      - run: node scripts/packaged-check.mjs ".candidate/artifacts/clean install ü" 2>&1 | tee .candidate/packaged.log
+        env:
+          POPPYKIT_TEST_PROVIDER_ORIGIN: https://operator-secondary.example
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  packaged-windows:
+    needs: candidate
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: node scripts/install-candidate.mjs .candidate/artifacts
+      - run: node scripts/packaged-check.mjs ".candidate/artifacts/clean install ü" 2>&1 | tee .candidate/packaged.log
+        env:
+          POPPYKIT_TEST_PROVIDER_ORIGIN: https://operator-secondary.example
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  packaged-macos:
+    needs: candidate
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: node scripts/install-candidate.mjs .candidate/artifacts
+      - run: node scripts/packaged-check.mjs ".candidate/artifacts/clean install ü" 2>&1 | tee .candidate/packaged.log
+        env:
+          POPPYKIT_TEST_PROVIDER_ORIGIN: https://operator-secondary.example
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: failure-${{ github.job }}
+          path: .candidate/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+  validation:
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - run: node scripts/run-checks.mjs validation
+  gate:
+    if: always()
+    needs: [candidate, fast, contracts, integration, packaged-linux, packaged-windows, packaged-macos, validation]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.12.0'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - run: node scripts/release-candidate.mjs check .candidate/artifacts
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}
+      - id: gate
+        run: node scripts/release-candidate.mjs gate .candidate/artifacts
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EXPECTED_MANIFEST_SHA: ${{ needs.candidate.outputs.manifest-sha }}

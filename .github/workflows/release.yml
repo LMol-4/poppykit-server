@@ -1,0 +1,69 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact package version
+        type: string
+        required: true
+      tag:
+        description: Exact existing vVERSION tag; dispatch this tag
+        type: string
+        required: true
+      commit:
+        description: Exact full tagged commit SHA
+        type: string
+        required: true
+      publish:
+        description: Publish after verification and protected environment approval
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: npm-publication-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      release-context: true
+      version: ${{ inputs.version }}
+      tag: ${{ inputs.tag }}
+      expected-sha: ${{ inputs.commit }}
+  publish:
+    if: ${{ inputs.publish && needs.verify.result == 'success' && needs.verify.outputs.ready == 'true' }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_CONTEXT: 'true'
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_SHA: ${{ inputs.commit }}
+      EXPECTED_MANIFEST_SHA: ${{ needs.verify.outputs.manifest-sha }}
+      NPM_PUBLISH_ENABLED: ${{ vars.NPM_PUBLISH_ENABLED }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4; no cache or install in the publishing job
+        with:
+          node-version: '24.12.0'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4; same-run artifacts only
+        with:
+          name: candidates
+          path: .candidate/artifacts
+      - id: candidate
+        run: node scripts/release-candidate.mjs publish-check .candidate/artifacts
+      - run: node scripts/registry-check.mjs .candidate/artifacts
+      - run: npm publish "$TARBALL" --access public --provenance --ignore-scripts
+        env:
+          TARBALL: ${{ steps.candidate.outputs.tarball }}
