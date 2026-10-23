@@ -48,7 +48,11 @@ export async function migratePostgres(pool: Pool, schema: PostgresSchema): Promi
   finally { client.release(); }
 }
 
-type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean };
+type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean; parent?: Context };
+function scopeActive(context: Context): boolean {
+  for (let scope: Context | undefined = context; scope; scope = scope.parent) if (!scope.active || !scope.state.active) return false;
+  return true;
+}
 export class PostgresRuntime {
   private readonly context = new AsyncLocalStorage<Context>();
   private closed = false;
@@ -59,19 +63,22 @@ export class PostgresRuntime {
     if (this.closed) throw new Error('Postgres adapter is closed');
     const parent = this.context.getStore();
     if (parent) {
-      if (!parent.active || !parent.state.active) throw new Error('expired Postgres transaction');
+      if (!scopeActive(parent)) throw new Error('expired Postgres transaction');
       if (parent.childActive) throw new Error('concurrent nested Postgres transactions are unsupported; await each mutation');
       parent.childActive = true;
       const savepoint = `nested_${++parent.state.serial}`;
-      const child: Context = { ...parent, active: true, childActive: false, locks: new Set(parent.locks) };
+      const child: Context = { ...parent, parent, active: true, childActive: false, locks: new Set(parent.locks) };
       let started = false;
       try {
         await parent.client.query(`SAVEPOINT ${savepoint}`); started = true;
         const result = await this.context.run(child, action);
-        if (!parent.state.active) throw new Error('expired Postgres transaction');
+        if (!scopeActive(child)) throw new Error('expired Postgres transaction');
+        if (child.childActive) throw new Error('unawaited nested Postgres transaction');
+        child.active = false;
         await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); parent.locks = child.locks; return result;
       } catch (error) {
-        if (started && parent.state.active) { await parent.client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`); await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); }
+        child.active = false;
+        if (started && scopeActive(parent)) { await parent.client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`); await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); }
         throw error;
       } finally { child.active = false; parent.childActive = false; }
     }
@@ -92,9 +99,9 @@ export class PostgresRuntime {
   }
   connection(): PostgresConnection {
     const context = this.context.getStore();
-    if (!context?.active || !context.state.active) throw new Error('no active Postgres transaction');
+    if (!context || !scopeActive(context)) throw new Error('no active Postgres transaction');
     return { query: async (sql, values) => {
-      if (!context.active || !context.state.active || this.context.getStore() !== context) throw new Error('expired Postgres transaction');
+      if (!scopeActive(context) || this.context.getStore() !== context) throw new Error('expired Postgres transaction');
       if (context.childActive) throw new Error('concurrent Postgres transaction use is unsupported; await each mutation');
       return context.client.query(sql, values);
     } };
@@ -104,7 +111,7 @@ export class PostgresRuntime {
   }
   async lock(key: string): Promise<void> {
     const context = this.context.getStore();
-    if (!context?.active || !context.state.active) throw new Error('no active Postgres transaction');
+    if (!context || !scopeActive(context)) throw new Error('no active Postgres transaction');
     if (!context.locks.has(key)) { await this.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`${this.schema}:${key}`]); context.locks.add(key); }
   }
 }
