@@ -1,59 +1,116 @@
 # PoppyKit server
 
-J1 supplies targeted storage contracts and an optional SQLite company database.
-See [STORAGE.md](STORAGE.md) for Node requirements, adapter setup, atomic
-authorization/revocation ordering, recovery guarantees and reset instructions.
+TypeScript SDK for companies exposing services through [Personal Agent Protocol
+draft 0.2](https://personalagentprotocol.org/docs/0.2/spec). Verify requests, serve
+JSON/SSE conversations, enforce current permissions, support browser-session joining
+and accept feedback. Your company owns accounts, consent UI, agent and business tools.
 
-Designed to be integrated into an existing company's backend. The SDK implements
-Poppy protocol handling through adapters; the company owns its account system,
-authorization policy, persistence, agent runtime and business tools. No hosted
-PoppyKit service or particular model provider is required.
+## Installation
 
-The embedding company supplies login pages, account data, and its agent runtime.
-Demo applications are deferred and are not dependencies of this SDK. Poppy authorization
-semantics are available as an optional experimental reference module; conversation
-serving also supports a compatible external issuer and does not require that
-module's storage, an agent handler or a worker queue. Application services publish
-through SDK-validated operations; storage adapters supply atomic persistence.
+Requires Node **24.12.0 or later** and ESM. CI certifies Node 24.12.0; later majors
+have no separate certification. Optional SQLite uses experimental `node:sqlite`
+and requires local filesystem locking.
 
-Company-side TypeScript SDK for authentication verification and agent conversations.
+The package is **private and unpublished, version 0.0.0**. Install a verified tarball:
 
-Status (2026-10-22): unpublished implementation of request authentication,
-an optional Direct/Device/Mediated reference issuer, and JSON conversation lifecycle and
-publication. Known correctness issues remain; durable production adapters and
-complete protocol conformance have not been established.
+```sh
+npm install ./poppykit-server-0.0.0.tgz
+```
 
-Targets the current [Personal Agent Protocol draft 0.2 specification](https://personalagentprotocol.org/docs/0.2/spec)
-and [guides](https://personalagentprotocol.org/docs/0.2/guides).
+The only production dependency is `jose@6.2.12`. Neither client SDK nor CLI is required.
+First-publication preparation is in [RELEASING.md](RELEASING.md).
 
-The October 19 source pin is historical evidence, not overriding authority.
-See [AUTH.md](AUTH.md) for method configuration, trusted hooks, scope/attempt
-policy and account-isolated revocation fences. The reviewed programme also adds
-streaming, API/browser integration, and feedback. These are planned capabilities,
-not features available in this checkout. The personal-agent hosted identity
-reference belongs with the client SDK and remains separate from this company's
-reference issuer, even when one operator hosts both.
+## Quickstart
 
-Accepted work may outlive its original Session Token. Hosts explicitly choose
-whether account work already in progress stops after revocation; new requests
-still require current access. Account-bound conversations remain open but reject
-signed-out access. Official schemas and the partial upstream validator supplement,
-but do not replace, normative prose and behavioral conformance tests.
+The complete [quickstart](examples/quickstart.mjs) creates an optional reference
+issuer, verified request authenticator and conversation service, then checks that
+an unauthenticated request is rejected. It starts no network listener:
 
-This is an independent implementation with behavioral tests and a partial review;
-complete protocol conformance and clean-package/platform verification remain open.
+```sh
+node examples/quickstart.mjs
+```
 
-Creating this repository does not reserve a name on npm, PyPI, or crates.io.
+Its essential service configuration is:
 
+```js
+import { createRequestAuthenticator, createConversationService } from '@poppykit/server';
+const conversations = createConversationService({
+  endpoint, store: database.conversations(issuer), policy: auth.authority.policy,
+  authenticator: createRequestAuthenticator({ authority: auth.authority,
+    endpoints: [{ origin: 'https://company.example', pathPrefix: '/conversations', resource: endpoint }],
+    now: Date.now }), clock: { now: Date.now },
+});
+```
 
-## Package names
+`database`, `auth`, `issuer` and `endpoint` are created in the runnable example.
+Use a private database file for persistence and your HTTPS framework to route
+trusted public Requests to `conversations.handle(request)`. Configure company
+account/consent hooks before advertising sign-in methods.
 
-- npm: @poppykit/server
-- Future PyPI distribution: poppykit-server (Python import: poppykit_server)
-- Future crates.io package: poppykit-server (Rust library name: poppykit_server, if applicable)
+## Configuration and authentication
 
-These are intended names, not reserved registry packages. Python and Rust implementations are not yet present.
+Existing issuers integrate through `ExternalAuthorityAdapter`: provide token
+introspection, an explicit revocation-visibility guarantee and `AuthorityPolicy`
+that orders checks with protected writes. `createRequestAuthenticator` verifies
+the actual public method/URL and DPoP/resource binding. Resolve public URLs at
+your trusted proxy boundary; do not trust arbitrary forwarded headers. Core
+imports do not load or run the optional reference issuer.
 
+The separate `/reference-auth` implements Direct, Device and Mediated flows.
+Configure endpoints/trusted hooks, publish discovery/authorization metadata and
+route token/revocation and method handlers. Your company authenticates humans,
+protects consent with browser sessions/CSRF, delivers/verifies codes and chooses
+scopes. Opening a consent link never approves it. See [AUTH.md](AUTH.md).
 
-See [DELIVERY.md](DELIVERY.md) for durable event windows, notification hints,
-SSE backpressure, byte-budgeted acceptance and record-specific retention.
+## Examples and common operations
+
+Route protocol requests to `conversations.handle(request)`. Workers use `claim`,
+`reply`, `finish` and lifecycle methods rather than writing rows directly. Use
+`requireAccount(work, scopes)` or protected-operation hooks before accessing
+account data. Model text cannot grant permission. Your application owns tool
+execution, validation and effect idempotency; receipt/publication deduplication
+does not make external writes exactly-once.
+
+`createBrowserSessions` integrates your cookie store with current session authority.
+`createFeedbackHandler` accepts validated reports, including signed-out sessions.
+`mcpResourceMetadata` and `mcpAuthorizationError` integrate an existing MCP server
+and issuer. See [INTEGRATIONS.md](INTEGRATIONS.md), [DELIVERY.md](DELIVERY.md) and
+the independent generic request fixtures in `tests/independent-peer.test.mjs`.
+
+## Errors, cancellation, retries and limits
+
+`AuthorityError` contains a safe code, HTTP status and authentication headers.
+Conversation handlers return protocol responses for known errors; your framework
+must handle unexpected host failures without exposing private diagnostics. Bound
+ingress bodies/rates before authentication. Propagate cancellation; a disconnected
+client cannot undo accepted application work.
+
+JSON pages and SSE events obey UTF-8 budgets. Notifications are hints; durable
+targeted reads reconcile lost notifications. [DELIVERY.md](DELIVERY.md) documents
+cursor/history gaps, waiting and record-specific retention. Choose
+`stop-account-work` or `allow-accepted-work-to-finish` deliberately; new requests
+always need current access. Immediate reference-issuer revocation visibility is
+an implementation policy, not a universal protocol requirement.
+
+## Storage and production responsibilities
+
+Use one `SqliteCompanyDatabase` for reference issuer, conversations and coordinator
+so authorization, revocation and protected writes share a transaction. SQLite
+serializes writers and requires local filesystem locking. Supply your own
+`ConversationStore`, `IssuerStore` and `AuthorityCoordinator` for other databases;
+adapters enforce cross-process atomicity. [STORAGE.md](STORAGE.md) specifies
+contracts, retention and explicit reset.
+
+Company credentials and signing infrastructure remain your responsibility. The
+personal-agent identity provider is a distinct trust role in the client package.
+No model, database service, deployment vendor or demo is required.
+
+## Reference and support
+
+[API.md](API.md) maps public entry points and declarations to deeper guides.
+This independent draft implementation has generic integration and packaged tests;
+deployed issuer, proxy, database and browser policies need operator validation.
+Individual extensions and business workflows are excluded. See
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),
+[CHANGELOG.md](CHANGELOG.md) and [RELEASING.md](RELEASING.md). No public license
+grant has been selected; licensing remains an owner decision before publication.
