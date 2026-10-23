@@ -92,7 +92,7 @@ development reset, stop all processes, resolve uncertain external effects, and
 explicitly move aside the database and WAL/SHM files. Reopen a fresh database to
 obtain new generations. Never reset a live database behind active processes.
 
-`tests/storage.test.mjs` exercises real child-process contention and termination
+`tests/storage.test.mts` exercises real child-process contention and termination
 before commit, after acceptance, and after a synthetic external side effect. It
 also checks publication fencing/deduplication, detached values, rollback, account
 token rotation versus revocation, namespace isolation, and unchanged read counts

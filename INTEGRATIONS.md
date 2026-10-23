@@ -80,5 +80,5 @@ reports return 400, auth errors use the shared challenge, success is empty 202.
 There is no protocol deduplication identifier and no exactly-once promise. Hosts
 own report retention, privacy filtering and downstream side-effect handling.
 
-`tests/integrations.test.mjs` exercises browser replay/current authority in memory
+`tests/integrations.test.mts` exercises browser replay/current authority in memory
 and SQLite, MCP schemes/resources/ordinary-client integration and feedback.
