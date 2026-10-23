@@ -50,10 +50,11 @@ try {
       } catch(error) {await client.query('ROLLBACK').catch(()=>{});throw error;} finally {client.release();}
       await migrate(pool,schema); // Idempotent explicit migration, no request-time DDL.
     }
-    if(process.argv.includes('--conversation-only'))await execute(process.cwd(),['tests/conversation/postgres-adapter-contract.test.mjs']);
+    if(process.argv.includes('--lifecycle-only'))await execute(process.cwd(),['tests/postgres-lifecycle.test.mjs']);
+    else if(process.argv.includes('--conversation-only'))await execute(process.cwd(),['tests/conversation/postgres-adapter-contract.test.mjs']);
     else if(!process.argv.includes('--client-only'))await execute(process.cwd(),['tests/postgres-storage.test.mjs','tests/postgres-lifecycle.test.mjs','tests/issuer-contract.test.mjs','tests/conversation/postgres-adapter-contract.test.mjs']);
     assert.ok(env.D1_CLIENT_DIR,'D1_CLIENT_DIR required');
-    if(!process.argv.includes('--conversation-only'))await execute(resolve(env.D1_CLIENT_DIR),['tests/provider.test.mjs','tests/postgres.test.mjs','tests/adapter-contract.test.mjs']);
+    if(!process.argv.includes('--conversation-only')&&!process.argv.includes('--lifecycle-only'))await execute(resolve(env.D1_CLIENT_DIR),['tests/provider.test.mjs','tests/postgres.test.mjs','tests/adapter-contract.test.mjs']);
     receipt.status='PASS';
   } else receipt.status='PASS_READ_ONLY';
 } catch(error) {

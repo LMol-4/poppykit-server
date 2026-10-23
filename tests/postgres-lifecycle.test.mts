@@ -22,6 +22,14 @@ test('Postgres lifecycle: savepoints, escaped handles, explicit schema versions 
       assert.deepEqual((await connection.query('SELECT id FROM poppy_server.records WHERE ns=$1 ORDER BY id',[ns])).rows.map(row=>row.id),['outer']);
     });
     assert.ok(escaped); await assert.rejects(escaped.query('SELECT 1'),/expired/);
+    let late: Promise<void> | undefined,releaseLate!:()=>void,enteredLate!:()=>void;
+    const lateGate=new Promise<void>(resolve=>{releaseLate=resolve;}),lateReady=new Promise<void>(resolve=>{enteredLate=resolve;});
+    await assert.rejects(db.withTransaction(async()=>{
+      late=db.withTransaction(async nested=>{enteredLate();await lateGate;await nested.query('SELECT 1');});
+      await lateReady;
+    }),/unawaited nested/);
+    releaseLate();assert.ok(late);await assert.rejects(late,/expired/);
+    assert.equal((await pool.query('SELECT 1 AS n')).rows[0].n,1,'late child must not use a released connection');
     await db.withTransaction(async connection=>{
       let entered!:()=>void,release!:()=>void;
       const ready=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});

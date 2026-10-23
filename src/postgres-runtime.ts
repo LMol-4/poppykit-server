@@ -48,7 +48,7 @@ export async function migratePostgres(pool: Pool, schema: PostgresSchema): Promi
   finally { client.release(); }
 }
 
-type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number }; childActive: boolean };
+type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean };
 export class PostgresRuntime {
   private readonly context = new AsyncLocalStorage<Context>();
   private closed = false;
@@ -59,7 +59,7 @@ export class PostgresRuntime {
     if (this.closed) throw new Error('Postgres adapter is closed');
     const parent = this.context.getStore();
     if (parent) {
-      if (!parent.active) throw new Error('expired Postgres transaction');
+      if (!parent.active || !parent.state.active) throw new Error('expired Postgres transaction');
       if (parent.childActive) throw new Error('concurrent nested Postgres transactions are unsupported; await each mutation');
       parent.childActive = true;
       const savepoint = `nested_${++parent.state.serial}`;
@@ -68,13 +68,14 @@ export class PostgresRuntime {
       try {
         await parent.client.query(`SAVEPOINT ${savepoint}`); started = true;
         const result = await this.context.run(child, action);
+        if (!parent.state.active) throw new Error('expired Postgres transaction');
         await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); parent.locks = child.locks; return result;
       } catch (error) {
-        if (started) { await parent.client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`); await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); }
+        if (started && parent.state.active) { await parent.client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`); await parent.client.query(`RELEASE SAVEPOINT ${savepoint}`); }
         throw error;
       } finally { child.active = false; parent.childActive = false; }
     }
-    const client = await this.pool.connect(), context: Context = { client, active: true, locks: new Set(), state: { serial: 0 }, childActive: false };
+    const client = await this.pool.connect(), context: Context = { client, active: true, locks: new Set(), state: { serial: 0, active: true }, childActive: false };
     try {
       await client.query('BEGIN');
       await client.query("SET LOCAL statement_timeout='5s'");
@@ -84,15 +85,16 @@ export class PostgresRuntime {
       const versions = (await client.query(`SELECT version FROM ${this.schema}.schema_version`)).rows;
       if (versions.length !== 1 || versions[0].version !== postgresSchemaVersion) throw new Error('unsupported Postgres schema version');
       const result = await this.context.run(context, action);
+      if (context.childActive) throw new Error('unawaited nested Postgres transaction');
       await client.query('COMMIT'); return result;
-    } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
-    finally { context.active = false; client.release(); }
+    } catch (error) { context.state.active = false; await client.query('ROLLBACK').catch(() => {}); throw error; }
+    finally { context.active = false; context.state.active = false; client.release(); }
   }
   connection(): PostgresConnection {
     const context = this.context.getStore();
-    if (!context?.active) throw new Error('no active Postgres transaction');
+    if (!context?.active || !context.state.active) throw new Error('no active Postgres transaction');
     return { query: async (sql, values) => {
-      if (!context.active || this.context.getStore() !== context) throw new Error('expired Postgres transaction');
+      if (!context.active || !context.state.active || this.context.getStore() !== context) throw new Error('expired Postgres transaction');
       if (context.childActive) throw new Error('concurrent Postgres transaction use is unsupported; await each mutation');
       return context.client.query(sql, values);
     } };
@@ -102,7 +104,7 @@ export class PostgresRuntime {
   }
   async lock(key: string): Promise<void> {
     const context = this.context.getStore();
-    if (!context?.active) throw new Error('no active Postgres transaction');
+    if (!context?.active || !context.state.active) throw new Error('no active Postgres transaction');
     if (!context.locks.has(key)) { await this.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`${this.schema}:${key}`]); context.locks.add(key); }
   }
 }
