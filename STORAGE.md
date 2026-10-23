@@ -1,7 +1,6 @@
 # Company persistence and authorization
 
-J1 replaces whole-state storage on request paths with domain selections. This is a
-breaking adapter change in an unpublished package. Node 24.12.0 or later is required.
+Request paths use targeted domain selections, not whole-state rewrites. Node 24.12.0 or later is required.
 The optional `@poppykit/server/sqlite` entry point exports `SqliteCompanyDatabase`.
 The core and reference issuer entry points do not import SQLite. Consumers can
 implement `ConversationStore`, `IssuerStore` and `AuthorityCoordinator` themselves.
@@ -46,10 +45,8 @@ still apply inside the SDK; a namespace name alone is not authentication.
 Conversation selections resolve an ID, message receipt, work ID, or next eligible
 claim. Reads include the related parent/Direct Conversation binding group, not
 unrelated conversations. A worker query selects the oldest eligible message for a
-conversation; publication rechecks lease and fence. Event delivery currently reads
-the selected conversation group's retained events. J3 owns bounded page queries,
-notification-backed waits, streaming and retention; this does not claim those jobs
-are complete. `ConversationNotifications` defines subscribe/unsubscribe/publish:
+conversation; publication rechecks lease and fence. Cursor-relative event selectors bound delivery reads without loading work/history
+aggregates. `ConversationNotifications` defines subscribe/unsubscribe/publish:
 subscribe before reading, treat wakes as hints, and always reconcile durable state
 after a wake or bounded timeout. Publishing after commit is best-effort, not an outbox.
 
@@ -75,8 +72,8 @@ an uncertain result for reconciliation. Never claim universal exactly-once execu
 
 `cleanup(namespace, now, limit)` bounds deletion to at most 1000 expired short-lived
 codes, authorizations, access tokens or replay entries. It does not delete grants,
-work intent, message receipts or conversation events. J3 must preserve receipt
-identity through retention for the conversation lifetime. Finished work pruning is
+work intent, message receipts or conversation events. Receipt identity remains
+through retention for the conversation lifetime. Finished work pruning is
 per selected conversation binding group; unrelated conversation growth cannot
 force another conversation's receipts out of storage.
 
@@ -92,12 +89,8 @@ development reset, stop all processes, resolve uncertain external effects, and
 explicitly move aside the database and WAL/SHM files. Reopen a fresh database to
 obtain new generations. Never reset a live database behind active processes.
 
-`tests/storage.test.mts` exercises real child-process contention and termination
-before commit, after acceptance, and after a synthetic external side effect. It
-also checks publication fencing/deduplication, detached values, rollback, account
-token rotation versus revocation, namespace isolation, and unchanged read counts
-after adding unrelated conversations. These are local Windows/Node results;
-other OS runner evidence belongs to J5/J6.
+Contract tests cover real process contention/death, publication fences, rotation/
+revocation, rollback, isolation and targeted read counts; see [contributing](CONTRIBUTING.md).
 
 ## Bounded conversation delivery and retention
 

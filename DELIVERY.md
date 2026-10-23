@@ -3,48 +3,12 @@
 The SDK targets Personal Agent Protocol draft 0.2. Company content, messages,
 unknown events and partial text remain untrusted data for the host application.
 
-## Client
+## Client interoperability
 
-Bind `createConversationClient` to the existing auth lifecycle:
-
-```ts
-const target = await auth.target(connectionId);
-const conversations = createConversationClient({
-  ...target, connectionId, store, clock: { now: Date.now },
-  authorizedRequest: request => auth.authorizedFetch(connectionId, request, target),
-  authorization: (id, scopes) => auth.authorization(id, scopes),
-});
-for await (const item of conversations.watch(conversationId, { consumer: 'ui', signal })) {
-  await processEvent(item.event);
-  await item.ack();
-}
-```
-
-`authorization(eventOrError)` returns the single auth lifecycle's verified
-required/granted/missing scopes and eligible methods. The UI requests consent and
-chooses an advertised method; Device or Mediated does not require Direct support.
-
-`read` returns one page; `drain` follows `has_more` immediately. Named consumers
-advance only on explicit acknowledgement. `watch` accepts SSE or JSON fallback,
-skips unknown event types, deduplicates up to 10,000 event IDs per invocation, and
-never rewinds its cursor on a duplicate. JSON pagination has its separate
-`maxPages` bound (default 1000), without consuming reconnect attempts. Reconnects
-are bounded (default 4); exhaustion is explicit `reconnect_exhausted`.
-
-`lastEventId` takes precedence over the starting cursor. On reconnect the watcher
-sends `Last-Event-ID`. `onPartial` is display-only: a null value clears unfinished
-text on completion/disconnect; never execute or reason from an incomplete delta.
-Messages are actionable only after a complete `message` event. SSE frames and
-JSON fallback are limited to 1 MiB, streams to 16 MiB, and partial text per stream
-to 1 MiB. UTF-8 fragmentation and CR/LF/CRLF are supported.
-
-`cursor_expired` is an explicit history gap. Inform the user, then reset a named
-consumer and reread retained history, or supply `onHistoryGap` returning true.
-Automatic recovery is limited to one reset per watch; it does not recover missing
-events. Checkpoints and pending sends survive process restart with durable stores.
-Send retries keep their original connection, issuer, endpoint, ID, body and read
-parameters. Abort signals are invocation-local and are never persisted. Canceling
-delivery does not cancel an accepted company action or prove a lost send failed.
+Clients keep immutable retry targets/message IDs, explicitly acknowledge named
+consumers and treat cursor_expired as a history gap, not recovered history. A
+disconnected client cannot undo accepted work. The [client delivery guide](https://github.com/LMol-4/poppykit-client/blob/main/DELIVERY.md)
+specifies watch/reconnect bounds, partial text, pagination and checkpoint handling.
 
 ## Node transport
 
@@ -67,7 +31,7 @@ the durable cursor and fresh authorization.
 Metadata caching remains bounded and honors freshness, Age, validators, no-cache
 and no-store, with a 300-second upper bound. Expired entries revalidate; 304s retain
 prior caching directives. `resolver.invalidate(target?)` fences old pending cache
-writes without bypassing fetch concurrency/rate limits. J2 rejects changed saved
+writes without bypassing fetch concurrency/rate limits. The auth lifecycle rejects changed saved
 issuer/endpoint/resource bindings rather than rerouting persisted work.
 
 ## Company service and retention

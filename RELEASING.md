@@ -1,193 +1,91 @@
-# Release preparation and owner runbook
+# Releasing
 
-The owner selected the **MIT** license and initial development version **0.1.0**.
-`private: false`, `publishConfig.access: public` and the shipped [LICENSE](LICENSE)
-prepare these candidates for a public release; they do not publish anything.
-No package has been published. Tags, npm publication and external settings remain
-separate owner-authorized actions. This is an initial 0.x release, not a stable 1.0
-compatibility promise.
+Use the tagged GitHub Actions workflow, not a local rebuild. Packages are MIT;
+0.1.0 was manually bootstrapped. Version 0.1.1 refreshes documentation without
+changing runtime APIs. Each new version needs its own source/artifact evidence.
 
-## Verification graph
+## Before tagging
 
-Every push, pull request and manual CI run calls the same repository-local
-`.github/workflows/verify.yml`. Documentation-only changes run the graph too;
-there are no path filters. A clean GitHub-hosted Linux job builds and packs once.
-The release manifest binds full source SHAs, package/version, filenames, byte
-counts, SHA256 and npm SHA512 integrity to those unchanged tarballs.
+- Confirm npm ownership, unused versions, supported Node 24.12.0 and npm>=11.5.1.
+  Keep the pinned compiler/dependencies; do not upgrade tooling during a release.
+- Update version, changelog and shipped docs. CLI's client dependency and both
+  candidate JSON files must match exact final SDK versions/full source SHAs.
+- Review the full diff and run typecheck, build, tests and documentation checks.
+  Preserve the existing API/storage/security contracts and historical evidence.
+- Protect source, workflow files, pins and release tags with repository review/rules.
+  All actions are commit-pinned; release verification never restores a PR cache.
+- Verify GitHub environment **npm**: variable **NPM_PUBLISH_ENABLED=true**,
+  intended required reviewer, no admin bypass, and allowed deployment tags **v***.
+  Reviewers approve the real pending deployment; automation must not approve for them.
+- Configure the npm package's GitHub trusted publisher: owner **LMol-4**, this
+  package repository, workflow **release.yml**, environment **npm**. Match case.
+  Enable **direct npm publish** permission; this workflow does not stage a publish.
+  Configure near the release: unused configurations expire after two days. Public
+  source/package visibility and supported GitHub-hosted runners are required for
+  this provenance path. Do not supply NODE_AUTH_TOKEN or fall back to a long-lived
+  token if OIDC fails. Confirm current [npm requirements](https://docs.npmjs.com/trusted-publishers/).
 
-| Job | Responsibility |
-| --- | --- |
-| candidate | Typecheck/build from exact source, pack once, record/upload identity |
-| fast | Documentation links/fences and small unit checks |
-| contracts | Storage, authentication, network and conversation contracts |
-| integration | API/browser/feedback and independent peers; CLI installs all pinned candidates |
-| packaged-linux/windows/macos | Install unchanged tarballs; startup, exports, SQLite and representative platform behavior |
-| validation | Release failure simulations, registry/toolchain guards and actual workflow wiring assertions |
-| gate | Always report; require each allowlisted job result to equal success and recheck artifact identity |
+## Publish exact tagged source
 
-The candidate job strictly typechecks and compiles the complete TypeScript test
-harness once before packing. It uploads a separate same-run `test-harness`
-artifact, never inside an npm candidate. Each unprivileged test/OS job checks the
-full source commit, complete canonical source inventory, exact LF source hashes
-and exact emitted-output hashes before using that harness. Runtime/packaged checks
-still import the unchanged candidate's installed JavaScript and execute real npm
-shims. The publisher consumes only tested npm tarballs and never the harness.
+Client and server are independent. Publish client before CLI: the CLI registry
+guard requires its tested client tarball integrity to equal the published one.
 
-All deterministic source tests run once on Linux, partitioned by
-`.github/test-groups.json`. Its runner rejects unassigned/duplicate test files.
-The CLI does not rerun complete SDK suites. It checks out the exact full client
-and server SHAs in its candidate JSON files, builds/installs their tarballs, and
-tests the combined package boundary. The SDKs have no dependency on one another;
-the server candidate is a CLI integration peer, not a production CLI dependency.
-Private cross-repository checkouts require owner-provided read access; no local
-untracked sibling directory is assumed.
+1. Merge reviewed source to main. Record the full SHA and create/push an approved
+   immutable **vVERSION** tag at that exact commit. Never move or replace a tag.
 
-Node 24.12.0 is the supported CI baseline on GitHub-hosted ubuntu-latest,
-windows-latest and macos-latest. Later Node majors are not separately certified.
-The CLI checks unsupported Node 22.17.1 once on Linux. Most JavaScript/type checks
-do not need an OS-by-runtime matrix. Packaged OS checks exercise installed shims,
-paths/SQLite and the CLI's generic encrypted-backend/lifecycle fixture. They do
-not certify a production OS keyring, physical terminal, browser engine or KMS.
+   ```sh
+   git tag vVERSION FULL_SHA
+   git push origin refs/tags/vVERSION
+   ```
+2. Dispatch **Release** from that tag, with matching version, tag and full commit.
+   Optional `publish=false` rehearses verification only. A later publishing dispatch
+   is a new run with newly identified artifacts; it does not reuse a rehearsal's bytes.
+3. Dispatch with `publish=true` when authorized. Example (replace all placeholders):
 
-SDK ordinary CI may restore a pnpm cache keyed by its frozen lockfile; installed
-dependencies are never shared across OSes. Release-context verification restores
-no dependency cache. The unpublished CLI dependency is supplied explicitly as a
-tarball; SDK lockfiles and full commit/version pins govern inputs, with exact
-TypeScript 5.9.3/@types-node 24.10.0/undici-types 7.16.0 tooling. No privileged
-release consumes a pull-request cache, artifact or check-name lookup. Artifacts
-are downloaded from this run only, and their manifest digest comes from the
-candidate job output. Failure logs retain seven days; candidates retain fourteen.
-Expired/missing artifacts require a new complete verification run.
+   ```sh
+   gh workflow run release.yml --repo LMol-4/PACKAGE --ref vVERSION -f version=VERSION -f tag=vVERSION -f commit=FULL_SHA -f publish=true
+   ```
 
-## Release workflow and fail-closed gate
+4. Wait for candidate, fast, contracts, integration, packaged-linux/windows/macos,
+   validation and gate to succeed. Missing, failed, canceled or skipped prerequisites
+   fail closed. Then follow the Actions environment-approval link. Do not bypass it.
+5. The publisher rechecks source/tag/ref/version, trusted manifest digest, unchanged
+   tarball metadata/bytes, owner enablement, registry absence and dependency integrity.
+   It publishes the same-run tested tarball with `--access public --provenance
+   --ignore-scripts`; it never installs, builds or packs again.
+6. Save run URL, full source SHAs, manifest SHA256, filenames, versions, byte counts,
+   tarball SHA256/npm SHA512 and registry integrity/provenance. Download before the
+   14-day candidate retention expires. Verify registry bytes, a clean exact-version
+   registry install, exported modules and the real npm CLI shim.
 
-`release.yml` is manual dispatch only. Dispatch an existing owner-approved
-`vVERSION` tag, supply the full tagged commit, matching version/tag, and
-leave `publish=false` for verification only. A branch dispatch, wrong SHA,
-version/tag mismatch, moved tag or missing/changed artifact is rejected. Do not
-push a tag merely to test workflow syntax. All actions are pinned to immutable
-commits; reusable verification is the same commit as its caller.
+Ordinary main/tag CI is useful evidence but is not a tagged Release/OIDC publishing
+run. A dry run or green tests alone do not prove npm authentication or provenance.
+The separate checked test-harness artifact is source/output-hash bound, used only
+by unprivileged verification jobs, and never published in an npm package.
 
-The allowlist is candidate, fast, contracts, integration, packaged-linux,
-packaged-windows, packaged-macos and validation. Missing, empty, failed, canceled
-and skipped results all fail. The always-running gate has no permission to
-publish. The publisher needs the reusable verification workflow to succeed AND
-its ready output to be exactly true AND explicit publish selection. It then
-rechecks source/commit/ref/version, manifest digest, every tarball, unchanged
-packed metadata, private/license policy, npm/toolchain and registry state.
+## Failure and partial release
 
-Only the publishing job requests `id-token: write`. It runs on GitHub-hosted
-Linux in protected environment `npm`. There is no publish credential in PR CI,
-no workflow_run artifact promotion, no checkout of PR code in a privileged job,
-no build/install/pack in the publisher, and no automatic publication on push/tag.
-Publication uses `npm publish TESTED_TARBALL --access public --provenance --ignore-scripts`.
-It publishes the unchanged bytes downloaded and checked in that job. Publication
-is serialized per repository and is never canceled by a newer release run.
+Stop on tag/source/version/digest mismatch, unknown registry responses or changed
+client integrity. Do not weaken gates, repack approved bytes, change pins silently,
+force an overwrite or use a token fallback. Inspect the failed job and preserve logs.
+For OIDC/auth failure check publisher spelling/case, workflow/environment identity,
+expiry, reviewer approval, permissions and npm/toolchain support before a new run.
 
-Safe local tests execute the gate with failed/canceled/missing/skipped checks,
-wrong commit/version/tag/ref, missing artifact, tampered tarball/manifest and an
-absent trusted digest. Registry tests reject an existing version, unauthorized or
-uncertain registry responses, unsupported tools and mismatched dependency bytes.
-These simulations and actionlint validate code/wiring. They do not prove GitHub
-environment settings, npm ownership or OIDC exchange work.
+If a version already exists, compare its registry integrity and provenance with the
+saved receipt. Matching successful publication is recorded, never republished.
+For partial publication, finish only absent packages; verify the published client's
+exact bytes before CLI. If bytes differ or a fix is needed, use a reviewed new
+version and complete verification. A source checkout rollback cannot undo an npm
+publication or external side effect. Deprecation, dist-tag changes, unpublish and
+replacement versions need separate owner authorization; never delete evidence.
 
-Any documentation/package-metadata/source change after J6 creates a new candidate.
-J6 evidence applies only to J6's recorded commits/digests. Re-run this complete
-graph on final commits/tarballs and retain the new manifests/platform results.
-Never label changed bytes publishable using old evidence. A passing Windows
-local run does not substitute for actual hosted Linux/macOS jobs.
+## Verification limits
 
-## Owner configuration — external, not performed by this repository
-
-Rechecked against [npm trusted publishers](https://docs.npmjs.com/trusted-publishers/),
-[GitHub secure use](https://docs.github.com/en/actions/reference/security/secure-use),
-[OIDC](https://docs.github.com/en/actions/concepts/security/openid-connect), and
-[deployment environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
-on **2026-10-23**. Recheck those live requirements before first publication:
-
-1. The owner confirmed the `@poppykit` scope and selected MIT/version 0.1.0.
-   Confirm the actual publishing account has package-name/maintainer rights and
-   the chosen version is unused. The complete LICENSE is in the package allowlist
-   and release notes describe this initial development candidate.
-   Confirm repository.url exactly matches the actual GitHub repository.
-2. Protect main, release tags, Actions files/scripts and candidate pins with
-   repository rules and review/CODEOWNERS appropriate to the actual team. Require
-   the complete verification result for the exact commit. Prevent unreviewed
-   workflow changes or tag replacement. Read-only PR permissions and trusted
-   publishing cannot enforce these owner settings themselves.
-3. Create environment `npm` in each package repository with required reviewers,
-   self-approval restrictions, protected release-tag rules and no admin bypass
-   where the repository plan supports them. Confirm feature availability; an
-   unprotected environment name alone provides no approval barrier. Add environment
-   variable `NPM_PUBLISH_ENABLED=true` only after setup/authorization. Missing
-   or false configuration fails the publisher's check.
-4. Configure each npm package's trusted publisher for GitHub owner `LMol-4`,
-   the corresponding `poppykit-client`, `poppykit-server` or `poppykit-cli`
-   repository, workflow filename **release.yml**, and environment **npm**.
-   Match spelling/case and the initiating workflow identity. verify.yml is a
-   reusable verifier, not the publishing workflow. Reassess identity if introducing
-   a reusable publisher or changing callers; workflow_call/dispatch identity has
-   documented caller nuances. This setup authorizes a workflow identity, not its
-   test results. The gate supplies the independent verification condition.
-5. npm currently requires npm >=11.5.1 and Node >=22.14.0 for trusted publishing;
-   this workflow uses Node24.12.0 and checks npm's version without upgrading it.
-   GitHub-hosted runners are supported; self-hosted runners are not supported for
-   this npm path. GitHub permissions must permit OIDC. No NODE_AUTH_TOKEN is set.
-   Do not silently fall back to a long-lived publish token when OIDC fails.
-6. Verify provenance requirements, repository visibility and package visibility
-   in the current npm documentation. Trusted publishing generates provenance
-   automatically for supported public packages/public repositories; explicit
-   --provenance must not be treated as proof without checking the registry record.
-   A private-source repository may need an owner-approved alternative or visibility
-   decision; do not claim provenance supported where it is not.
-7. Current npm publisher configurations require first successful use within two
-   days or expire; configure near the authorized release. npm supports up to ten
-   configurations, with separate direct-publish/staging/dist-tag permissions.
-   Grant only this workflow's required direct publication capability, review other
-   publishers/tokens and restrict alternative access according to owner policy.
-   Keep recovery access separate from the normal workflow.
-
-## First publication and bootstrap
-
-A new package may need first publication using authorized npm-owner authentication
-before package settings/trusted publishing are available. npm name availability
-has not been established by creating a GitHub repository. The owner must confirm
-the current bootstrap flow and explicitly authorize it. Do not place bootstrap
-tokens in PR workflows or temporarily make publication unconditional.
-
-Prepare a license/version-ready candidate, run the exact full verification graph,
-retain/download the unchanged manifest/tarball and verify its digest. If the first
-publication must be manual, an authorized owner uses their own current npm login/
-2FA or narrowly scoped supported bootstrap credential to publish those exact bytes,
-then removes temporary credentials and configures the trusted publisher. Record
-the resulting version/integrity/provenance. A dry run is not proof of bootstrap
-permissions or production OIDC authentication. Current 0.1.0 candidates have public-ready metadata, but publication still
-requires all exact-byte checks, owner settings and separate authorization.
-
-## Package order, existing versions and partial recovery
-
-Release by actual production dependencies: client and server are independent;
-either SDK can publish first. Publish the client before a CLI version requiring
-that exact client version. The CLI registry guard requires the published client's
-dist.integrity to match its tested candidate tarball. If it differs, stop and
-reconcile/retest the actual dependency; do not silently replace tested bytes.
-
-Before publishing, npm view must confirm that this package version is absent.
-Only a structured E404 is considered absent; auth/network/registry failures stop.
-An existing version stops publication even after an uncertain earlier response.
-Inspect npm's published version, integrity, provenance and intended dist-tag using
-read-only registry commands. Never overwrite or blindly republish. If the exact
-bytes already published, record that success and resume the remaining package's
-separate verified release. Multi-repository releases are not atomic. Do not unpublish
-a successful dependency as rollback. If correction is required, choose a new
-version, update dependent pins/lockfiles/release notes and verify a new candidate.
-
-This runbook does not authorize publication, tag pushes, package ownership changes,
-external settings, deployment or demo implementation.
-
-Candidate metadata is inspected with the archive basename and its directory as
-`cwd`. This avoids GNU tar interpreting a Windows drive colon as a remote archive;
-stderr is preserved in failure diagnostics. Negative checks exercise GNU tar on
-Windows with space/Unicode candidate paths and retain wrong/missing/changed bytes
-and fail-closed gate cases. Local success does not certify a future hosted run or
-any newly packed bytes.
+Deterministic source suites run once per verification graph on Linux; exhaustive
+file groups reject omissions/duplicates. Packaged jobs test actual installed JS,
+exports/declarations/content/SQLite and representative platform behavior; CLI also
+tests real shims, auth/retry processes and API/browser/feedback wiring. They do not
+certify a production keyring, physical terminal, browser engine, KMS or TLS deployment.
+Windows GNU tar is given archive basename plus directory cwd to avoid drive-colon
+remote parsing. Failure logs retain seven days. Expired/missing artifacts require a
+new full run, not relabeling old results. See [CONTRIBUTING.md](CONTRIBUTING.md).
