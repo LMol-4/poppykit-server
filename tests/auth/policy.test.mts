@@ -54,6 +54,16 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
   for (const [name, change] of Object.entries(stale)) {
     await assert.rejects(t.policy.withCurrent({ ...t.signedIn, ...change }, [], action), { code: 'invalid_token', status: 401 }, name);
   }
+  const invalidStates: ((state: ReturnType<typeof initialIssuerState>) => void)[] = [
+    state => { state.sessions.s1.expiresAt = NOW; },
+    state => { state.grants.g1.expiresAt = NOW; },
+    state => { state.grants.g1.revoked = true; },
+    state => { state.generation = 'after-reset'; },
+  ];
+  for (const invalidate of invalidStates) {
+    const current = setup(); current.store.set(invalidate);
+    await assert.rejects(current.policy.withCurrent(current.signedIn, [], action), { code: 'invalid_token', status: 401 });
+  }
   const scope = await t.policy.withCurrent(t.signedIn, ['poppy:read', 'poppy:write'], action).catch(error => error);
   assert.ok(scope instanceof AuthorityError);
   assert.deepEqual([scope.code, scope.status, scope.headers.get('www-authenticate')], ['insufficient_scope', 403, 'DPoP error="insufficient_scope", scope="poppy:read poppy:write", algs="ES256"']);
