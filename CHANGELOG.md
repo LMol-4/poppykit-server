@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+Require Node 24 >=24.22.1 within 24.x. Enforce current-token expiry after waits and
+at streamed delivery while preserving already-accepted work's authority ceiling.
+Deduplicate reserved string output IDs and retain refresh-token ancestors through
+fixed grant expiry so replay revokes descendants. Direct Sign-In hosts must supply
+the documented durable `authorizationResultCipher`; identical decisions recover
+their original encrypted callback. Before public enablement, revoke pre-upgrade
+live grant lineages and obtain fresh consent, or prove their fixed expiry.
+Required release verification now includes isolated PostgreSQL contracts.
+
 ## 0.2.0 (release candidate)
 
 Add bundled Postgres company stores/coordinator with explicit migrations, atomic host transaction composition, savepoints and pool lifecycle.
