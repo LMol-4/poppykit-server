@@ -6,14 +6,14 @@ supplies accounts, consent UI, agent, business tools and HTTPS routing. [MIT](LI
 
 ## Install
 
-Version 0.2.0 is a release candidate until its publishing workflow completes.
+This source contains unreleased repairs; final version selection and publication are pending.
 
-Requires Node **24.12.0+** and ESM. CI tests Node 24.12.0 on Linux, macOS and Windows;
-later majors are not separately certified. SQLite is optional/experimental and
+Requires Node **24.x, at least 24.22.1**, and ESM. CI tests Node 24.22.1 on Linux, macOS and Windows;
+other Node majors are unsupported. SQLite is optional/experimental and
 requires local filesystem locking.
 
 ```sh
-npm install @poppykit/server@0.2.0
+npm install @poppykit/server
 ```
 
 ## Configure a service

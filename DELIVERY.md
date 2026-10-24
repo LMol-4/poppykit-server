@@ -53,8 +53,9 @@ SQLite reconciliation; deployments can implement the same notification contract
 with their own distributed adapter. Lost/duplicate hints cannot erase a commit.
 SQLite event windows and append operations do not reload complete event histories.
 
-Server streams default to 30 seconds and apply pull backpressure, rechecking
-current authority before further pages. This bounded-connection policy omits
+Server streams default to 30 seconds, end earlier at token expiry and apply pull
+backpressure, rechecking current authority before every emitted frame. Reconnect
+with a fresh credential and the last handled event ID. This bounded-connection policy omits
 periodic idle comments; proxies may close an idle stream sooner, and the client
 reconnects. Longer-lived deployments should supply heartbeat handling at their
 HTTP adapter. Hosts must propagate disconnect/AbortSignal and body cancellation.

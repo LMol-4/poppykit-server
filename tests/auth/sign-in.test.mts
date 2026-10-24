@@ -412,15 +412,15 @@ test('a rate_limited Session request rolls back: the same assertions and proof s
   expectError(await env.send(fields, { dpop }), 'invalid_grant'); // the accepted request did consume them
 });
 
-test('only the current and previous Account Token hashes are retained per lineage', async () => {
+test('every Account Token ancestor remains replay-detectable until fixed grant expiry', async () => {
   const env = await signInSetup();
   let token = (await env.signIn((await env.session()).session_id)).body.refresh_token;
   const first = token;
   for (let i = 0; i < 5; i++) token = (await env.refresh(token)).body.refresh_token;
-  assert.equal(Object.keys(env.store.state.refreshTokens).length, 2);
+  assert.equal(Object.keys(env.store.state.refreshTokens).length, 6);
   expectError(await env.refresh(first), 'invalid_grant');
   assert.equal((await env.revoke(first)).status, 200);
-  assert.equal((await env.refresh(token)).status, 200, 'a forgotten token cannot revoke the lineage');
+  expectError(await env.refresh(token), 'invalid_grant');
 });
 
 test('issuer state of another version is refused, not misread', async () => {

@@ -228,8 +228,8 @@ export class SqliteCompanyDatabase {
       if (selection.kind === 'revoke') { get('refreshTokens', selection.refreshHash); get('replay', selection.replayKey); }
       if (selection.kind === 'authorize') {
         get('signIns', clientRevisionKey(selection.clientId));
-        const pending = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.at)!;
-        const client = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.clientId, selection.at)!;
+        const pending = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.completion') IS NULL AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.at)!;
+        const client = this.db.prepare("SELECT count(*) AS n FROM records WHERE ns=? AND kind='authorizations' AND json_extract(body,'$.completion') IS NULL AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.clientId, selection.at)!;
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(pending.n), pendingForClient: Number(client.n) };
       }
       if (selection.kind === 'disconnect') {
@@ -264,8 +264,9 @@ export class SqliteCompanyDatabase {
   cleanup(namespace: string, now: number, limit = 100): Promise<number> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('cleanup limit');
     return this.run(async () => {
-      const rows = this.db.prepare(`SELECT kind,id FROM records WHERE ns=? AND
-        ((kind IN ('authorizations','codes','accessTokens') AND json_extract(body,'$.expiresAt')<=?) OR (kind='signIns' AND json_extract(body,'$.expiresAt')+30000<?) OR (kind='replay' AND CAST(body AS REAL)<?)) LIMIT ?`).all(namespace, now, now, now, limit);
+      const rows = this.db.prepare(`SELECT kind,id FROM records AS retained WHERE ns=? AND
+        ((kind IN ('authorizations','codes','accessTokens') AND json_extract(body,'$.expiresAt')<=?) OR (kind='signIns' AND json_extract(body,'$.expiresAt')+30000<?) OR (kind='replay' AND CAST(body AS REAL)<?)
+        OR (kind='refreshTokens' AND NOT EXISTS (SELECT 1 FROM records AS lineage WHERE lineage.ns=retained.ns AND lineage.kind='grants' AND lineage.id=json_extract(retained.body,'$') AND json_extract(lineage.body,'$.expiresAt')>? AND json_extract(lineage.body,'$.revoked')=0))) LIMIT ?`).all(namespace, now, now, now, now, limit);
       for (const row of rows) this.db.prepare('DELETE FROM records WHERE ns=? AND kind=? AND id=?').run(namespace, row.kind, row.id);
       return rows.length;
     });

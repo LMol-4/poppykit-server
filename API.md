@@ -18,6 +18,11 @@ idempotency and reconciliation. Existing issuers implement `ExternalAuthorityAda
 and do not need the optional reference issuer. Your framework owns HTTPS routing,
 trusted public URLs, ingress limits, request cancellation and private-error handling.
 
+Direct reference issuers now require `authorizationResultCipher` before
+`beginAuthorization`; same-decision `completeAuthorization` recovers the encrypted
+callback through its original validity window. See [AUTH.md](AUTH.md) for custody,
+revocation and one-time exchange limits. No package subpath or driver contract changed.
+
 Run the [quickstart](examples/quickstart.mjs) without a listener or external service.
 
 The optional Postgres entry point ships its adapters, `createPostgresPool`,

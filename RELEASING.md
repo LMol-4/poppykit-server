@@ -6,7 +6,7 @@ changing runtime APIs. Each new version needs its own source/artifact evidence.
 
 ## Before tagging
 
-- Confirm npm ownership, unused versions, supported Node 24.12.0 and npm>=11.5.1.
+- Confirm npm ownership, unused versions, supported Node 24.x (at least 24.22.1) and npm>=11.5.1.
   Keep the pinned compiler/dependencies; do not upgrade tooling during a release.
 - Update version, changelog and shipped docs. CLI's client dependency and both
   candidate JSON files must match exact final SDK versions/full source SHAs.
@@ -47,7 +47,7 @@ guard requires its tested client tarball integrity to equal the published one.
    ```
 
 4. Wait for candidate, fast, contracts, integration, packaged-linux/windows/macos,
-   validation and gate to succeed. Missing, failed, canceled or skipped prerequisites
+   validation, postgres and gate to succeed. The postgres job uses its own disposable PostgreSQL17 cluster and the same-run checked candidate/harness; zero discovery or any skipped database case fails. Missing, failed, canceled or skipped prerequisites
    fail closed. Then follow the Actions environment-approval link. Do not bypass it.
 5. The publisher rechecks source/tag/ref/version, trusted manifest digest, unchanged
    tarball metadata/bytes, owner enablement, registry absence and dependency integrity.

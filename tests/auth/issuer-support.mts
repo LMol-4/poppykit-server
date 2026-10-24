@@ -9,6 +9,7 @@ import { SignJWT } from 'jose';
 import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
 import { memoryCoordinator } from '../conversation/support.mjs';
+import { resultCipher } from '../../test-support/result-cipher.mjs';
 
 // Reference issuer test environment: one agent client, fake metadata resolver, injected clock.
 export const ISSUER = 'https://auth.shop.test';
@@ -56,7 +57,7 @@ export async function setup(overrides:Partial<ReferenceIssuerOptions> = {}) {
     async resolveClient(id) { env.calls.client++; await env.onClient?.(); if (id !== CLIENT && id !== OTHER_CLIENT) throw new Error('unknown client'); return { client_id: id, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [REDIRECT], token_endpoint_auth_method: 'private_key_jwt' as const }; },
     async resolveJwks(uri, settings = {}) { assert.equal(uri, JWKS_URI); if (settings.refresh) { env.calls.refresh++; return structuredClone(env.refreshedJwks); } env.calls.jwks++; await env.onJwks?.(); return structuredClone(env.jwks); },
   };
-  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: ['poppy:read', 'poppy:write'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, ...overrides });
+  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: ['poppy:read', 'poppy:write'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, authorizationResultCipher: resultCipher(), ...overrides });
   env.assertion = (claims = {}, { key = identity, header = {} } = {}) => {
     const iat = Math.floor(clock.now / 1000);
     return new SignJWT({ iss: CLIENT, sub: 'usr_1', aud: ISSUER, iat, exp: iat + 60, jti: randomUUID(), ...claims }).setProtectedHeader({ alg: 'ES256', kid: 'k1', ...header }).sign(key.privateKey);

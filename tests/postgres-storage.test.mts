@@ -138,20 +138,25 @@ test('bounded Postgres cleanup isolates namespaces and retains grants, work, rec
       state.replay.expired = at - 1; state.replay.boundary = at;
       state.grants.retained = { clientId: CLIENT, userId: 'user', accountId: 'account', scopes: [], expiresAt: at - 1, revoked: true, refreshHash: 'refresh', previousHash: '' };
       state.refreshTokens.refresh = 'retained';
+      state.grants.active = { ...state.grants.retained, expiresAt: at + 1000, revoked: false, refreshHash: 'current', previousHash: 'previous' };
+      for (const hash of ['oldest', 'previous', 'current']) state.refreshTokens[hash] = 'active';
     });
   };
   await seed(namespace); await seed(other);
 
   const records = async (name: string) => (await pool!.query('SELECT kind,id,body FROM poppy_server.records WHERE ns=$1 ORDER BY kind,id',[path+':'+name])).rows;
   const before = await records(namespace), untouched = await records(other), events = (await pool!.query('SELECT * FROM poppy_server.events WHERE ns=$1 ORDER BY conversation,seq',[path+':'+namespace])).rows;
-  const expired = new Set(['authorizations:expired', 'codes:expired', 'signIns:expired', 'accessTokens:expired', 'replay:expired']);
+  const expired = new Set(['authorizations:expired', 'codes:expired', 'signIns:expired', 'accessTokens:expired', 'replay:expired', 'refreshTokens:refresh']);
   for (const limit of [0, 1.5, 1001]) assert.throws(() => db.cleanup(namespace, at, limit), /cleanup limit/);
   assert.deepEqual(await records(namespace), before);
   assert.equal(await db.cleanup(namespace, at, 1), 1);
   assert.equal((await records(namespace)).length, before.length - 1);
-  assert.equal(await db.cleanup(namespace, at, 100), 4);
+  assert.equal(await db.cleanup(namespace, at, 100), 5);
   assert.equal(await db.cleanup(namespace, at, 100), 0);
   assert.deepEqual(await records(namespace), before.filter(row => !expired.has(row.kind + ':' + row.id)));
+  assert.deepEqual(await records(other), untouched);
+  await db.cleanup(namespace, at + 1000, 100);
+  assert.ok(!(await records(namespace)).some(row => row.kind === 'refreshTokens'), 'all expired ancestor hashes are collected');
   assert.deepEqual(await records(other), untouched);
   assert.deepEqual((await pool!.query('SELECT * FROM poppy_server.events WHERE ns=$1 ORDER BY conversation,seq',[path+':'+namespace])).rows, events);
 });

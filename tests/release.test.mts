@@ -48,8 +48,8 @@ test('real candidate checks reject missing artifacts tampering and changed manif
     const env={...process.env,GITHUB_SHA:actualCommit,EXPECTED_SHA:actualCommit,RELEASE_VERSION:pkg.version,RELEASE_TAG:'v'+pkg.version,RELEASE_CONTEXT:'false',GITHUB_REPOSITORY:actual.repository,EXPECTED_MANIFEST_SHA:actualSha,NEEDS_JSON:JSON.stringify(good),GITHUB_OUTPUT:output};
     const gate=async(extra={})=>{await writeFile(output,'');const result=spawnSync(process.execPath,[script.pathname.replace(/^\/(\w:)/,'$1'),'gate',dir],{env:{...env,...extra},encoding:'utf8',windowsHide:true});return {status:result.status,output:await readFile(output,'utf8'),error:result.stderr};};
     const passed=await gate();assert.equal(passed.status,0,passed.error);assert.equal(passed.output,'ready=true\n');
-    for(const result of ['failure','cancelled','skipped',null]){const value=await gate({NEEDS_JSON:JSON.stringify({...good,contracts:{result}})});assert.notEqual(value.status,0);assert.equal(value.output,'');}
-    const missing={...good};delete missing.fast;
+    for(const name of ['contracts','postgres'])for(const result of ['failure','cancelled','skipped',null]){const value=await gate({NEEDS_JSON:JSON.stringify({...good,[name]:{result}})});assert.notEqual(value.status,0);assert.equal(value.output,'');}
+    const missing={...good};delete missing.postgres;
     for(const extra of [{NEEDS_JSON:JSON.stringify(missing)},{NEEDS_JSON:''},{EXPECTED_SHA:'b'.repeat(40)},{RELEASE_VERSION:'9.9.9'},{RELEASE_TAG:'wrong'},{EXPECTED_MANIFEST_SHA:'0'.repeat(64)},{RELEASE_CONTEXT:'true',GITHUB_REF:'refs/heads/main'}]){const value=await gate(extra);assert.notEqual(value.status,0);assert.equal(value.output,'');}
     for(const name of ['EXPECTED_SHA','RELEASE_VERSION','RELEASE_TAG','GITHUB_REPOSITORY'])for(const empty of ['',undefined]){const value=await gate({RELEASE_CONTEXT:'true',GITHUB_REF:'refs/tags/v'+pkg.version,[name]:empty});assert.notEqual(value.status,0);assert.equal(value.output,'');}
     const actualFile=join(dir,actual.files[0].name),savedFile=await readFile(actualFile);

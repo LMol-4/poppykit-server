@@ -1,10 +1,10 @@
 # Company persistence and authorization
 
-Request paths use targeted domain selections, not whole-state rewrites. Node 24.12.0 or later is required.
+Request paths use targeted domain selections, not whole-state rewrites. Node 24.x, at least 24.22.1, is required.
 The optional `@poppykit/server/sqlite` entry point exports `SqliteCompanyDatabase`.
 The core and reference issuer entry points do not import SQLite. Consumers can
 implement `ConversationStore`, `IssuerStore` and `AuthorityCoordinator` themselves.
-The tested Node 24.12.0 runtime marks `node:sqlite` experimental.
+The tested Node 24.22.1 runtime marks `node:sqlite` experimental.
 
 ```ts
 import { SqliteCompanyDatabase } from '@poppykit/server/sqlite';
@@ -35,7 +35,7 @@ with correct SQLite locks; network-mounted multi-host SQLite is unsupported.
 ## Domain records and guarantees
 
 Every primary key includes a namespace (use the exact full issuer). Sessions,
-grants, current/previous token hashes, authorization requests, codes, access-token
+grants, every live-lineage Account Token hash, authorization requests, codes, access-token
 hashes, replay keys, conversation metadata, shared account bindings, message
 receipts and work intent are separate records. Ordered events are a separate table
 keyed by namespace/conversation/sequence. Indexes cover client, account, grant,
@@ -71,7 +71,9 @@ its own idempotency key (such as the stable work ID), or the application must re
 an uncertain result for reconciliation. Never claim universal exactly-once execution.
 
 `cleanup(namespace, now, limit)` bounds deletion to at most 1000 expired short-lived
-codes, authorizations, access tokens or replay entries. It does not delete grants,
+codes, authorizations, access tokens, replay entries or expired/revoked/orphaned
+Account Token hashes. Every used hash for a live lineage remains replay-detectable
+through its fixed expiry; retained size follows rotation volume. It does not delete grants,
 work intent, message receipts or conversation events. Receipt identity remains
 through retention for the conversation lifetime. Finished work pruning is
 per selected conversation binding group; unrelated conversation growth cannot
@@ -116,7 +118,7 @@ reset or history deletion was added.
 `@poppykit/server/postgres` ships `PostgresCompanyDatabase`, explicit migrations,
 and `createPostgresPool` in this package. Install optional peer `pg@8.23.1` when
 using that subpath. Core/reference-auth imports load neither database driver.
-Supported baseline: Node 24.12+, PostgreSQL 17, including Supabase transaction pooling.
+Supported baseline: Node 24.x (at least 24.22.1), PostgreSQL 17, including Supabase transaction pooling.
 No application, Google login or Supabase Auth dependency is required.
 
 ```ts

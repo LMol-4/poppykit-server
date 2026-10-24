@@ -52,7 +52,7 @@ function serviceOn(store: ConversationOptions['store'], clock: { now(): number }
       return principal;
     },
   };
-  return createConversationService({ endpoint, store, authenticator, policy, clock, leaseMs: 1000 });
+  return createConversationService({ endpoint, store, authenticator, policy, clock, leaseMs: 1000, supportedScopes: ['poppy:read'] });
 }
 async function call(service: ConversationService, path: string, as: string, body?: unknown, query = '') {
   const response = await service.handle(new Request(`${endpoint}${path}${query}`, {
@@ -144,6 +144,34 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     await assert.rejects(a.reply(fresh, 'out_1', { ...reply, text: 'changed' }), { code: 'output_conflict' });
     const events = (await call(b, `/${id}/events`, 'signedOut')).body.events as { message?: { id: string } }[];
     assert.equal(events.filter(event => event.message?.id === reply.id).length, 1);
+  }));
+
+  test('adapter contract: reserved output IDs persist atomic reply and prompt receipts across handles', () => withFixture(async ({ store, second }) => {
+    const a = serviceOn(store, clock);
+    const id = (await call(a, '', 'signedOut', { message })).body.conversation_id;
+    const work = (await a.claim())!;
+    for (const outputId of ['__proto__', 'constructor', 'ordinary']) {
+      const b = serviceOn(second, clock);
+      const value = { ...reply, id: `reply_${outputId}` };
+      await a.reply(work, outputId, value);
+      await b.reply(work, outputId, value);
+      await assert.rejects(b.reply(work, outputId, { ...value, text: 'changed' }), { code: 'output_conflict' });
+      await a.requestAuthorization(work, `auth_${outputId}`, ['poppy:read']);
+      await b.requestAuthorization(work, `auth_${outputId}`, ['poppy:read']);
+      await a.requestUser(work, `user_${outputId}`, outputId);
+      await b.requestUser(work, `user_${outputId}`, outputId);
+      await assert.rejects(b.requestUser(work, `user_${outputId}`, 'changed'), { code: 'output_conflict' });
+      const persisted = await second.inspect();
+      const receipt = persisted.work.find(row => row.id === work.workId)!;
+      assert.ok(Object.hasOwn(receipt.outputs, outputId));
+    }
+    const events = (await call(serviceOn(second, clock), `/${id}/events`, 'signedOut')).body.events as { type: string; message?: { role: string } }[];
+    assert.equal(events.filter(event => event.message?.role === 'company').length, 3);
+    assert.equal(events.filter(event => event.type === 'authorization').length, 3);
+    assert.equal(events.filter(event => event.type === 'user_requested').length, 3);
+    clock.t += 1000;
+    await serviceOn(second, clock).claim();
+    await assert.rejects(a.reply(work, '__proto__', reply), { code: 'stale_work' });
   }));
 
   test('adapter contract: a waited POST committed before a crash is recovered unchanged on the other handle', () => withFixture(async ({ store, second }) => {

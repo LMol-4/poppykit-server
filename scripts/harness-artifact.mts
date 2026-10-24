@@ -30,7 +30,7 @@ if(mode==='write'){
  const record:Manifest={schema:1,commit,node:process.version,typescript:compiler.version,files};await writeFile(resolve(destination,'harness-manifest.json'),JSON.stringify(record,null,2)+'\n');
  console.log(JSON.stringify({status:'written',commit,files:files.length,destination}));
 }else{
- const record:unknown=JSON.parse(await readFile(local('harness-manifest.json'),'utf8'));manifest(record);assert.equal(record.commit,commit,'harness compiled from another commit');assert.equal(record.node,'v24.12.0');assert.equal(record.typescript,'5.9.3');
+ const record:unknown=JSON.parse(await readFile(local('harness-manifest.json'),'utf8'));manifest(record);assert.equal(record.commit,commit,'harness compiled from another commit');assert.equal(record.node,'v24.22.1');assert.equal(record.typescript,'5.9.3');
  const seen=new Set<string>();for(const file of record.files){assert.match(file.source,/^(?:scripts|tests|test-support)\/.+\.mts$/);assert.equal(file.output,file.source.replace(/\.mts$/,'.mjs'));assert.ok(!seen.has(file.source),'duplicate harness entry');seen.add(file.source);assert.equal(hash(await readFile(local(file.source))),file.sourceSha256,'harness source changed: '+file.source);assert.equal(hash(await readFile(local(file.output))),file.outputSha256,'harness output changed: '+file.output);}
  assert.deepEqual([...seen].sort(),sources,'harness omitted or added canonical sources');
  console.log(JSON.stringify({status:'checked',commit,files:record.files.length}));

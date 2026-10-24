@@ -12,6 +12,43 @@ The host authenticates the human and protects consent with its own browser
 session/CSRF controls; pass a high-entropy browser binding. Registered callback
 URLs must be HTTPS on the client metadata domain and exactly match registration.
 
+Direct hosts must configure `authorizationResultCipher: { seal, open }` with
+synchronous authenticated encryption and a durable protected key before calling
+`beginAuthorization`. Hosts already using the optional client provider can reuse
+its `createResultCipher` instance. Other hosts supply the same structural contract;
+no client package or database driver is loaded by the reference issuer.
+
+`completeAuthorization(id, browserBinding, decision)` commits one decision and
+an encrypted callback receipt atomically. Repeating the same decision returns
+the same URL after restart; changed browser/account/scopes/decision and stale
+account revocation/reset fail. Approval recovery expires at the earlier of the
+original authorization deadline and code expiry; denial uses the original deadline.
+Recovery never mints a replacement code or extends consent. The host must retain
+its authenticated owner/installation/session binding and chosen decision durably,
+then reconcile delivery outside transactions. Never retry an uncertain code exchange.
+
+`withCurrent` checks token, Session and grant expiry immediately before protected
+actions, including after body reads and long-poll waits. Streams close at token
+expiry and recheck current authority for each emitted frame; reconnect with fresh
+authentication. `withAccepted` intentionally ignores admission-token expiry while
+preserving the accepted scope ceiling, reset generation and configured revocation policy.
+
+Account Token rotation retains all issued hashes through the fixed grant lifetime.
+Replaying any ancestor revokes its entire lineage and signs its Sessions out;
+rotation never extends the grant. Client authentication remains mandatory, while
+Session Tokens can move to a new DPoP key as the protocol permits. Shared provider
+signing does not bind a copied refresh token to one provider enrollment. Keep
+tokens secret and serialize rotation; never retry a lost token response blindly.
+Bounded database cleanup removes hashes only after their lineage is expired,
+revoked or absent. No plaintext callback code is persisted.
+
+Upgrade prerequisite: older issuers discarded ancestors beyond the previous hash.
+Those missing hashes cannot be reconstructed by this update. Before public
+enablement, revoke every pre-upgrade live lineage through the issuer's normal
+revocation/disconnect flow and require fresh consent, or prove it has expired.
+Until then, the full-ancestor guarantee applies only to newly created lineages.
+This update does not reset stored data or silently revoke legacy grants.
+
 Enable reference Device sign-in with `device: { endpoint, verificationUri,
 scopes }`. Route the configured device endpoint to `deviceAuthorization`.
 On the human page call `beginDeviceAuthorization(userCode, browserBinding)` and

@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 
 const root=fileURLToPath(new URL('../',import.meta.url));
 const digest=bytes=>createHash('sha256').update(bytes).digest('hex');
-export const mandatory=['candidate','fast','contracts','integration','packaged-linux','packaged-windows','packaged-macos','validation'];
+export const mandatory=['candidate','fast','contracts','postgres','integration','packaged-linux','packaged-windows','packaged-macos','validation'];
 const sha=value=>assert.match(value??'',/^[a-f0-9]{40}$/,'exact source SHA required');
 export function successful(needs){
   assert.ok(needs&&typeof needs==='object','missing prerequisites');

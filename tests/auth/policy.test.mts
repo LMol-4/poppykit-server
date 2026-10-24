@@ -16,8 +16,8 @@ const DAY = 86_400_000;
 function setup() {
   const clock = { now: NOW };
   const initial = initialIssuerState();
-  Object.assign(initial.sessions,{s1:{ clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW }});
-  Object.assign(initial.grants,{g1:{ clientId: CLIENT, accountId: 'acct_1', expiresAt: NOW + 30 * DAY, revoked: false }});
+  initial.sessions.s1 = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW, expiresAt: NOW + 7 * DAY, accountId: 'acct_1', grantId: 'g1' };
+  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['poppy:read'], expiresAt: NOW + 30 * DAY, revoked: false, refreshHash: '', previousHash: '' };
   const store = memoryStore(initial);
   const coordinator = memoryCoordinator();
   const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, poppyDomains: ['shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),directScopes:[], store, coordinator, now: () => clock.now });
@@ -64,6 +64,12 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
 
 test('expiry is not revocation: accepted work outlives its token, current readers need a live grant', async () => {
   const t = setup();
+  let runs = 0;
+  t.clock.now = t.signedIn.tokenExpiresAt - 1;
+  await t.policy.withCurrent(t.signedIn, ['poppy:read'], async () => { runs++; });
+  t.clock.now++;
+  await assert.rejects(t.policy.withCurrent(t.signedIn, [], async () => { runs++; }), { code: 'invalid_token' });
+  assert.equal(runs, 1);
   t.clock.now = t.signedIn.tokenExpiresAt + DAY;
   assert.equal(await t.policy.withAccepted(t.accepted(t.signedIn), ['poppy:read'], async () => 'continued'), 'continued');
   // An ended account sign-in (grant expiry) is not token expiry: stop policy ends account work.
@@ -87,8 +93,8 @@ test('revocation: stop policy ends account work, allow-finish continues it, curr
 test('disconnect revokes only that client and account', async () => {
   const t = setup();
   t.store.set(state => {
-    Object.assign(state.grants,{g2:{ clientId: CLIENT, accountId: 'acct_2', expiresAt: NOW + DAY, revoked: false }});
-    Object.assign(state.grants,{g3:{ clientId: 'https://agent.test/other.json', accountId: 'acct_1', expiresAt: NOW + DAY, revoked: false }});
+    state.grants.g2 = { ...state.grants.g1, accountId: 'acct_2' };
+    state.grants.g3 = { ...state.grants.g1, clientId: 'https://agent.test/other.json' };
   });
   await t.issuer.disconnect(CLIENT, 'acct_1');
   const { grants } = await t.store.read();

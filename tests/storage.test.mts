@@ -132,6 +132,8 @@ test('bounded SQLite cleanup isolates namespaces and retains grants, work, recei
       state.replay.expired = at - 1; state.replay.boundary = at;
       state.grants.retained = { clientId: CLIENT, userId: 'user', accountId: 'account', scopes: [], expiresAt: at - 1, revoked: true, refreshHash: 'refresh', previousHash: '' };
       state.refreshTokens.refresh = 'retained';
+      state.grants.active = { ...state.grants.retained, expiresAt: at + 1000, revoked: false, refreshHash: 'current', previousHash: 'previous' };
+      for (const hash of ['oldest', 'previous', 'current']) state.refreshTokens[hash] = 'active';
     });
   };
   await seed(namespace); await seed(other);
@@ -141,14 +143,17 @@ test('bounded SQLite cleanup isolates namespaces and retains grants, work, recei
     return { kind: row.kind, id: row.id, body: row.body };
   });
   const before = records(namespace), untouched = records(other), events = raw.prepare('SELECT * FROM events ORDER BY ns,conversation,seq').all();
-  const expired = new Set(['authorizations:expired', 'codes:expired', 'signIns:expired', 'accessTokens:expired', 'replay:expired']);
+  const expired = new Set(['authorizations:expired', 'codes:expired', 'signIns:expired', 'accessTokens:expired', 'replay:expired', 'refreshTokens:refresh']);
   for (const limit of [0, 1.5, 1001]) assert.throws(() => db.cleanup(namespace, at, limit), /cleanup limit/);
   assert.deepEqual(records(namespace), before);
   assert.equal(await db.cleanup(namespace, at, 1), 1);
   assert.equal(records(namespace).length, before.length - 1);
-  assert.equal(await db.cleanup(namespace, at, 100), 4);
+  assert.equal(await db.cleanup(namespace, at, 100), 5);
   assert.equal(await db.cleanup(namespace, at, 100), 0);
   assert.deepEqual(records(namespace), before.filter(row => !expired.has(row.kind + ':' + row.id)));
+  assert.deepEqual(records(other), untouched);
+  await db.cleanup(namespace, at + 1000, 100);
+  assert.ok(!records(namespace).some(row => row.kind === 'refreshTokens'), 'all expired ancestor hashes are collected');
   assert.deepEqual(records(other), untouched);
   assert.deepEqual(raw.prepare('SELECT * FROM events ORDER BY ns,conversation,seq').all(), events);
 });

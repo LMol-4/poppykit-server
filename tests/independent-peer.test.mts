@@ -5,13 +5,14 @@ import { independentAgent } from '../test-support/independent-agent.mjs';
 import { createReferenceIssuer } from '../dist/reference-auth/index.js';
 import { SqliteCompanyDatabase } from '../dist/sqlite.js';
 import { createConversationService, createRequestAuthenticator } from '../dist/index.js';
+import { resultCipher } from '../test-support/result-cipher.mjs';
 
 async function fixture(t: test.TestContext){
   const db=new SqliteCompanyDatabase(':memory:');t.after(()=>db.close());
   const peer=await independentAgent(),scopes=['poppy:read','record:view','record:edit'];
   function company(name: string){
     const issuer=`https://${name}.example/issuer`,endpoint=`https://${name}.example/conversations`;
-    const auth=createReferenceIssuer({issuer,tokenEndpoint:issuer+'/token',revocationEndpoint:issuer+'/revoke',poppyDomains:[name+'.example'],directScopes:scopes,resources:[endpoint,`https://${name}.example/other`],metadata:peer.metadata,store:db.issuer(issuer),coordinator:db,now:Date.now,requireDpopNonce:false});
+    const auth=createReferenceIssuer({issuer,tokenEndpoint:issuer+'/token',revocationEndpoint:issuer+'/revoke',poppyDomains:[name+'.example'],directScopes:scopes,resources:[endpoint,`https://${name}.example/other`],metadata:peer.metadata,store:db.issuer(issuer),coordinator:db,now:Date.now,requireDpopNonce:false,authorizationResultCipher:resultCipher()});
     const authenticator=createRequestAuthenticator({authority:auth.authority,endpoints:[{origin:new URL(endpoint).origin,pathPrefix:'/conversations',resource:endpoint}],now:Date.now});
     const service=createConversationService({endpoint,store:db.conversations(issuer),authenticator,policy:auth.authority.policy,clock:{now:Date.now},supportedScopes:scopes});
     return {issuer,endpoint,auth,authenticator,service};

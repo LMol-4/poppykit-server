@@ -19,8 +19,8 @@ const HOUR = 3_600_000;
 function setup(revocationPolicy?:WorkRevocationPolicy) {
   const clock = { t: NOW, now: () => clock.t };
   const initial = initialIssuerState();
-  Object.assign(initial.sessions,{s1:{ clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW }});
-  Object.assign(initial.grants,{g1:{ clientId: CLIENT, accountId: 'acct_1', expiresAt: NOW + 30 * 24 * HOUR, revoked: false }});
+  initial.sessions.s1 = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW, expiresAt: NOW + 24 * HOUR, accountId: 'acct_1', grantId: 'g1' };
+  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['poppy:read'], expiresAt: NOW + 30 * 24 * HOUR, revoked: false, refreshHash: '', previousHash: '' };
   const issuerStore = memoryStore(initial);
   const coordinator = memoryCoordinator();
   const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, poppyDomains: ['shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),directScopes:[], store: issuerStore, coordinator, now: clock.now });
@@ -39,6 +39,34 @@ function setup(revocationPolicy?:WorkRevocationPolicy) {
 }
 const message:Message = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?' };
 const reply:Message = { id: 'msg_r1', sender: 'agent', text: 'Shipped.' };
+
+test('token expiry fences buffered SSE frames and body reads after initial authentication', async () => {
+  const t = setup(), id = (await t.call('POST', '', { message })).body.conversation_id;
+  const response = await t.service.handle(new Request(`${endpoint}/${id}/events`, { headers: { accept: 'text/event-stream' } }));
+  const reader = response.body!.getReader();
+  assert.equal((await reader.read()).done, false);
+  t.clock.t = NOW + HOUR;
+  assert.equal((await reader.read()).done, true, 'buffered frames cannot outlive the token');
+  const u = setup(), other = (await u.call('POST', '', { message })).body.conversation_id;
+  const body = new ReadableStream<Uint8Array>({ pull(controller) {
+    u.clock.t = NOW + HOUR;
+    controller.enqueue(new TextEncoder().encode(JSON.stringify({ message: { ...message, id: 'after_body_wait' } })));
+    controller.close();
+  } }, { highWaterMark: 0 });
+  const rejected = await u.service.handle(new Request(`${endpoint}/${other}/messages`, { method: 'POST', body, duplex: 'half' } as RequestInit));
+  assert.equal(rejected.status, 401);
+  assert.ok(!(await u.store.read()).conversations[other].events.some(event => event.type === 'message' && (event.message as { id: string }).id === 'after_body_wait'));
+});
+
+test('a long-poll rechecks the token after its wait instead of returning protected events', async () => {
+  const t = setup(), id = (await t.call('POST', '', { message })).body.conversation_id;
+  const cursor = (await t.call('GET', `/${id}/events`)).body.cursor;
+  const reads = t.store.reads;
+  const waiting = t.call('GET', `/${id}/events?cursor=${cursor}&wait=1`);
+  await t.store.untilReads(reads + 1);
+  t.clock.t = NOW + HOUR;
+  assert.equal((await waiting).status, 401);
+});
 
 test('expired-token accepted work continues: bind, read history, reply and finish', async () => {
   const t = setup();

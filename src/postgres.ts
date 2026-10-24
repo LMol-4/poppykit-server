@@ -234,8 +234,8 @@ export class PostgresCompanyDatabase {
             }
             if (selection.kind === 'authorize') {
                 await get('signIns', clientRevisionKey(selection.clientId));
-                const pending = (await this.sqlGet("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='authorizations' AND ((body::jsonb#>>'{expiresAt}')::double precision)>$2", [namespace, selection.at]))!;
-                const client = (await this.sqlGet("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='authorizations' AND (body::jsonb#>>'{clientId}')=$2 AND ((body::jsonb#>>'{expiresAt}')::double precision)>$3", [namespace, selection.clientId, selection.at]))!;
+                const pending = (await this.sqlGet("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='authorizations' AND body::jsonb->'completion' IS NULL AND ((body::jsonb#>>'{expiresAt}')::double precision)>$2", [namespace, selection.at]))!;
+                const client = (await this.sqlGet("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='authorizations' AND body::jsonb->'completion' IS NULL AND (body::jsonb#>>'{clientId}')=$2 AND ((body::jsonb#>>'{expiresAt}')::double precision)>$3", [namespace, selection.clientId, selection.at]))!;
                 state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(pending.n), pendingForClient: Number(client.n) };
             }
             if (selection.kind === 'disconnect') {
@@ -289,8 +289,9 @@ export class PostgresCompanyDatabase {
             throw new TypeError('cleanup limit');
         return this.run(async () => {
             await this.db.lock(JSON.stringify([namespace, 'issuer']));
-            const rows = await this.sqlAll(`SELECT kind,id FROM poppy_server.records WHERE ns=$1 AND
-        ((kind IN ('authorizations','codes','accessTokens') AND ((body::jsonb#>>'{expiresAt}')::double precision)<=$2) OR (kind='signIns' AND ((body::jsonb#>>'{expiresAt}')::double precision)+30000<$3) OR (kind='replay' AND (body::jsonb#>>'{}')::double precision<$4)) LIMIT $5`, [namespace, now, now, now, limit]);
+            const rows = await this.sqlAll(`SELECT kind,id FROM poppy_server.records AS retained WHERE ns=$1 AND
+        ((kind IN ('authorizations','codes','accessTokens') AND ((body::jsonb#>>'{expiresAt}')::double precision)<=$2) OR (kind='signIns' AND ((body::jsonb#>>'{expiresAt}')::double precision)+30000<$3) OR (kind='replay' AND (body::jsonb#>>'{}')::double precision<$4)
+        OR (kind='refreshTokens' AND NOT EXISTS (SELECT 1 FROM poppy_server.records AS lineage WHERE lineage.ns=retained.ns AND lineage.kind='grants' AND lineage.id=retained.body::jsonb#>>'{}' AND (lineage.body::jsonb->>'expiresAt')::double precision>$5 AND lineage.body::jsonb->>'revoked'='false'))) LIMIT $6`, [namespace, now, now, now, now, limit]);
             for (const row of rows)
                 await this.sqlRun("DELETE FROM poppy_server.records WHERE ns=$1 AND kind=$2 AND id=$3", [namespace, row.kind, row.id]);
             return rows.length;

@@ -5,8 +5,8 @@ and [guides](https://personalagentprotocol.org/docs/0.2/guides). Tests/snapshots
 supporting evidence. Demo/business workflows and individual extensions are excluded.
 Code is [MIT](LICENSE); confirm rights for third-party contributions.
 
-Use Node 24.12.0, TypeScript 5.9.3 and @types/node 24.10.0.
-Install the packageManager-pinned pnpm and run pnpm install --frozen-lockfile.
+Use Node 24.22.1, TypeScript 5.9.3 and @types/node 24.10.0.
+Install the packageManager-pinned pnpm and run pnpm install --frozen-lockfile --ignore-scripts.
 
 ```sh
 npm run typecheck
@@ -36,3 +36,11 @@ Preserve credential/destination validation, private errors and persisted data.
 Report checks actually run and limits. Use Issues for non-sensitive defects and
 [SECURITY.md](SECURITY.md) for vulnerabilities. Follow [RELEASING.md](RELEASING.md)
 before tagging/publishing; obtain explicit owner authorization.
+
+Required CI also runs scripts/postgres-ci.mjs in a dedicated disposable PostgreSQL17
+cluster with POPPY_DISPOSABLE_POSTGRES=1, D1_LOCAL=1 and explicit loopback PGHOST,
+PGPORT, PGUSER, PGPASSWORD, PGDATABASE. Build production/tests first; use a fresh
+database without SDK schemas. Never point it at shared/cloud data. It migrates
+only this package's schemas, runs all named durable suites, rejects skips/missing
+discovery and leaves cluster destruction to its owner. Default source-suite skips
+do not replace this gate. See the workflow for the pinned image and setup.

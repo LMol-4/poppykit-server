@@ -11,7 +11,7 @@ export function absent(result){
 }
 export function toolchain(node,npm){
   const atLeast=(value,minimum)=>{const parts=value.trim().replace(/^v/,'').split('.').map(Number);return parts.every(Number.isInteger)&&parts.length===3&&parts.some((part,i)=>part>minimum[i]&&parts.slice(0,i).every((v,j)=>v===minimum[j]))||parts.join('.')===minimum.join('.');};
-  assert.ok(atLeast(node,[24,12,0]),'unsupported publishing Node');
+  assert.ok(/^v?24\./.test(node.trim()) && atLeast(node,[24,22,1]),'unsupported publishing Node');
   assert.ok(atLeast(npm,[11,5,1]),'npm trusted publishing requires npm >=11.5.1');
 }
 export function dependencyIntegrity(actual,expected){assert.equal(actual,expected,'published dependency differs from tested candidate');}

@@ -401,30 +401,33 @@ export function createConversationService(options: ConversationOptions): Convers
       if (!streaming) {
         const deadline = Date.now() + read.waitSeconds * 1000, logicalDeadline = clock.now() + read.waitSeconds * 1000;
         while (!(first.events as unknown[]).length && Date.now() < deadline && clock.now() < logicalDeadline && !signal.aborted) {
-          await wait(Math.min(pollIntervalMs,deadline-Date.now(),logicalDeadline-clock.now()), seen); seen = revision;
+          await wait(Math.min(pollIntervalMs,deadline-Date.now(),logicalDeadline-clock.now(),principal.tokenExpiresAt-clock.now()), seen); seen = revision;
           if (signal.aborted) throw signal.reason;
           first = await deliver();
         }
         signal.throwIfAborted(); cleanup(); return json(200, first);
       }
-      lifetime = setTimeout(cleanup, streamMs);
-      const encoder = new TextEncoder(), deadline = Date.now()+streamMs;
+      const duration = Math.max(0, Math.min(streamMs, principal.tokenExpiresAt-clock.now()));
+      lifetime = setTimeout(cleanup, duration);
+      const encoder = new TextEncoder(), deadline = Date.now()+duration;
       let pending = first, index = 0, bytes = 0, cancelled = false;
       const stream = new ReadableStream<Uint8Array>({
         async pull(target) {
           try {
+            if (clock.now() >= principal.tokenExpiresAt) { cleanup(); target.close(); return; }
             signal.throwIfAborted();
             while (index >= (pending.events as unknown[]).length) {
               if (Date.now() >= deadline || pending.status === 'closed' && !pending.has_more) { cleanup(); target.close(); return; }
               if (!pending.has_more) await wait(Math.min(pollIntervalMs,deadline-Date.now()),seen);
               signal.throwIfAborted(); seen=revision; pending=await deliver(); index=0;
             }
+            await policy.withCurrent(principal, [], async () => {});
             const event = (pending.events as ConversationEvent[])[index++];
             const frame = encoder.encode('id: '+event.id+'\ndata: '+JSON.stringify(event)+'\n\n');
             bytes += frame.byteLength;
             if (frame.byteLength > maxFrameBytes || bytes > 16777216) { cleanup(); target.close(); return; }
             cursor=event.id; target.enqueue(frame);
-          } catch (error) { const expired = stop.signal.aborted && !request.signal.aborted; cleanup(); if (cancelled) return; if (expired) target.close(); else target.error(error); }
+          } catch (error) { const expired = (stop.signal.aborted || clock.now() >= principal.tokenExpiresAt) && !request.signal.aborted; cleanup(); if (cancelled) return; if (expired) target.close(); else target.error(error); }
         },
         cancel() { cancelled = true; cleanup(); },
       },{highWaterMark:0});
@@ -531,7 +534,7 @@ export function createConversationService(options: ConversationOptions): Convers
   // Stable output IDs: true the first time, false for an identical repeat, a conflict for changed content.
   function firstOutput(work: WorkRecord, outputId: string, payload: string): boolean {
     const previous = own(work.outputs, outputId);
-    if (previous === undefined) { work.outputs[outputId] = payload; return true; }
+    if (previous === undefined) { work.outputs = { ...work.outputs, [outputId]: payload }; return true; }
     if (previous !== payload) throw new PublicationError('output_conflict');
     return false;
   }

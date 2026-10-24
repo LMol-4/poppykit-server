@@ -92,3 +92,7 @@ coverage/
 /tests/postgres-lifecycle.test.mjs.map
 /tests/postgres-storage.test.mjs
 /tests/postgres-storage.test.mjs.map
+/scripts/postgres-ci.mjs
+/scripts/postgres-ci.mjs.map
+/test-support/result-cipher.mjs
+/test-support/result-cipher.mjs.map

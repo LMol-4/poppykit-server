@@ -22,7 +22,7 @@ interface SessionRecord { clientId: string; userId: string; version: number; cre
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
 interface AccessTokenRecord { sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
-interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number }
+interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
 interface CodeRecord { clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
 export type SignInRecord =
@@ -44,7 +44,7 @@ export interface IssuerState {
   generation: string;
   sessions: Record<string, SessionRecord>;
   grants: Record<string, GrantRecord>;
-  refreshTokens: Record<string, string>; // Account Token hash -> grant ID, current and previous only
+  refreshTokens: Record<string, string>; // Every issued Account Token hash -> grant ID, through the grant's fixed expiry
   authorizations: Record<string, AuthorizationRecord>;
   codes: Record<string, CodeRecord>;
   signIns: Record<string, SignInRecord>;
@@ -58,6 +58,8 @@ export interface ReferenceIssuerOptions {
   resources?: string[]; // exact supported resource identifiers; absent resource means default
   mcpResources?: { url: string; dpop: boolean }[];
   metadata: MetadataResolver;
+  /** Required for Direct Sign-In: synchronous authenticated encryption with a durable host-owned key. */
+  authorizationResultCipher?: { seal(value: string): string; open(value: string): string };
   store: IssuerStore;
   coordinator: AuthorityCoordinator; // deployment-wide, shared with conversation work and reset
   now: () => number;
@@ -525,8 +527,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const scopes = requested ?? lineage.scopes;
         if (!scopes.every(item => lineage.scopes.includes(item))) throw new TokenError('invalid_scope');
         const successor = random(32);
-        // Older hashes are forgotten: the previous one is enough to revoke after a lost rotation response.
-        delete draft.refreshTokens[lineage.previousHash];
+        // Retain ancestors until the fixed grant expiry so every replay can revoke its descendants.
         lineage.previousHash = lineage.refreshHash; lineage.refreshHash = tokenHash(successor); draft.refreshTokens[lineage.refreshHash] = grantId;
         record.accountId = lineage.accountId; record.grantId = grantId;
         return { ...grant(id, record, grantId, scopes), refresh_token: successor, refresh_token_expires_in: Math.floor((lineage.expiresAt - at) / 1000) };
@@ -555,9 +556,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const presented = tokenHash(refreshToken!);
       const grantId = own(draft.refreshTokens, presented);
       const lineage = grantId === undefined ? undefined : own(draft.grants, grantId);
-      // Reuse of the previous Account Token (e.g. a retry after a lost response) revokes the lineage, so its Sessions
+      // Reuse of any ancestor Account Token (e.g. a retry after a lost response) revokes the lineage, so its Sessions
       // continue signed out instead of staying bound to a successor nobody holds (RFC 9700 4.14.2).
-      if (lineage && lineage.clientId === clientId && presented === lineage.previousHash) { revokeGrant(draft, grantId!); return null; }
+      if (lineage && lineage.clientId === clientId && presented !== lineage.refreshHash) { revokeGrant(draft, grantId!); return null; }
       // A rotated Account Token never issues another successor.
       if (!lineage || !grantLive(lineage, at) || lineage.clientId !== clientId || lineage.refreshHash !== presented) throw new TokenError('invalid_grant');
       return sessionId === undefined ? signIn(...create(lineage.userId), grantId!) : signIn(sessionId, existing(lineage.userId), grantId!);
@@ -616,7 +617,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const state = await read({ kind: 'principal', sessionId: principal.sessionId, ...(principal.grantId ? { grantId: principal.grantId } : {}) });
       const session = own(state.sessions, principal.sessionId);
       if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
-        || session.expiresAt <= now() || session.userId !== principal.userId || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
+        || principal.tokenExpiresAt <= now() || session.expiresAt <= now() || session.userId !== principal.userId || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
       requireScopes(principal.scopes, scopes);
       return action();
     }),
@@ -681,6 +682,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     // Validates the whole request before persisting anything; the host renders login and consent from the view.
     // Unauthenticated: hosts must rate-limit their /authorize route; the pending cap only bounds state and coordinator time.
     async beginAuthorization(request, browserBinding) {
+      if (!options.authorizationResultCipher) throw new TypeError('authorizationResultCipher is required for Direct Sign-In');
       if (typeof browserBinding !== 'string' || !browserBinding) throw new TypeError('browserBinding');
       const params = uniqueParams(new URL(request.url).searchParams, () => new AuthorizationError('invalid_request'));
       const clientId = params.get('client_id'); const redirectUri = params.get('redirect_uri');
@@ -706,7 +708,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         if (draft.generation !== generation) throw new AuthorizationError('invalid_request');
         const at = now(); prune(draft, at);
         // shortcut: an unauthenticated caller can fill one client's slots for AUTHORIZATION_MS (10 minutes); hosts must rate-limit /authorize.
-        const pending = Object.values(draft.authorizations);
+        const pending = Object.values(draft.authorizations).filter(record => !record.completion);
         if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(record => record.clientId === clientId).length) >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
         draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt, revision: revision(draft, clientRevisionKey(clientId)) };
@@ -714,24 +716,37 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       });
     },
 
-    // Consumes the authorization once; the browser binding is checked before deny as well as approve.
+    // Commit once; a bound identical decision can recover the encrypted callback without minting another code.
     async completeAuthorization(id, browserBinding, decision) {
+      const cipher = options.authorizationResultCipher;
+      if (!cipher) throw new TypeError('authorizationResultCipher is required for Direct Sign-In');
       if (typeof id !== 'string' || typeof browserBinding !== 'string') throw new AuthorizationError('invalid_request');
       const snapshot = own((await read({ kind: 'authorization', id })).authorizations, id);
       const accountId = 'accountId' in decision && typeof decision.accountId === 'string' ? decision.accountId : undefined;
       const href = await commit({ kind: 'authorization', id, ...(snapshot && accountId ? { revocationKey: accountRevisionKey(snapshot.clientId, accountId) } : {}) }, draft => {
         const record = own(draft.authorizations, id);
         if (!record || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
-        const fields = { state: record.state, iss: issuer };
-        if ('denied' in decision && decision.denied === true) { delete draft.authorizations[id]; return callback(record.redirectUri, { error: 'access_denied', ...fields }); }
+        const denied = 'denied' in decision && decision.denied === true;
         const { accountId, scopes } = decision as { accountId: unknown; scopes: unknown };
         // Partial consent narrows; the host may never grant more than was requested.
-        if (typeof accountId !== 'string' || !accountId || !Array.isArray(scopes) || !scopes.length || !scopes.every(scope => record.scopes.includes(scope))) throw new TypeError('decision');
-        if (!consentCurrent(draft, record.clientId, accountId, record.revision)) throw new AuthorizationError('invalid_request');
-        delete draft.authorizations[id];
+        if (!denied && (typeof accountId !== 'string' || !accountId || !Array.isArray(scopes) || !scopes.length || !scopes.every(scope => record.scopes.includes(scope)))) throw new TypeError('decision');
+        if (!denied && !consentCurrent(draft, record.clientId, accountId as string, record.revision)) throw new AuthorizationError('invalid_request');
+        const granted = denied ? [] : [...new Set(scopes as string[])].sort();
+        const decisionHash = tokenHash(JSON.stringify(denied ? { denied: true } : { accountId, scopes: granted }));
+        if (record.completion) {
+          if (record.completion.decisionHash !== decisionHash) throw new AuthorizationError('invalid_request');
+          return cipher.open(record.completion.callback);
+        }
+        const fields = { state: record.state, iss: issuer };
+        if (denied) {
+          const href = callback(record.redirectUri, { error: 'access_denied', ...fields });
+          record.completion = { decisionHash, callback: cipher.seal(href) }; return href;
+        }
         const code = random(32);
-        draft.codes[tokenHash(code)] = { clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId, scopes: [...new Set(scopes as string[])], expiresAt: now() + CODE_MS, grantId: null, revision: record.revision };
-        return callback(record.redirectUri, { code, ...fields });
+        record.expiresAt = Math.min(record.expiresAt, now() + CODE_MS);
+        draft.codes[tokenHash(code)] = { clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId: accountId as string, scopes: granted, expiresAt: record.expiresAt, grantId: null, revision: record.revision };
+        const href = callback(record.redirectUri, { code, ...fields });
+        record.completion = { decisionHash, callback: cipher.seal(href) }; return href;
       });
       return new URL(href);
     },
