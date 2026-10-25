@@ -5,7 +5,7 @@ and [guides](https://personalagentprotocol.org/docs/0.2/guides). Tests/snapshots
 supporting evidence. Demo/business workflows and individual extensions are excluded.
 Code is [MIT](LICENSE); confirm rights for third-party contributions.
 
-Use Node 24.22.1, TypeScript 5.9.3 and @types/node 24.10.0.
+Use Node 24.21.0, TypeScript 5.9.3 and @types/node 24.10.0.
 Install the packageManager-pinned pnpm and run pnpm install --frozen-lockfile --ignore-scripts.
 
 ```sh

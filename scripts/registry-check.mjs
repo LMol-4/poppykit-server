@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {readFileSync} from 'node:fs';
+const minimumNode=readFileSync(new URL('../.node-version',import.meta.url),'utf8').trim().split('.').map(Number);
 import {spawnSync} from 'node:child_process';
 import {join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -11,7 +13,7 @@ export function absent(result){
 }
 export function toolchain(node,npm){
   const atLeast=(value,minimum)=>{const parts=value.trim().replace(/^v/,'').split('.').map(Number);return parts.every(Number.isInteger)&&parts.length===3&&parts.some((part,i)=>part>minimum[i]&&parts.slice(0,i).every((v,j)=>v===minimum[j]))||parts.join('.')===minimum.join('.');};
-  assert.ok(/^v?24\./.test(node.trim()) && atLeast(node,[24,22,1]),'unsupported publishing Node');
+  assert.ok(/^v?24\./.test(node.trim()) && atLeast(node,minimumNode),'unsupported publishing Node');
   assert.ok(atLeast(npm,[11,5,1]),'npm trusted publishing requires npm >=11.5.1');
 }
 export function dependencyIntegrity(actual,expected){assert.equal(actual,expected,'published dependency differs from tested candidate');}

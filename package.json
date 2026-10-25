@@ -1,6 +1,6 @@
 {
   "name": "@poppykit/server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": false,
   "description": "Personal Agent Protocol company SDK",
   "repository": {
@@ -9,7 +9,7 @@
   },
   "type": "module",
   "engines": {
-    "node": ">=24.22.1 <25"
+    "node": ">=24.21.0 <25"
   },
   "packageManager": "pnpm@11.25.0",
   "scripts": {

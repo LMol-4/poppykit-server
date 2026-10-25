@@ -1,10 +1,10 @@
 # Company persistence and authorization
 
-Request paths use targeted domain selections, not whole-state rewrites. Node 24.x, at least 24.22.1, is required.
+Request paths use targeted domain selections, not whole-state rewrites. Node 24.x, at least 24.21.0, is required.
 The optional `@poppykit/server/sqlite` entry point exports `SqliteCompanyDatabase`.
 The core and reference issuer entry points do not import SQLite. Consumers can
 implement `ConversationStore`, `IssuerStore` and `AuthorityCoordinator` themselves.
-The tested Node 24.22.1 runtime marks `node:sqlite` experimental.
+The tested Node 24.21.0 runtime marks `node:sqlite` experimental.
 
 ```ts
 import { SqliteCompanyDatabase } from '@poppykit/server/sqlite';
@@ -118,7 +118,7 @@ reset or history deletion was added.
 `@poppykit/server/postgres` ships `PostgresCompanyDatabase`, explicit migrations,
 and `createPostgresPool` in this package. Install optional peer `pg@8.23.1` when
 using that subpath. Core/reference-auth imports load neither database driver.
-Supported baseline: Node 24.x (at least 24.22.1), PostgreSQL 17, including Supabase transaction pooling.
+Supported baseline: Node 24.x (at least 24.21.0), PostgreSQL 17, including Supabase transaction pooling.
 No application, Google login or Supabase Auth dependency is required.
 
 ```ts

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+Support Node 24.21.0 and later within Node 24 under the owner-accepted runtime policy.
+Build, verification and publication tooling read .node-version.
+
 ## 0.3.0
 
 Require Node 24 >=24.22.1 within 24.x. Enforce current-token expiry after waits and
