@@ -15,6 +15,24 @@ import * as wire from '../../dist/protocol/wire.js';
 import { parseClientMetadata } from '../../dist/network/discovery.js';
 import { registeredRedirect } from '../../dist/network/redirect.js';
 
+test('excluded tasks cache public data and revalidate alternatives against current discovery; hints stay conservative', async () => {
+  const source = { protocol_version: '0.3', organization: { name: 'Shop', domain: 'shop.example' }, web: {},
+    auth: { issuer: 'https://shop.example/auth', scope_hints: { 'orders:read': { changes: 'future', personal_data: true, unknown: 'ignored' } } },
+    excluded_tasks: { url: 'https://shop.example/tasks' }, apis: [{ type: 'mcp', url: 'https://shop.example/mcp', description: 'Tools' }] };
+  const doc = parsePoppyDocument(source, 'https://shop.example/.well-known/poppy.json');
+  assert.deepEqual(doc.auth?.scope_hints, { 'orders:read': { changes: 'irreversible', personal_data: true } });
+  for (const hint of [{ changes: 'none' }, { personal_data: false }, { changes: 'none', personal_data: 'no' }]) assert.throws(() => parsePoppyDocument({ ...source, auth: { issuer: source.auth.issuer, scope_hints: { 'orders:read': hint } } }, 'https://shop.example/.well-known/poppy.json'));
+  let calls = 0, now = 0, body: unknown = { tasks: [{ task: 'Export', future: 'ignored', alternative: { references: [{ type: 'mcp', url: 'https://shop.example/mcp', tool: 'export' }, { type: 'future' }] } }] };
+  const resolver = createMetadataResolver({ async fetch(request) { calls++; assert.equal(request.headers.get('authorization'), null); assert.equal(request.headers.get('cookie'), null); return Response.json(body, { headers: { 'cache-control': 'max-age=120' } }); } }, { now: () => now });
+  const read = expectValue(resolver.resolveExcludedTasks).bind(resolver);
+  assert.deepEqual(await read(doc), [{ task: 'Export', alternative: { references: [{ type: 'mcp', url: 'https://shop.example/mcp', tool: 'export' }] } }]);
+  await read(doc); assert.equal(calls, 1);
+  assert.deepEqual(await read({ ...doc, apis: [] }), [{ task: 'Export', alternative: { references: [] } }]); assert.equal(calls, 1);
+  now = 120001; body = { tasks: [{ task: 'x'.repeat(201) }] }; await assert.rejects(read(doc)); assert.equal(calls, 2);
+  body = { tasks: [{ task: 'Export', alternative: { references: [{ type: 'web', url: 'javascript:unsafe()' }] } }] }; await assert.rejects(read(doc));
+  assert.deepEqual(await read({ ...doc, excluded_tasks: undefined }), []);
+});
+
 test('loopback redirect exception allows literal IP ports and preserves every other component', async () => {
   const client = 'https://agent.example/client', registered = ['http://127.0.0.1:8000/cb?route=fixed', 'http://[::1]:8000/cb'];
   const metadata = { client_id: client, client_name: 'Agent', jwks_uri: 'https://agent.example/keys', redirect_uris: registered, token_endpoint_auth_method: 'private_key_jwt' };

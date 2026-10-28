@@ -295,9 +295,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const refreshHash = tokenHash(refreshToken);
     draft.grants[grantId] = { clientId: target.clientId, userId: target.userId, accountId, scopes: [...scopes], expiresAt: at + accountLifetimeMs, revoked: false, refreshHash, previousHash: '' };
     draft.refreshTokens[refreshHash] = grantId; target.accountId = accountId; target.grantId = grantId; target.expiresAt = at + sessionMs;
-    const bearer = isBearerResource(resource);
-    draft.accessTokens[tokenHash(accessToken)] = { sessionId, grantId, scopes: [...scopes], resource: resource ?? null, jkt: bearer ? '' : jkt, expiresAt: at + lifetimeMs };
-    return { grantId, body: { access_token: accessToken, token_type: bearer ? 'Bearer' : 'DPoP', expires_in: lifetimeSeconds, refresh_token: refreshToken, refresh_token_expires_in: Math.floor(accountLifetimeMs / 1000), scope: scopes.join(' ') } };
+    draft.accessTokens[tokenHash(accessToken)] = { sessionId, grantId, scopes: [...scopes], resource: resource ?? null, jkt, expiresAt: at + lifetimeMs };
+    return { grantId, body: { access_token: accessToken, token_type: 'DPoP', expires_in: lifetimeSeconds, refresh_token: refreshToken, refresh_token_expires_in: Math.floor(accountLifetimeMs / 1000), scope: scopes.join(' ') } };
   }
   function signInScopes(scope: string | undefined, allowed: readonly string[]): string[] {
     const scopes = scope?.split(' ') ?? [];
@@ -334,8 +333,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     if (!options.device) throw new TokenError('unsupported_grant_type');
     const { clientId, clientAssertion } = clientCredentials(params), code = params.get('device_code'), resource = params.get('resource');
     if (!code || params.has('session_id') || params.has('assertion')) throw new TokenError('invalid_request');
-    if (resource !== undefined && !resources.includes(resource)) throw new TokenError('invalid_target');
-    const state = await read(), bearer = isBearerResource(resource);
+    if (resource !== undefined && (!resources.includes(resource) || isBearerResource(resource))) throw new TokenError('invalid_target');
+    const state = await read();
     const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
     if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
     const { client, keys } = await authenticateClient(clientId, clientAssertion);
@@ -462,10 +461,37 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     }
   }
 
+  async function exchangeToken(request: Request, params: Map<string, string>): Promise<Response> {
+    const { clientId, clientAssertion } = clientCredentials(params);
+    const subject = params.get('subject_token'), resource = params.get('resource');
+    if (!subject || params.get('subject_token_type') !== 'urn:ietf:params:oauth:token-type:access_token' || ['assertion', 'session_id', 'refresh_token', 'code', 'actor_token', 'actor_token_type'].some(key => params.has(key)) || (params.has('requested_token_type') && params.get('requested_token_type') !== 'urn:ietf:params:oauth:token-type:access_token')) throw new TokenError('invalid_request');
+    if (!resource || !isBearerResource(resource)) throw new TokenError('invalid_target');
+    const state = await read();
+    const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
+    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
+    const { client, keys } = await authenticateClient(clientId, clientAssertion);
+    for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
+    const replayKey = 'assertion ' + clientId + ' ' + client.jti, proofKey = 'proof ' + proof.jkt + ' ' + proof.claims.jti;
+    const body = await commit({ kind: 'sign_in', ids: [], sessionKey: proof.jkt, clientId, accessHash: tokenHash(subject), replayKeys: [replayKey, proofKey], at: now() }, draft => {
+      const at = now(), token = own(draft.accessTokens, tokenHash(subject)), session = token && own(draft.sessions, token.sessionId);
+      if (draft.generation !== state.generation || !current(client)) throw new TokenError('invalid_client');
+      if ((proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000 <= at) throw new TokenError('invalid_dpop_proof');
+      if (!token || !session || !token.jkt || token.jkt !== proof.jkt || own(draft.sessionKeys, proof.jkt) !== token.sessionId || session.clientId !== clientId || token.expiresAt <= at || session.expiresAt <= at || session.grantId !== token.grantId || (token.grantId !== null && !grantLive(own(draft.grants, token.grantId), at))) throw new TokenError('invalid_grant');
+      const scopes = params.has('scope') ? signInScopes(params.get('scope'), token.scopes) : [...token.scopes];
+      if ((own(draft.replay, proofKey) ?? 0) > at) throw new TokenError('invalid_dpop_proof');
+      consumeReplay(draft, replayKey, client.exp * 1000); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
+      const access = random(32), expiresAt = Math.min(at + lifetimeMs, session.expiresAt);
+      draft.accessTokens[tokenHash(access)] = { sessionId: token.sessionId, grantId: token.grantId, scopes, resource, jkt: '', expiresAt };
+      return { access_token: access, issued_token_type: 'urn:ietf:params:oauth:token-type:access_token', token_type: 'Bearer', expires_in: Math.floor((expiresAt - at) / 1000), scope: scopes.join(' ') };
+    });
+    return json(200, body);
+  }
+
   async function issue(request: Request): Promise<Response> {
     const params = await readParams(request);
     const grantType = params.get('grant_type');
     if (!grantType) throw new TokenError('invalid_request');
+    if (grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') return exchangeToken(request, params);
     if (grantType === DEVICE_GRANT) return pollDevice(request, params);
     if (grantType !== JWT_BEARER && grantType !== 'authorization_code' && grantType !== 'refresh_token') throw new TokenError('unsupported_grant_type');
     const { clientId, clientAssertion } = clientCredentials(params);
@@ -489,11 +515,10 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const requested = scope === undefined || grantType === JWT_BEARER ? undefined : [...new Set(scope.split(' ').filter(Boolean))];
     if (requested?.length === 0) throw new TokenError('invalid_scope');
     // Resources are exact configured identifiers, chosen per token request; grants are never narrowed to one.
-    if (resource !== undefined && !resources.includes(resource)) throw new TokenError('invalid_target');
+    if (resource !== undefined && (!resources.includes(resource) || isBearerResource(resource))) throw new TokenError('invalid_target');
 
     const state = await read(); const generation = state.generation;
     // htu is checked against the configured token endpoint, never the incoming Request URL.
-    const bearerResource = isBearerResource(resource);
     const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
     // Nonce challenge precedes any network fetch and any replay consumption.
     if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
@@ -542,8 +567,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const accessToken = random(32);
       const grant = (id: string, record: SessionRecord, grantId: string | null, scopes: string[]) => {
         record.expiresAt = at + sessionMs;
-        draft.accessTokens[tokenHash(accessToken)] = { sessionId: id, grantId, scopes, resource: resource ?? null, jkt: bearerResource ? '' : proof.jkt, expiresAt: at + lifetimeMs };
-        return { access_token: accessToken, token_type: bearerResource ? 'Bearer' : 'DPoP', expires_in: lifetimeSeconds, ...(grantId === null ? {} : { scope: scopes.join(' ') }) };
+        draft.accessTokens[tokenHash(accessToken)] = { sessionId: id, grantId, scopes, resource: resource ?? null, jkt: proof.jkt, expiresAt: at + lifetimeMs };
+        return { access_token: accessToken, token_type: 'DPoP', expires_in: lifetimeSeconds, ...(grantId === null ? {} : { scope: scopes.join(' ') }) };
       };
       // Signs the Session in to the lineage and rotates its Account Token: consume, successor and session update in this one commit.
       const signIn = (id: string, record: SessionRecord, grantId: string) => {
@@ -664,13 +689,11 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   return {
     browserSessions: {
       async current(binding) { return browserSession(await read({ kind: 'browser', sessionId: binding.sessionId }), binding); },
-      join(binding, assertion) {
-        const replayKey = `assertion ${binding.clientId} ${assertion.jti}`;
-        return commit({ kind: 'browser', sessionId: binding.sessionId, replayKey }, draft => {
-          if (assertion.expiresAt <= now() || assertion.expiresAt > now() + 90000 || !assertion.jti || assertion.jti.length > 256 || (own(draft.replay, replayKey) ?? 0) > now()) throw new AuthorityError('invalid_token');
-          const session = browserSession(draft, binding);
-          draft.replay[replayKey] = assertion.expiresAt; return session;
-        });
+      async join(sessionKey) {
+        const state = await read({ kind: 'sign_in', ids: [], sessionKey, replayKeys: [], at: now() });
+        const id = own(state.sessionKeys, sessionKey), session = id && own(state.sessions, id);
+        if (!id || !session) throw new AuthorityError('invalid_token');
+        return browserSession(state, { clientId: session.clientId, userId: session.userId, sessionId: id });
       },
     },
     token: request => respond(request, issue),
@@ -792,7 +815,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         ...(options.device ? { device_authorization_endpoint: options.device.endpoint } : {}),
         dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true,
         protected_resources: [...options.protectedResources],
-        grant_types_supported: [JWT_BEARER, 'refresh_token', ...(options.authorizationEndpoint ? ['authorization_code'] : []), ...(options.device ? [DEVICE_GRANT] : [])],
+        grant_types_supported: [JWT_BEARER, 'refresh_token', ...(mcpResources.some(entry => !entry.dpop) ? ['urn:ietf:params:oauth:grant-type:token-exchange'] : []), ...(options.authorizationEndpoint ? ['authorization_code'] : []), ...(options.device ? [DEVICE_GRANT] : [])],
         scopes_supported: [...options.supportedScopes],
       };
     },

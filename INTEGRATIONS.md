@@ -27,8 +27,12 @@ MCP metadata identifies the exact resource URL, issuer and ES256 support when
 enabled. Challenges include Bearer and, if supported, DPoP with `resource_metadata`.
 The exact endpoint accepts no child paths or added query. All other APIs retain
 DPoP-only authentication. Configure the reference issuer `mcpResources` with the
-same `{url,dpop}` list: every grant chooses Bearer for a non-DPoP MCP server even
-when a proof was provided. DPoP MCP requires a valid proof. Bearer tokens are
+same `{url,dpop}` list. Non-DPoP MCP targets require Token Exchange of a current
+DPoP Session Token, a matching client assertion and the Session Key proof. Other
+grants reject those targets with invalid_target; exchange rejects DPoP MCP targets.
+Exchange preserves the Session and narrows subject scopes without rotating an
+Account Token. Metadata advertises exchange when a Bearer-only MCP resource exists.
+DPoP MCP continues using normal DPoP token grants. Bearer tokens are
 resource-bound; DPoP-bound tokens cannot be presented as Bearer.
 
 An existing issuer can accept ordinary MCP OAuth clients through its own flow.
@@ -43,7 +47,7 @@ implements personal-agent grants; it does not add a general OAuth login product.
 
 ```ts
 const browser = createBrowserSessions({ endpoint: browserEndpoint, domain: companyDomain,
-  metadata, authority: referenceIssuer.browserSessions,
+  authority: referenceIssuer.browserSessions,
   policy: referenceIssuer.authority.policy, cookies: cookieStore, now: Date.now,
 });
 // Mount browser.join on browserEndpoint; no request-body logging at this route.
@@ -52,15 +56,21 @@ const result = await browser.withSession(request, ['records:read'], principal =>
 
 `BrowserCookieStore.put/get` stores SHA256 cookie-value hashes, session bindings and
 expiry. Supply durable storage with targeted operations and expire old rows. Never
-store plaintext cookie values. `BrowserSessionAuthority.join` must atomically
-consume assertion jti and validate an active same-client/same-user session; `current`
-must read current session permissions. The reference issuer implements both on its
-existing durable issuer store/coordinator; SQLite uses targeted browser selectors.
+store plaintext cookie values. The same store must implement `putJoin(codeHash,
+{cookieHash, expiresAt})` and atomic `consumeJoin(codeHash)`, which removes and
+returns the entry even if expired. Expire abandoned joins and rate-limit the public
+route in the host. Cookie/code hashes may be shared durably across handler replicas.
+`BrowserSessionAuthority.join(sessionKey)` resolves an existing active key; it never
+creates a Session. `current` reads current permissions. The reference issuer uses
+targeted key/Session selectors on its existing memory/SQLite/PostgreSQL stores.
 
-The browser handler verifies JWKS signature, asymmetric algorithm, typ, exact aud,
-times/lifetime, replay, client/user/session and HTTPS company return URL. Invalid
-requests return 400 with no cookie; successful requests set a host-only cookie and
-return 303 to the validated URL. Defaults are `__Host-poppy-session`, Path=/, Secure,
+Mount both GET and POST. GET sets only a 60-second Strict __Host-poppy_join cookie
+and emits a random 256-bit hidden code, no-store, frame-ancestors none and same-origin
+opener isolation. POST consumes the submitted code first, including failed cookie,
+origin and proof checks. It requires that browser's cookie and a valid Session Key
+DPoP proof whose nonce is the code and which has no ath. Invalid requests return 400
+with no cookie; success clears the join cookie, sets the Session cookie and returns
+303 to the endpoint's website root. No provider signing/JWKS assertion is involved. Defaults are `__Host-poppy-session`, Path=/, Secure,
 HttpOnly, SameSite=Lax and max 3600 seconds capped by the current session lifetime.
 SameSite=None is supported; Strict is refused. `authenticate` resolves current
 authority on every request. Use `withSession` for scoped mutations so permission

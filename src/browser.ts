@@ -1,23 +1,22 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { compactVerify, createLocalJWKSet, decodeJwt, errors } from 'jose';
-import type { JSONWebKeySet } from 'jose';
-import type { MetadataResolver } from './network/discovery.js';
 import { secureUrl } from './network/transport.js';
-import { parseJson, object } from './protocol/wire.js';
-import { assertUniqueJwtMembers } from './auth/dpop.js';
+import { verifyDpopProof } from './auth/dpop.js';
 import type { Principal, AuthorityPolicy } from './auth/authority.js';
 import { AuthorityError } from './auth/authority.js';
 
 export interface BrowserBinding { clientId: string; userId: string; sessionId: string; issuerGeneration?: string }
 export interface BrowserSession extends BrowserBinding { principal: Principal; expiresAt: number }
 export interface BrowserSessionAuthority {
-  // Must atomically validate the live client/user/session and consume jti until expiresAt.
-  join(binding: BrowserBinding, assertion: { jti: string; expiresAt: number }): Promise<BrowserSession>;
+  // Resolve only an existing active Session Key; never create a Session.
+  join(sessionKey: string): Promise<BrowserSession>;
   current(binding: BrowserBinding): Promise<BrowserSession>;
 }
 export interface BrowserCookieStore {
   put(hash: string, binding: BrowserBinding & { expiresAt: number }): Promise<void>;
   get(hash: string): Promise<(BrowserBinding & { expiresAt: number }) | null>;
+  putJoin(codeHash: string, binding: { cookieHash: string; expiresAt: number }): Promise<void>;
+  // Atomically remove and return, including expired entries. First submission consumes the code on any result.
+  consumeJoin(codeHash: string): Promise<{ cookieHash: string; expiresAt: number } | null>;
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('base64url');
 export async function boundedText(request: Request, max: number): Promise<string> {
@@ -29,13 +28,14 @@ export async function boundedText(request: Request, max: number): Promise<string
   return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(parts));
 }
 export function createBrowserSessions(options: {
-  endpoint: string; domain: string; metadata: MetadataResolver; authority: BrowserSessionAuthority;
+  endpoint: string; domain: string; authority: BrowserSessionAuthority;
   cookies: BrowserCookieStore; policy: AuthorityPolicy; now: () => number;
   cookieName?: string; sameSite?: 'Lax' | 'None'; cookieLifetimeSeconds?: number;
 }) {
-  secureUrl(options.endpoint);
+  const endpoint = secureUrl(options.endpoint);
   const name = options.cookieName ?? '__Host-poppy-session', sameSite = options.sameSite ?? 'Lax', lifetime = options.cookieLifetimeSeconds ?? 3600;
   if (!/^[A-Za-z0-9_-]+$/.test(name) || !['Lax', 'None'].includes(sameSite) || !Number.isSafeInteger(lifetime) || lifetime < 1 || !/^[a-z0-9.-]+$/i.test(options.domain)) throw new TypeError('browser options');
+  if (name === '__Host-poppy_join' || (endpoint.hostname !== options.domain.toLowerCase() && !endpoint.hostname.endsWith(`.${options.domain.toLowerCase()}`))) throw new TypeError('browser options');
   const invalid = () => new Error('Invalid browser session');
   async function authenticate(request: Request): Promise<Principal> {
     const cookies = (request.headers.get('cookie') ?? '').split(';').map(part => part.trim().split('='));
@@ -59,28 +59,39 @@ export function createBrowserSessions(options: {
     },
     async join(request: Request): Promise<Response> {
       try {
-        if (request.method !== 'POST' || request.url !== options.endpoint || request.headers.get('content-type')?.split(';')[0] !== 'application/x-www-form-urlencoded') throw invalid();
+        if (request.url !== options.endpoint) throw invalid();
+        if (request.method === 'GET') {
+          const code = randomBytes(32).toString('base64url'), cookie = randomBytes(32).toString('base64url');
+          await options.cookies.putJoin(hash(code), { cookieHash: hash(cookie), expiresAt: options.now() + 60000 });
+          return new Response(`<!doctype html><title>Connecting</title><form method="post"><input type="hidden" name="code" value="${code}"><input type="text" name="proof"></form>`, { headers: {
+            'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+            'Content-Security-Policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'", 'Cross-Origin-Opener-Policy': 'same-origin',
+            'Set-Cookie': '__Host-poppy_join=' + cookie + '; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Strict',
+          } });
+        }
+        if (request.method !== 'POST' || request.headers.get('content-type')?.split(';')[0] !== 'application/x-www-form-urlencoded') throw invalid();
         const fields = new URLSearchParams(await boundedText(request, 16384));
-        if (fields.getAll('assertion').length !== 1 || [...fields.keys()].some(key => key !== 'assertion')) throw invalid();
-        const jwt = fields.get('assertion')!; if (jwt.length > 8192) throw invalid();
-        assertUniqueJwtMembers(jwt);
-        const untrusted = decodeJwt(jwt); if (typeof untrusted.iss !== 'string') throw invalid();
-        const client = await options.metadata.resolveClient(untrusted.iss);
-        let keys = await options.metadata.resolveJwks(client.jwks_uri) as unknown as JSONWebKeySet;
-        let verified;
-        try { verified = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ['ES256', 'RS256'] }); }
-        catch (error) { if (!(error instanceof errors.JWKSNoMatchingKey)) throw error; keys = await options.metadata.resolveJwks(client.jwks_uri, { refresh: true }) as unknown as JSONWebKeySet; verified = await compactVerify(jwt, createLocalJWKSet(keys), { algorithms: ['ES256', 'RS256'] }); }
-        const claims = object(parseJson(new TextDecoder().decode(verified.payload)));
-        if (verified.protectedHeader.typ?.toLowerCase().replace(/^application\//, '') !== 'poppy-browser+jwt' || claims.iss !== client.client_id || claims.aud !== options.endpoint || typeof claims.sub !== 'string' || !claims.sub || claims.sub.length > 256 || typeof claims.session_id !== 'string' || !claims.session_id || typeof claims.jti !== 'string' || !claims.jti || claims.jti.length > 256 || !Number.isSafeInteger(claims.iat) || !Number.isSafeInteger(claims.exp) || (claims.exp as number) <= options.now() / 1000 || (claims.iat as number) > options.now() / 1000 + 30 || (claims.exp as number) <= (claims.iat as number) || (claims.exp as number) - (claims.iat as number) > 60 || typeof claims.return_to !== 'string') throw invalid();
-        const destination = secureUrl(claims.return_to);
-        if (destination.hostname !== options.domain.toLowerCase() && !destination.hostname.endsWith(`.${options.domain.toLowerCase()}`)) throw invalid();
-        const session = await options.authority.join({ clientId: client.client_id, userId: claims.sub, sessionId: claims.session_id }, { jti: claims.jti, expiresAt: (claims.exp as number) * 1000 });
+        const codes = fields.getAll('code');
+        // Consume every identifiable code before checking cookies, origin, proof or duplicate fields.
+        const issued = await Promise.all([...new Set(codes)].map(code => options.cookies.consumeJoin(hash(code))));
+        if (codes.length !== 1 || fields.getAll('proof').length !== 1 || [...fields.keys()].some(key => !['code', 'proof'].includes(key))) throw invalid();
+        const binding = issued[0];
+        const cookies = (request.headers.get('cookie') ?? '').split(';').map(part => part.trim().split('='));
+        const matches = cookies.filter(([key]) => key === '__Host-poppy_join');
+        if (!binding || binding.expiresAt <= options.now() || matches.length !== 1 || matches[0]!.length !== 2 || hash(matches[0]![1]!) !== binding.cookieHash) throw invalid();
+        const origin = request.headers.get('origin'), site = request.headers.get('sec-fetch-site');
+        if ((origin !== null && origin !== new URL(options.endpoint).origin) || (site !== null && !['same-origin', 'none'].includes(site))) throw invalid();
+        const verified = await verifyDpopProof(fields.get('proof'), { method: 'POST', url: options.endpoint, nowMs: options.now() });
+        if (verified.claims.nonce !== codes[0]) throw invalid();
+        const session = await options.authority.join(verified.jkt);
         const seconds = Math.floor(Math.min(session.expiresAt - options.now(), lifetime * 1000) / 1000);
         if (seconds < 1) throw invalid();
         const value = randomBytes(32).toString('base64url');
         const { clientId, userId, sessionId, issuerGeneration } = session;
         await options.cookies.put(hash(value), { clientId, userId, sessionId, ...(issuerGeneration === undefined ? {} : { issuerGeneration }), expiresAt: options.now() + seconds * 1000 });
-        return new Response(null, { status: 303, headers: { Location: claims.return_to, 'Set-Cookie': `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=${sameSite}; Max-Age=${seconds}`, 'Cache-Control': 'no-store' } });
+        const headers = new Headers({ Location: new URL('/', options.endpoint).href, 'Set-Cookie': `${name}=${value}; Path=/; Secure; HttpOnly; SameSite=${sameSite}; Max-Age=${seconds}`, 'Cache-Control': 'no-store' });
+        headers.append('Set-Cookie', '__Host-poppy_join=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict');
+        return new Response(null, { status: 303, headers });
       } catch { return new Response('Invalid browser session', { status: 400, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'text/plain' } }); }
     },
   };

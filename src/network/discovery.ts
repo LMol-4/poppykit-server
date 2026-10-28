@@ -3,11 +3,14 @@ import { object, string, member, canonical, parseJson, ValidationError } from '.
 import type { JsonObject } from '../protocol/wire.js';
 import { secureUrl } from './transport.js';
 import type { HttpTransport } from './transport.js';
-export interface PoppyDocument { protocol_version: '0.3'; organization: { name: string; domain: string }; auth?: { issuer: string; mediated?: { endpoint: string; fields: { name: string; label: string; secret: boolean }[]; scopes: string[] }; scopes?: Record<string, string>; [key: string]: unknown }; agent?: { protocols: { type: string; endpoint: string; resource?: string; [key: string]: unknown }[] }; apis?: { type: string; url: string; description: string; resource?: string; [key: string]: unknown }[]; web?: { browser_session_endpoint?: string; [key: string]: unknown }; feedback?: { endpoint: string; [key: string]: unknown }; extensions?: Record<string, { version: string; endpoint?: string; [key: string]: unknown }>; [key: string]: unknown }
+import { parseExcludedTasks } from './tasks.js';
+import type { ExcludedTask } from './tasks.js';
+export interface ScopeHint { changes: 'none' | 'reversible' | 'irreversible'; personal_data: boolean }
+export interface PoppyDocument { protocol_version: '0.3'; organization: { name: string; domain: string }; auth?: { issuer: string; mediated?: { endpoint: string; fields: { name: string; label: string; secret: boolean }[]; scopes: string[] }; scopes?: Record<string, string>; scope_hints?: Record<string, ScopeHint>; [key: string]: unknown }; agent?: { protocols: { type: string; endpoint: string; resource?: string; [key: string]: unknown }[] }; apis?: { type: string; url: string; description: string; resource?: string; [key: string]: unknown }[]; web?: { browser_session_endpoint?: string; [key: string]: unknown }; excluded_tasks?: { url: string }; feedback?: { endpoint: string; [key: string]: unknown }; extensions?: Record<string, { version: string; endpoint?: string; [key: string]: unknown }>; [key: string]: unknown }
 export interface AuthorizationMetadata { issuer: string; token_endpoint: string; revocation_endpoint: string; protected_resources: string[]; grant_types_supported: string[]; scopes_supported?: string[]; authorization_endpoint?: string; device_authorization_endpoint?: string; dpop_signing_alg_values_supported?: string[]; client_id_metadata_document_supported?: boolean; [key: string]: unknown }
 export interface ClientMetadata { client_id: string; client_name: string; jwks_uri: string; redirect_uris: string[]; token_endpoint_auth_method: 'private_key_jwt'; [key: string]: unknown }
 export interface CompanyMetadata { document: PoppyDocument; authorization?: AuthorizationMetadata; url: string }
-export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject>; invalidate?(target?: string): void }
+export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject>; resolveExcludedTasks?(document: PoppyDocument): Promise<ExcludedTask[]>; invalidate?(target?: string): void }
 function url(value: unknown, field: string): string { const valueString = string(value, field); secureUrl(valueString); return valueString; }
 function strings(value: unknown, field: string, allowEmpty = false): string[] { if (!Array.isArray(value) || (!allowEmpty && !value.length)) throw new ValidationError(field); value.forEach(item => string(item, field)); return value; }
 export function companyScopes(value: unknown, allowEmpty = false): string[] {
@@ -45,6 +48,14 @@ export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDoc
         string(item.name, 'field.name'); string(item.label, 'field.label'); member(item.secret, [true, false], 'field.secret');
       }
     }
+    if ('scope_hints' in auth) {
+      const hints = object(auth.scope_hints, 'scope_hints');
+      for (const [scope, value] of Object.entries(hints)) {
+        companyScopes([scope]); const hint = object(value, 'scope_hint');
+        string(hint.changes, 'changes'); member(hint.personal_data, [true, false], 'personal_data');
+        hints[scope] = { changes: ['none', 'reversible', 'irreversible'].includes(hint.changes as string) ? hint.changes : 'irreversible', personal_data: hint.personal_data };
+      }
+    }
     if ('scopes' in auth) for (const [scope, description] of Object.entries(object(auth.scopes, 'auth.scopes'))) { companyScopes([scope]); string(description, 'auth.scopes'); }
   }
   if ('agent' in doc) {
@@ -57,6 +68,7 @@ export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDoc
     }
   }
   if ('apis' in doc) { if (!Array.isArray(doc.apis)) throw new ValidationError('apis'); for (const api of doc.apis) { const item = object(api); string(item.type, 'api.type'); string(item.description, 'api.description'); url(item.url, 'api.url'); if ('resource' in item) url(item.resource, 'api.resource'); } }
+  if ('excluded_tasks' in doc) url(object(doc.excluded_tasks).url, 'excluded_tasks.url');
   if ('feedback' in doc) url(object(doc.feedback).endpoint, 'feedback.endpoint');
   if ('extensions' in doc) for (const extension of Object.values(object(doc.extensions))) { const item = object(extension); string(item.version, 'extension.version'); if ('endpoint' in item) url(item.endpoint, 'extension.endpoint'); }
   return doc as unknown as PoppyDocument;
@@ -159,6 +171,11 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
       remember(entries, currentDomain, { auth: spelling, expires: found.expires }, maxEntries, expiredEntry);
       remember(authDocuments, document.auth.issuer, entries, maxEntries, inner => [...inner.values()].every(expiredEntry));
       return { document, authorization: parseAuthorizationMetadata(auth.value, document), url: found.url };
+    },
+    async resolveExcludedTasks(document) {
+      if (!document.excluded_tasks) return [];
+      const found = await get(document.excluded_tasks.url, value => parseExcludedTasks(value, document), 'discovery');
+      return parseExcludedTasks(found.value, document);
     },
     async resolveClient(clientId) { validateClientId(clientId); const found = await get(clientId, value => parseClientMetadata(value, clientId), 'endpoint'); return parseClientMetadata(found.value, clientId); },
     async resolveJwks(uri, settings = {}) {
