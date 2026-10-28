@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 — 2026-10-28
 
 Target pinned Personal Agent Protocol draft 0.3. Break discovery, proof-key grants, author, browser joining and MCP Token Exchange contracts. Upgrade issuer state 3→4; stop old writers and reset conversation state to version 2. Require explicit company history scopes.
 
