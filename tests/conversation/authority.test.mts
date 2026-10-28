@@ -20,17 +20,17 @@ function setup(revocationPolicy?:WorkRevocationPolicy) {
   const clock = { t: NOW, now: () => clock.t };
   const initial = initialIssuerState();
   initial.sessions.s1 = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW, expiresAt: NOW + 24 * HOUR, accountId: 'acct_1', grantId: 'g1' };
-  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['poppy:read'], expiresAt: NOW + 30 * 24 * HOUR, revoked: false, refreshHash: '', previousHash: '' };
+  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['orders:read'], expiresAt: NOW + 30 * 24 * HOUR, revoked: false, refreshHash: '', previousHash: '' };
   const issuerStore = memoryStore(initial);
   const coordinator = memoryCoordinator();
-  const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, poppyDomains: ['shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),directScopes:[], store: issuerStore, coordinator, now: clock.now });
-  const principal = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['poppy:read'], tokenExpiresAt: NOW + HOUR, sessionVersion: 1, issuerGeneration: initial.generation };
+  const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, protectedResources: ['https://shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),supportedScopes:[], store: issuerStore, coordinator, now: clock.now });
+  const principal = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['orders:read'], tokenExpiresAt: NOW + HOUR, sessionVersion: 1, issuerGeneration: initial.generation };
   // Stands in for token verification, which J10 extends to signed-in tokens.
   let current:Principal = principal;
   const authenticator = { async authenticate() { return current; } };
   const signOut = () => { const { accountId, grantId, ...signedOut } = { ...principal, scopes: [] }; current = signedOut; };
   const store = memoryStore(initialConversationState());
-  const service = createConversationService({ endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, authorizeOperator: async () => {}, directScopes: ['poppy:read', 'poppy:write'] });
+  const service = createConversationService({ historyScopes: ['orders:read'], endpoint, store, authenticator, policy: issuer.authority.policy, clock, revocationPolicy, pollIntervalMs: 1, authorizeOperator: async () => {}, directScopes: ['orders:read', 'orders:write'] });
   const call = async (method:string,path:string,body?:unknown) => {
     const response = await service.handle(new Request(`${endpoint}${path}`, { method, headers: { authorization: 'DPoP x' }, body: body===undefined?undefined:JSON.stringify(body) }));
     return { status: response.status, body: await response.json() };
@@ -73,7 +73,7 @@ test('expired-token accepted work continues: bind, read history, reply and finis
   const id = (await t.call('POST', '', { message })).body.conversation_id;
   t.clock.t = NOW + 2 * HOUR; // the admission token expired an hour ago
   const claim = await t.service.claim();
-  assert.deepEqual(await t.service.requireAccount(expectValue(claim), ['poppy:read']), { accountId: 'acct_1' });
+  assert.deepEqual(await t.service.requireAccount(expectValue(claim), ['orders:read']), { accountId: 'acct_1' });
   assert.equal((await t.service.history(expectValue(claim))).length, 2);
   await t.service.reply(expectValue(claim), 'out_1', reply);
   await t.service.finish(expectValue(claim), 'completed');
@@ -89,7 +89,7 @@ test('stop-account-work: after revocation no account work, publication or read g
   const claim = await t.service.claim();
   await t.issuer.disconnect(CLIENT, 'acct_1');
   const before = await t.store.read();
-  await assert.rejects(t.service.requireAccount(expectValue(claim), ['poppy:read']), { code: 'invalid_token' });
+  await assert.rejects(t.service.requireAccount(expectValue(claim), ['orders:read']), { code: 'invalid_token' });
   await assert.rejects(t.service.history(expectValue(claim)), { code: 'invalid_token' });
   await assert.rejects(t.service.reply(expectValue(claim), 'out_1', reply), { code: 'invalid_token' });
   await assert.rejects(t.service.finish(expectValue(claim), 'completed'), { code: 'invalid_token' });
@@ -128,11 +128,11 @@ test('stop-account-work: revoked work can still ask to sign in, but cannot ask f
   await t.issuer.disconnect(CLIENT, 'acct_1');
   await assert.rejects(t.service.requestUser(expectValue(claim), 'user', 'A specialist needs you.'), { code: 'invalid_token' });
   // Asking to sign in uses no account and is exactly what the signed-out User needs (spec 4.9, 7.11).
-  await t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']);
+  await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']);
   await t.service.finish(expectValue(claim), 'suspended');
   const conversation = (await t.store.read()).conversations[id];
   const event = conversation.events.at(-2);
-  assert.deepEqual([expectValue(event).type, expectValue(event).error, expectValue(event).scope], ['authorization', 'sign_in_required', 'poppy:read']);
+  assert.deepEqual([expectValue(event).type, expectValue(event).error, expectValue(event).scope], ['authorization', 'sign_in_required', 'orders:read']);
   assert.equal(conversation.status, 'idle');
   assert.equal(t.coordinator.held, false);
 });
@@ -142,11 +142,11 @@ test('revoked work asking for a scope it never had is told to sign in, not to wi
     const t = setup(revocationPolicy);
     const id = (await t.call('POST', '', { message })).body.conversation_id;
     const claim = await t.service.claim();
-    await t.service.requestAuthorization(expectValue(claim), 'live', ['poppy:write']);
+    await t.service.requestAuthorization(expectValue(claim), 'live', ['orders:write']);
     await t.issuer.disconnect(CLIENT, 'acct_1');
-    await t.service.requestAuthorization(expectValue(claim), 'revoked', ['poppy:write']);
+    await t.service.requestAuthorization(expectValue(claim), 'revoked', ['orders:write']);
     const events = (await t.store.read()).conversations[id].events.filter((event:ConversationEvent) => event.type === 'authorization');
-    assert.deepEqual(events.map((event:ConversationEvent) => [event.error, event.scope]), [['insufficient_scope', 'poppy:write'], ['sign_in_required', 'poppy:write']], revocationPolicy);
+    assert.deepEqual(events.map((event:ConversationEvent) => [event.error, event.scope]), [['insufficient_scope', 'orders:write'], ['sign_in_required', 'orders:write']], revocationPolicy);
   }
 });
 
@@ -155,7 +155,7 @@ test("stop-account-work: a person's replies use no account and still publish aft
   const id = (await t.call('POST', '', { message })).body.conversation_id;
   const person = await t.service.joinHuman({}, id);
   await t.issuer.disconnect(CLIENT, 'acct_1');
-  await assert.rejects(t.service.requireAccount(person, ['poppy:read']), { code: 'invalid_token' });
+  await assert.rejects(t.service.requireAccount(person, ['orders:read']), { code: 'invalid_token' });
   await assert.rejects(t.service.history(person), { code: 'invalid_token' });
   await t.service.renew(person);
   await t.service.reply(person, 'out_1', { id: 'msg_h1', sender: 'human', text: 'I can help with that.' });
@@ -177,10 +177,10 @@ test('a revoked sign-in request still respects the fence and a reset generation'
   const claim = await t.service.claim();
   await t.issuer.disconnect(CLIENT, 'acct_1');
   t.clock.t = NOW + 2 * 60_000; // past the default lease
-  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']), { code: 'stale_work' });
+  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']), { code: 'stale_work' });
   const fresh = await t.service.claim();
   t.issuerStore.set(state => { state.generation = 'after-reset'; });
-  await assert.rejects(t.service.requestAuthorization(expectValue(fresh), 'auth', ['poppy:read']), { code: 'invalid_token' });
+  await assert.rejects(t.service.requestAuthorization(expectValue(fresh), 'auth', ['orders:read']), { code: 'invalid_token' });
 });
 
 test('failing revoked work still respects a reset generation', async () => {
@@ -197,7 +197,7 @@ test('allow-accepted-work-to-finish: accepted work completes but the revoked rea
   const id = (await t.call('POST', '', { message })).body.conversation_id;
   const claim = await t.service.claim();
   await t.issuer.disconnect(CLIENT, 'acct_1');
-  assert.deepEqual(await t.service.requireAccount(expectValue(claim), ['poppy:read']), { accountId: 'acct_1' });
+  assert.deepEqual(await t.service.requireAccount(expectValue(claim), ['orders:read']), { accountId: 'acct_1' });
   await t.service.reply(expectValue(claim), 'out_1', reply);
   await t.service.finish(expectValue(claim), 'completed');
   assert.deepEqual(await t.call('GET', `/${id}/events`), { status: 401, body: { error: 'invalid_token' } });

@@ -166,10 +166,10 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   const env = await issuerSetup({ store: db.issuer(ISSUER), coordinator: db, requireDpopNonce: false });
   const start = await env.send(); assert.equal(start.status, 200);
   const verifier = 'v'.repeat(43), url = new URL(ISSUER + '/authorize');
-  const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'poppy:read', state: 'state', code_challenge_method: 'S256', code_challenge: createHash('sha256').update(verifier).digest('base64url') };
+  const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: 'state', code_challenge_method: 'S256', code_challenge: createHash('sha256').update(verifier).digest('base64url') };
   for (const [name, value] of Object.entries(fields)) url.searchParams.set(name, value);
   const view = await env.issuer.beginAuthorization(new Request(url), 'binding');
-  const callback = await env.issuer.completeAuthorization(view.id, 'binding', { accountId: 'account', scopes: ['poppy:read'] });
+  const callback = await env.issuer.completeAuthorization(view.id, 'binding', { accountId: 'account', scopes: ['orders:read'] });
   const signed = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier, session_id: start.body.session_id });
   assert.equal(signed.status, 200, JSON.stringify(signed.body));
   const { principal } = await env.issuer.authority.introspect(expectValue(signed.body.access_token));
@@ -184,12 +184,12 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   await assert.rejects(env.issuer.authority.introspect(expectValue(signed.body.access_token)), { code: 'invalid_token' });
   // Start a new grant to test the policy/transaction ordering separately.
   const view2 = await env.issuer.beginAuthorization(new Request(url), 'binding2');
-  const callback2 = await env.issuer.completeAuthorization(view2.id, 'binding2', { accountId: 'account', scopes: ['poppy:read'] });
+  const callback2 = await env.issuer.completeAuthorization(view2.id, 'binding2', { accountId: 'account', scopes: ['orders:read'] });
   const signed2 = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback2.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier, session_id: start.body.session_id });
   const currentPrincipal = (await env.issuer.authority.introspect(expectValue(signed2.body.access_token))).principal;
   const conversations = setup({ store: db.conversations(ISSUER), policy: env.issuer.authority.policy, authenticator: { authenticate: async () => currentPrincipal } });
   let entered!:()=>void; const gate=new Promise<void>(r=>{entered=r;});let release!:()=>void;const hold=new Promise<void>(r=>{release=r;});
-  const accepted = env.issuer.authority.policy.withCurrent(currentPrincipal, ['poppy:read'], async () => { entered(); await hold; return conversations.start(hello); });
+  const accepted = env.issuer.authority.policy.withCurrent(currentPrincipal, ['orders:read'], async () => { entered(); await hold; return conversations.start(hello); });
   await gate;
   const revoked = env.issuer.disconnect(CLIENT, 'account');
   expectValue(release)(); const receipt = await accepted; assert.equal(receipt.status, 201); await revoked;

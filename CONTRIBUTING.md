@@ -1,8 +1,10 @@
 # Contributing
 
-Follow the live draft 0.2 [specification](https://personalagentprotocol.org/docs/0.2/spec)
-and [guides](https://personalagentprotocol.org/docs/0.2/guides). Tests/snapshots are
-supporting evidence. Demo/business workflows and individual extensions are excluded.
+Follow the pinned draft 0.3 [specification](https://personalagentprotocol.org/docs/0.3/spec)
+and [guides](https://personalagentprotocol.org/docs/0.3/guides). Tests/snapshots are
+supporting evidence. This unreleased checkout has completed only the discovery
+stage of migration; auth, wire/storage and integrations still need their stages.
+Demo/business workflows and individual extensions are excluded.
 Code is [MIT](LICENSE); confirm rights for third-party contributions.
 
 Use Node 24.21.0, TypeScript 5.9.3 and @types/node 24.10.0.

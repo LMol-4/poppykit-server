@@ -2,14 +2,18 @@ import { object, string, member, canonical, parseJson, ValidationError } from '.
 import type { JsonObject } from '../protocol/wire.js';
 import { secureUrl } from './transport.js';
 import type { HttpTransport } from './transport.js';
-export interface PoppyDocument { protocol_version: '0.2'; organization: { name: string; domain: string }; auth?: { issuer: string; direct?: { scopes: string[] }; device?: { scopes: string[] }; mediated?: { endpoint: string; fields: { name: string; label: string; secret: boolean }[]; scopes: string[] }; custom_scopes?: Record<string, string>; [key: string]: unknown }; agent?: { protocols: { type: string; endpoint: string; resource?: string; [key: string]: unknown }[] }; apis?: { type: string; url: string; description: string; resource?: string; [key: string]: unknown }[]; web?: { browser_session_endpoint?: string; [key: string]: unknown }; feedback?: { endpoint: string; [key: string]: unknown }; extensions?: Record<string, { version: string; endpoint?: string; [key: string]: unknown }>; [key: string]: unknown }
-export interface AuthorizationMetadata { issuer: string; token_endpoint: string; revocation_endpoint: string; poppy_domains: string[]; authorization_endpoint?: string; device_authorization_endpoint?: string; dpop_signing_alg_values_supported?: string[]; client_id_metadata_document_supported?: boolean; [key: string]: unknown }
+export interface PoppyDocument { protocol_version: '0.3'; organization: { name: string; domain: string }; auth?: { issuer: string; mediated?: { endpoint: string; fields: { name: string; label: string; secret: boolean }[]; scopes: string[] }; scopes?: Record<string, string>; [key: string]: unknown }; agent?: { protocols: { type: string; endpoint: string; resource?: string; [key: string]: unknown }[] }; apis?: { type: string; url: string; description: string; resource?: string; [key: string]: unknown }[]; web?: { browser_session_endpoint?: string; [key: string]: unknown }; feedback?: { endpoint: string; [key: string]: unknown }; extensions?: Record<string, { version: string; endpoint?: string; [key: string]: unknown }>; [key: string]: unknown }
+export interface AuthorizationMetadata { issuer: string; token_endpoint: string; revocation_endpoint: string; protected_resources: string[]; grant_types_supported: string[]; scopes_supported?: string[]; authorization_endpoint?: string; device_authorization_endpoint?: string; dpop_signing_alg_values_supported?: string[]; client_id_metadata_document_supported?: boolean; [key: string]: unknown }
 export interface ClientMetadata { client_id: string; client_name: string; jwks_uri: string; redirect_uris: string[]; token_endpoint_auth_method: 'private_key_jwt'; [key: string]: unknown }
 export interface CompanyMetadata { document: PoppyDocument; authorization?: AuthorizationMetadata; url: string }
 export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject>; invalidate?(target?: string): void }
 function url(value: unknown, field: string): string { const valueString = string(value, field); secureUrl(valueString); return valueString; }
 function strings(value: unknown, field: string, allowEmpty = false): string[] { if (!Array.isArray(value) || (!allowEmpty && !value.length)) throw new ValidationError(field); value.forEach(item => string(item, field)); return value; }
-function scopes(value: unknown): void { for (const scope of strings(value, 'scopes')) if (!/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) throw new ValidationError('scopes'); }
+export function companyScopes(value: unknown, allowEmpty = false): string[] {
+  const result = strings(value, 'scopes', allowEmpty);
+  for (const scope of result) if (!/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope) || scope.startsWith('poppy:')) throw new ValidationError('scopes');
+  return result;
+}
 function domain(value: unknown): string { const text = string(value, 'domain'); if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(text) || text.includes('..')) throw new ValidationError('domain'); return text; }
 export function authorizationMetadataUrl(issuer: string): string { const parsed = secureUrl(issuer); if (parsed.search) throw new ValidationError('issuer'); return `${parsed.origin}/.well-known/oauth-authorization-server${parsed.pathname === '/' ? '' : parsed.pathname}`; }
 export function validateClientId(clientId: string): URL {
@@ -20,7 +24,9 @@ export function validateClientId(clientId: string): URL {
   return secureUrl(clientId);
 }
 export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDocument {
-  const doc = object(value); member(doc.protocol_version, ['0.2'], 'protocol_version');
+  const doc = object(value); member(doc.protocol_version, ['0.3'], 'protocol_version');
+  const served = secureUrl(servingUrl);
+  if (served.pathname !== '/.well-known/poppy.json' || servingUrl.includes('?')) throw new ValidationError('discovery.url');
   const organization = object(doc.organization, 'organization'); string(organization.name, 'organization.name');
   if (domain(organization.domain).toLowerCase() !== secureUrl(servingUrl).hostname.toLowerCase()) throw new ValidationError('organization.domain');
   if (!['agent', 'apis', 'web'].some(key => key in doc)) throw new ValidationError('capabilities');
@@ -29,17 +35,16 @@ export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDoc
   if (['agent', 'apis', 'feedback'].some(key => key in doc) || (web && 'browser_session_endpoint' in web)) object(doc.auth, 'auth');
   if ('auth' in doc) {
     const auth = object(doc.auth, 'auth'); authorizationMetadataUrl(url(auth.issuer, 'issuer'));
-    for (const key of ['direct', 'device']) if (key in auth) scopes(object(auth[key], key).scopes);
     if ('mediated' in auth) {
       const mediated = object(auth.mediated, 'mediated');
-      url(mediated.endpoint, 'mediated.endpoint'); scopes(mediated.scopes);
+      url(mediated.endpoint, 'mediated.endpoint'); companyScopes(mediated.scopes);
       if (!Array.isArray(mediated.fields) || !mediated.fields.length) throw new ValidationError('mediated.fields');
       for (const field of mediated.fields) {
         const item = object(field);
         string(item.name, 'field.name'); string(item.label, 'field.label'); member(item.secret, [true, false], 'field.secret');
       }
     }
-    if ('custom_scopes' in auth) Object.values(object(auth.custom_scopes)).forEach(value => string(value, 'custom_scopes', false));
+    if ('scopes' in auth) for (const [scope, description] of Object.entries(object(auth.scopes, 'auth.scopes'))) { companyScopes([scope]); string(description, 'auth.scopes'); }
   }
   if ('agent' in doc) {
     const protocols = object(doc.agent, 'agent').protocols;
@@ -58,13 +63,29 @@ export function parsePoppyDocument(value: unknown, servingUrl: string): PoppyDoc
 export function parseAuthorizationMetadata(value: unknown, document: PoppyDocument): AuthorizationMetadata {
   const metadata = object(value); const auth = document.auth!;
   if (metadata.issuer !== auth.issuer) throw new ValidationError('issuer');
-  const domains = strings(metadata.poppy_domains, 'poppy_domains'); domains.forEach(domain);
-  if (!domains.some(item => item.toLowerCase() === document.organization.domain.toLowerCase())) throw new ValidationError('poppy_domains');
+  const resources = strings(metadata.protected_resources, 'protected_resources'); resources.forEach(value => url(value, 'protected_resources'));
+  if (!resources.some(value => /^https:\/\/[^/:?#]+$/.test(value) && value.slice(8).toLowerCase() === document.organization.domain.toLowerCase())) throw new ValidationError('protected_resources');
+  const grants = strings(metadata.grant_types_supported, 'grant_types_supported');
+  for (const grant of ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token']) if (!grants.includes(grant)) throw new ValidationError('grant_types_supported');
   for (const key of ['token_endpoint', 'revocation_endpoint']) url(metadata[key], key);
-  for (const [key, required] of [['authorization_endpoint', !!auth.direct], ['device_authorization_endpoint', !!auth.device]] as const) if (required || key in metadata) url(metadata[key], key);
+  for (const [key, grant] of [['authorization_endpoint', 'authorization_code'], ['device_authorization_endpoint', 'urn:ietf:params:oauth:grant-type:device_code']] as const) if (grants.includes(grant) || key in metadata) url(metadata[key], key);
+  if ('pushed_authorization_request_endpoint' in metadata) url(metadata.pushed_authorization_request_endpoint, 'pushed_authorization_request_endpoint');
+  const signIn = grants.includes('authorization_code') || grants.includes('urn:ietf:params:oauth:grant-type:device_code') || !!auth.mediated;
+  const supported = signIn || 'scopes_supported' in metadata ? companyScopes(metadata.scopes_supported, true) : [];
+  if (auth.mediated && !auth.mediated.scopes.every(scope => supported.includes(scope))) throw new ValidationError('mediated.scopes');
+  // Scope descriptions may instead live in a listed OpenAPI document.
+  if (!document.apis?.some(api => api.type === 'openapi') && supported.some(scope => !Object.hasOwn(auth.scopes ?? {}, scope))) throw new ValidationError('auth.scopes');
   if ('dpop_signing_alg_values_supported' in metadata && !strings(metadata.dpop_signing_alg_values_supported, 'dpop_signing_alg_values_supported').includes('ES256')) throw new ValidationError('dpop_signing_alg_values_supported');
   if ('client_id_metadata_document_supported' in metadata) member(metadata.client_id_metadata_document_supported, [true, false], 'client_id_metadata_document_supported');
   return metadata as unknown as AuthorizationMetadata;
+}
+export function signInMethods(metadata: CompanyMetadata): { method: 'direct' | 'device' | 'mediated'; scopes: string[] }[] {
+  const auth = metadata.authorization, methods: ReturnType<typeof signInMethods> = [];
+  if (!auth) return methods;
+  if (auth.grant_types_supported.includes('authorization_code') && auth.authorization_endpoint) methods.push({ method: 'direct', scopes: [...auth.scopes_supported ?? []] });
+  if (auth.grant_types_supported.includes('urn:ietf:params:oauth:grant-type:device_code') && auth.device_authorization_endpoint) methods.push({ method: 'device', scopes: [...auth.scopes_supported ?? []] });
+  if (metadata.document.auth?.mediated) methods.push({ method: 'mediated', scopes: [...metadata.document.auth.mediated.scopes] });
+  return methods;
 }
 export function parseClientMetadata(value: unknown, clientId: string): ClientMetadata {
   const parsed = validateClientId(clientId); const metadata = object(value);
@@ -109,11 +130,12 @@ export function createMetadataResolver(transport: HttpTransport, options: { now?
         const response = await transport.fetch(new Request(target, { headers }), { mode });
         if (response.status !== 200 && !(response.status === 304 && cached)) throw new ValidationError('metadata.status');
         let value: unknown; try { value = response.status === 304 ? cached!.value : parseJson(await response.text()); } catch { throw new ValidationError('metadata.json'); }
-        const servedUrl = response.status === 304 ? cached!.url : response.url || target; validate(value, servedUrl);
+        const servedUrl = response.url || (response.status === 304 ? cached!.url : target); validate(value, servedUrl);
+        if (response.status === 304) validate(value, cached!.url);
         const control = response.headers.get('cache-control') ?? (response.status === 304 ? cached?.control : undefined) ?? ''; const age = Number(response.headers.get('age') ?? 0);
         const seconds = Number(/(?:^|,)\s*max-age=(\d+)/i.exec(control)?.[1] ?? 60); // no max-age: 60 s floor (guide: at least a minute)
         const expires = now() + (/\b(?:no-store|no-cache)\b/i.test(control) ? 0 : Math.max(0, Math.min(300, seconds - (Number.isFinite(age) ? age : 0)))) * 1000;
-        const result = { value, control, url: response.status === 304 ? cached!.url : servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (startedEpoch !== epoch) return result; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
+        const result = { value, control, url: servedUrl, expires, etag: response.headers.get('etag') ?? cached?.etag, modified: response.headers.get('last-modified') ?? cached?.modified }; if (startedEpoch !== epoch) return result; if (!/\bno-store\b/i.test(control)) remember(cache, key, result, maxEntries, entry => entry.expires <= now()); else cache.delete(key);
         return result;
       })().finally(() => { fetching--; }); pending.set(key, task);
     }

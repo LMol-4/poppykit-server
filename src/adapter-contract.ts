@@ -30,8 +30,8 @@ const endpoint = 'https://contract.example.test/poppy/conversations';
 const base = { issuer: 'https://auth.contract.test', clientId: 'https://agent.contract.test/client', sessionId: 's1', userId: 'u_1', scopes: [], tokenExpiresAt: 9e12, sessionVersion: 1 };
 const principals: Record<string, Principal> = {
   signedOut: base,
-  account1: { ...base, accountId: 'acct_1', scopes: ['poppy:read'] },
-  account2: { ...base, accountId: 'acct_2', scopes: ['poppy:read'] },
+  account1: { ...base, accountId: 'acct_1', scopes: ['orders:read'] },
+  account2: { ...base, accountId: 'acct_2', scopes: ['orders:read'] },
 };
 const message = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?' } as const;
 const reply = { id: 'msg_r1', sender: 'agent', text: 'Shipped.' } as const;
@@ -52,7 +52,7 @@ function serviceOn(store: ConversationOptions['store'], clock: { now(): number }
       return principal;
     },
   };
-  return createConversationService({ endpoint, store, authenticator, policy, clock, leaseMs: 1000, supportedScopes: ['poppy:read'] });
+  return createConversationService({historyScopes:['orders:read'], endpoint, store, authenticator, policy, clock, leaseMs: 1000, supportedScopes: ['orders:read'] });
 }
 async function call(service: ConversationService, path: string, as: string, body?: unknown, query = '') {
   const response = await service.handle(new Request(`${endpoint}${path}${query}`, {
@@ -115,11 +115,11 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     const parentWork = (await a.claim())!;
     const outcome = (promise: Promise<{ accountId: string }>) => promise.then(value => value.accountId, error => String(error.code));
     const results = await Promise.all([
-      outcome(a.requireAccount(parentWork, ['poppy:read'])),
+      outcome(a.requireAccount(parentWork, ['orders:read'])),
       (async () => {
         const opened = await call(b, '', 'account2', { parent_conversation_id: parent, message: { id: 'msg_c', sender: 'human', text: 'Hi.' } });
         if (opened.status !== 201) return String(opened.body.error);
-        return outcome(b.claim().then(work => b.requireAccount(work!, ['poppy:read'])));
+        return outcome(b.claim().then(work => b.requireAccount(work!, ['orders:read'])));
       })(),
     ]);
     const winners = results.filter(result => result.startsWith('acct_'));
@@ -156,8 +156,8 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
       await a.reply(work, outputId, value);
       await b.reply(work, outputId, value);
       await assert.rejects(b.reply(work, outputId, { ...value, text: 'changed' }), { code: 'output_conflict' });
-      await a.requestAuthorization(work, `auth_${outputId}`, ['poppy:read']);
-      await b.requestAuthorization(work, `auth_${outputId}`, ['poppy:read']);
+      await a.requestAuthorization(work, `auth_${outputId}`, ['orders:read']);
+      await b.requestAuthorization(work, `auth_${outputId}`, ['orders:read']);
       await a.requestUser(work, `user_${outputId}`, outputId);
       await b.requestUser(work, `user_${outputId}`, outputId);
       await assert.rejects(b.requestUser(work, `user_${outputId}`, 'changed'), { code: 'output_conflict' });

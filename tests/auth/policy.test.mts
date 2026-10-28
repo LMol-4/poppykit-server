@@ -17,11 +17,11 @@ function setup() {
   const clock = { now: NOW };
   const initial = initialIssuerState();
   initial.sessions.s1 = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: NOW, expiresAt: NOW + 7 * DAY, accountId: 'acct_1', grantId: 'g1' };
-  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['poppy:read'], expiresAt: NOW + 30 * DAY, revoked: false, refreshHash: '', previousHash: '' };
+  initial.grants.g1 = { clientId: CLIENT, userId: 'usr_1', accountId: 'acct_1', scopes: ['orders:read'], expiresAt: NOW + 30 * DAY, revoked: false, refreshHash: '', previousHash: '' };
   const store = memoryStore(initial);
   const coordinator = memoryCoordinator();
-  const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, poppyDomains: ['shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),directScopes:[], store, coordinator, now: () => clock.now });
-  const signedIn = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['poppy:read'], tokenExpiresAt: NOW + 3_600_000, sessionVersion: 1, issuerGeneration: initial.generation };
+  const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, protectedResources: ['https://shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),supportedScopes:[], store, coordinator, now: () => clock.now });
+  const signedIn = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['orders:read'], tokenExpiresAt: NOW + 3_600_000, sessionVersion: 1, issuerGeneration: initial.generation };
   const { accountId, grantId, ...signedOut } = { ...signedIn, scopes: [] };
   const accepted = (principal:Principal, revocationPolicy:WorkRevocationPolicy = 'stop-account-work') => ({ principal, acceptedAt: NOW, revocationPolicy });
   return { clock, store, coordinator, issuer, policy: issuer.authority.policy, signedIn, signedOut, accepted };
@@ -29,7 +29,7 @@ function setup() {
 
 test('withCurrent runs the action while holding the coordinator after checking the issuer snapshot', async () => {
   const t = setup();
-  const result = await t.policy.withCurrent(t.signedIn, ['poppy:read'], async () => ({ held: t.coordinator.held }));
+  const result = await t.policy.withCurrent(t.signedIn, ['orders:read'], async () => ({ held: t.coordinator.held }));
   assert.deepEqual(result, { held: true });
   assert.equal(t.coordinator.held, false);
   assert.equal(await t.policy.withCurrent(t.signedOut, [], async () => 'ok'), 'ok');
@@ -64,10 +64,10 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
     const current = setup(); current.store.set(invalidate);
     await assert.rejects(current.policy.withCurrent(current.signedIn, [], action), { code: 'invalid_token', status: 401 });
   }
-  const scope = await t.policy.withCurrent(t.signedIn, ['poppy:read', 'poppy:write'], action).catch(error => error);
+  const scope = await t.policy.withCurrent(t.signedIn, ['orders:read', 'orders:write'], action).catch(error => error);
   assert.ok(scope instanceof AuthorityError);
-  assert.deepEqual([scope.code, scope.status, scope.headers.get('www-authenticate')], ['insufficient_scope', 403, 'DPoP error="insufficient_scope", scope="poppy:read poppy:write", algs="ES256"']);
-  await assert.rejects(t.policy.withCurrent(t.signedOut, ['poppy:read'], action), { code: 'insufficient_scope' });
+  assert.deepEqual([scope.code, scope.status, scope.headers.get('www-authenticate')], ['insufficient_scope', 403, 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256"']);
+  await assert.rejects(t.policy.withCurrent(t.signedOut, ['orders:read'], action), { code: 'insufficient_scope' });
   assert.equal(runs, 0);
   assert.equal(t.coordinator.held, false);
 });
@@ -76,12 +76,12 @@ test('expiry is not revocation: accepted work outlives its token, current reader
   const t = setup();
   let runs = 0;
   t.clock.now = t.signedIn.tokenExpiresAt - 1;
-  await t.policy.withCurrent(t.signedIn, ['poppy:read'], async () => { runs++; });
+  await t.policy.withCurrent(t.signedIn, ['orders:read'], async () => { runs++; });
   t.clock.now++;
   await assert.rejects(t.policy.withCurrent(t.signedIn, [], async () => { runs++; }), { code: 'invalid_token' });
   assert.equal(runs, 1);
   t.clock.now = t.signedIn.tokenExpiresAt + DAY;
-  assert.equal(await t.policy.withAccepted(t.accepted(t.signedIn), ['poppy:read'], async () => 'continued'), 'continued');
+  assert.equal(await t.policy.withAccepted(t.accepted(t.signedIn), ['orders:read'], async () => 'continued'), 'continued');
   // An ended account sign-in (grant expiry) is not token expiry: stop policy ends account work.
   t.clock.now = NOW + 31 * DAY;
   await assert.rejects(t.policy.withAccepted(t.accepted(t.signedIn), [], async () => {}), { code: 'invalid_token' });
@@ -94,7 +94,7 @@ test('revocation: stop policy ends account work, allow-finish continues it, curr
   assert.equal((await t.store.read()).grants.g1.revoked, true);
   await assert.rejects(t.policy.withAccepted(t.accepted(t.signedIn), [], async () => {}), { code: 'invalid_token' });
   await assert.rejects(t.policy.withAccepted(Object.assign(t.accepted(t.signedIn),{revocationPolicy:'unknown-policy'}), [], async () => {}), { code: 'invalid_token' }, 'unknown policy means stop');
-  assert.equal(await t.policy.withAccepted(t.accepted(t.signedIn, 'allow-accepted-work-to-finish'), ['poppy:read'], async () => 'finished'), 'finished');
+  assert.equal(await t.policy.withAccepted(t.accepted(t.signedIn, 'allow-accepted-work-to-finish'), ['orders:read'], async () => 'finished'), 'finished');
   await assert.rejects(t.policy.withCurrent(t.signedIn, [], async () => {}), { code: 'invalid_token' });
   // Signed-out work holds no account authority, so revocation leaves it alone.
   assert.equal(await t.policy.withAccepted(t.accepted(t.signedOut), [], async () => 'general'), 'general');
@@ -115,7 +115,7 @@ test('accepted scope ceiling and reset generation hold under both revocation pol
   const t = setup();
   for (const revocationPolicy of ['stop-account-work', 'allow-accepted-work-to-finish'] as const) {
     // A later broader sign-in does not widen work accepted with fewer scopes.
-    await assert.rejects(t.policy.withAccepted(t.accepted({ ...t.signedIn, scopes: [] }, expectValue(revocationPolicy)), ['poppy:read'], async () => {}), { code: 'insufficient_scope' });
+    await assert.rejects(t.policy.withAccepted(t.accepted({ ...t.signedIn, scopes: [] }, expectValue(revocationPolicy)), ['orders:read'], async () => {}), { code: 'insufficient_scope' });
     await assert.rejects(t.policy.withAccepted(t.accepted({ ...t.signedIn, issuer: 'https://other.test' }, expectValue(revocationPolicy)), [], async () => {}), { code: 'invalid_token' });
   }
   t.store.set(state => { state.generation = 'after-reset'; });

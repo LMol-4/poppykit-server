@@ -51,18 +51,18 @@ test('ordinary MCP client Bearer sessions work at DPoP-capable endpoint and end 
 
 test('Device grant selects the configured MCP scheme with optional Bearer proof across all resource variants', async () => {
   for (const [resource, withProof] of ([[MCP,false],[MCP,true],[DPOP,true]] satisfies [string,boolean][])) {
-    const env = await setup({ ...mcpOptions, requireDpopNonce: false, device: { endpoint: `${ISSUER}/device`, verificationUri: `${ISSUER}/verify`, scopes: ['poppy:read'] } });
+    const env = await setup({ ...mcpOptions, requireDpopNonce: false, device: { endpoint: `${ISSUER}/device`, verificationUri: `${ISSUER}/verify` } });
     const session = await env.send();
-    const start = await env.issuer.deviceAuthorization(new Request(`${ISSUER}/device`, { method: 'POST', body: new URLSearchParams({ scope: 'poppy:read', client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion() }) }));
+    const start = await env.issuer.deviceAuthorization(new Request(`${ISSUER}/device`, { method: 'POST', body: new URLSearchParams({ scope: 'orders:read', client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion() }) }));
     const device = await start.json(); await env.issuer.beginDeviceAuthorization(device.user_code, 'human-consent-browser-binding');
-    await env.issuer.completeDeviceAuthorization(device.user_code, 'human-consent-browser-binding', { accountId: 'account', scopes: ['poppy:read'] });
+    await env.issuer.completeDeviceAuthorization(device.user_code, 'human-consent-browser-binding', { accountId: 'account', scopes: ['orders:read'] });
     env.clock.now += 5000;
     const fields = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', assertion: undefined, device_code: device.device_code, session_id: session.body.session_id, resource };
     if (resource === DPOP) assert.equal((await env.send(expectValue(fields), { dpop: null })).body.error, 'invalid_dpop_proof');
     const result = await env.send(expectValue(fields), withProof ? {} : { dpop: null });
     assert.equal(result.status, 200); assert.equal(result.body.token_type, resource === MCP ? 'Bearer' : 'DPoP');
     const token = await env.issuer.authority.introspect(expectValue(result.body.access_token), expectValue(resource));
-    assert.equal(token.dpopJkt === null, resource === MCP); assert.deepEqual(token.principal.scopes, ['poppy:read']);
+    assert.equal(token.dpopJkt === null, resource === MCP); assert.deepEqual(token.principal.scopes, ['orders:read']);
   }
 });
 
@@ -147,12 +147,12 @@ for (const durable of [false, true]) test(`browser cookies follow real sign-in, 
   assert.equal(joined.headers.get('location'), 'https://shop.test/account');
   const page = () => new Request('https://shop.test/account', { headers: { cookie: expectValue(cookie).split(';')[0] } });
   assert.deepEqual((await env.browser.authenticate(page())).scopes, []);
-  await signIn(env, ['poppy:read']); assert.deepEqual((await env.browser.authenticate(page())).scopes, ['poppy:read']);
-  await signIn(env, ['poppy:read', 'poppy:write']);
-  assert.equal(await env.browser.withSession(page(), ['poppy:write'], async principal => principal.accountId), 'account');
+  await signIn(env, ['orders:read']); assert.deepEqual((await env.browser.authenticate(page())).scopes, ['orders:read']);
+  await signIn(env, ['orders:read', 'orders:write']);
+  assert.equal(await env.browser.withSession(page(), ['orders:write'], async principal => principal.accountId), 'account');
   await env.issuer.disconnect(CLIENT, 'account');
   assert.deepEqual((await env.browser.authenticate(page())).scopes, []);
-  await assert.rejects(env.browser.withSession(page(), ['poppy:write'], async () => 'forbidden'), { code: 'insufficient_scope' });
+  await assert.rejects(env.browser.withSession(page(), ['orders:write'], async () => 'forbidden'), { code: 'insufficient_scope' });
   env.clock.now += 3600001; await assert.rejects(env.browser.authenticate(page()));
   env.clock.now += 86400000; assert.equal((await env.join(await env.assertion())).status, 400);
 });
@@ -173,7 +173,7 @@ test('feedback accepts signed-out unknown kinds as inert data and returns empty 
 });
 
 test('feedback rechecks revoked authority after authentication and never accepts the report', async () => {
-  const env = await browserFixture(), signed = await signIn(env, ['poppy:read']); let accepted = 0;
+  const env = await browserFixture(), signed = await signIn(env, ['orders:read']); let accepted = 0;
   const token = expectValue(signed.access_token);
   const authenticator = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://shop.test', pathPrefix: '/feedback' }], now: now(env) });
   const handler = createFeedbackHandler({

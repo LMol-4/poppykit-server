@@ -10,11 +10,12 @@ try {
   const endpoint = 'https://company.example/conversations';
   const auth = createReferenceIssuer({
     issuer, tokenEndpoint: issuer + '/token', revocationEndpoint: issuer + '/revoke',
-    poppyDomains: ['company.example'], directScopes: [], resources: [endpoint],
+    protectedResources: ['https://company.example'], supportedScopes: [], resources: [endpoint],
     metadata: createMetadataResolver(transport), store: database.issuer(issuer),
     coordinator: database, now: Date.now,
   });
   const conversations = createConversationService({
+    historyScopes: ['orders:read'],
     endpoint, store: database.conversations(issuer), policy: auth.authority.policy,
     authenticator: createRequestAuthenticator({ authority: auth.authority,
       endpoints: [{ origin: 'https://company.example', pathPrefix: '/conversations', resource: endpoint }],

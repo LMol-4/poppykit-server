@@ -88,8 +88,8 @@ test('each DPoP proof defect is rejected as invalid_dpop_proof', async () => {
 });
 
 test('AuthorityError maps codes to status and quoted challenge', () => {
-  const error = new AuthorityError('insufficient_scope', { scope: 'poppy:read poppy:write' });
-  assert.equal(error.status, 403); assert.equal(error.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="poppy:read poppy:write", algs="ES256"');
+  const error = new AuthorityError('insufficient_scope', { scope: 'orders:read orders:write' });
+  assert.equal(error.status, 403); assert.equal(error.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256"');
   assert.equal(new AuthorityError('sign_in_required').status, 403);
   assert.throws(() => new AuthorityError('insufficient_scope', { scope: 'a" b' }));
 });

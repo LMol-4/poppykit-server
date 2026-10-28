@@ -29,7 +29,7 @@ test('issues and renews a signed-out DPoP session after a nonce challenge', asyn
   const resourceProof = await proof(env.dpopKey, { htu: API, iat: NOW / 1000, token: renewed.body.access_token });
   const principal = await authenticator.authenticate(new Request(API, { method: 'POST', headers: { authorization: `DPoP ${renewed.body.access_token}`, dpop: resourceProof } }));
   assert.deepEqual(principal, { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: first.body.session_id, scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1, issuerGeneration: env.store.state.generation });
-  assert.deepEqual(env.issuer.authorizationMetadata(), { issuer: ISSUER, token_endpoint: TOKEN_ENDPOINT, revocation_endpoint: `${ISSUER}/oauth/revoke`, dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true, poppy_domains: ['shop.test'] });
+  assert.deepEqual(env.issuer.authorizationMetadata(), { issuer: ISSUER, token_endpoint: TOKEN_ENDPOINT, revocation_endpoint: `${ISSUER}/oauth/revoke`, dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true, protected_resources: ['https://shop.test'], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token'], scopes_supported: ['orders:read','orders:write'] });
 });
 
 test('nonce challenge precedes network fetches and replay consumption, and nonce state stays bounded', async () => {
@@ -105,7 +105,7 @@ test('replay retention survives a restart and expires with the assertion', async
   const env = await setup(); await env.challenge();
   const assertion = await env.assertion();
   assert.equal((await env.send({ assertion })).status, 200);
-  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains:['shop.test'],directScopes:[],metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
+  const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'],supportedScopes:[],metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
   env.issuer = restarted;
   expectError(await env.send({ assertion }), 'invalid_grant');
   env.clock.now += 61_000; env.nonce = undefined; await env.challenge();
@@ -164,7 +164,7 @@ test('session, scope, resource and request shape checks', async () => {
   expectError(await env.send({ session_id: first.body.session_id, assertion: await env.assertion({ sub: 'usr_2' }) }), 'invalid_session');
   expectError(await env.send({ session_id: 'ses_missing' }), 'invalid_session');
   expectError(await env.send({ session_id: '__proto__' }), 'invalid_session');
-  expectError(await env.send({ scope: 'poppy:read' }), 'invalid_scope');
+  expectError(await env.send({ scope: 'orders:read' }), 'invalid_scope');
   expectError(await env.send({ resource: 'https://api.shop.test/other' }), 'invalid_target');
   expectError(await env.send({ grant_type: 'password' }), 'unsupported_grant_type');
   expectError(await env.send({ grant_type: undefined }), 'invalid_request');

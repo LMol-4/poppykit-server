@@ -7,6 +7,16 @@ order authorization checks with protected work. The reference issuer is a
 separate `/reference-auth` import and uses the shared company database coordinator
 for immediate revocation visibility.
 
+For draft 0.3 discovery configure `protectedResources`, including
+`https://company.example` (host only, no port/path/trailing slash), and
+`supportedScopes`, the company-defined account scopes. This replaces
+`poppyDomains` and `directScopes` in reference issuer options. Direct and Device
+use that same supported list; Device configuration no longer has a `scopes` field.
+Mediated retains its own subset. Publish descriptions in company `auth.scopes` or
+a listed OpenAPI document. Names starting with `poppy:` are reserved. Issuer
+metadata emits the mandatory session/refresh grants and enabled sign-in grants.
+Token exchange for Bearer-only MCP remains a later migration stage.
+
 Reference Direct sign-in uses `beginAuthorization` / `completeAuthorization`.
 The host authenticates the human and protects consent with its own browser
 session/CSRF controls; pass a high-entropy browser binding. Registered callback
@@ -50,7 +60,7 @@ Until then, the full-ancestor guarantee applies only to newly created lineages.
 This update does not reset stored data or silently revoke legacy grants.
 
 Enable reference Device sign-in with `device: { endpoint, verificationUri,
-scopes }`. Route the configured device endpoint to `deviceAuthorization`.
+}`. Route the configured device endpoint to `deviceAuthorization`.
 On the human page call `beginDeviceAuthorization(userCode, browserBinding)` and
 show the client identity and requested scopes. After an authenticated explicit
 approve/decline action call `completeDeviceAuthorization`. Opening a link must

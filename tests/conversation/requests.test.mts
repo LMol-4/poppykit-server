@@ -6,17 +6,17 @@ import assert from 'node:assert/strict';
 import { AuthorityError } from '../../dist/index.js';
 import { hello, setup } from './support.mjs';
 
-const directScopes = ['poppy:read', 'poppy:write'];
+const directScopes = ['orders:read', 'orders:write'];
 const latest = async (t:ReturnType<typeof setup>,id:string) => (await t.store.read()).conversations[id].events.at(-1);
 
 test('requestAuthorization on signed-out work adds a sign_in_required authorization event', async () => {
   const t = setup({ directScopes });
   const id = (await t.start(hello)).body.conversation_id;
   const claim = await t.service.claim();
-  await t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']);
+  await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']);
   const event = await latest(t, id);
   assert.deepEqual(Object.keys(expectValue(event)).sort(), ['created_at', 'error', 'id', 'scope', 'type']);
-  assert.deepEqual({ type: expectValue(event).type, error: expectValue(event).error, scope: expectValue(event).scope }, { type: 'authorization', error: 'sign_in_required', scope: 'poppy:read' });
+  assert.deepEqual({ type: expectValue(event).type, error: expectValue(event).error, scope: expectValue(event).scope }, { type: 'authorization', error: 'sign_in_required', scope: 'orders:read' });
   assert.match(expectValue(event).id, /^evt_/);
   assert.equal(expectValue(event).created_at, new Date(t.clock.now()).toISOString());
   // The conversation stays open and the work continues until it finishes (7.11).
@@ -30,22 +30,22 @@ test('requestAuthorization on signed-in work lacking scopes asks for insufficien
   const t = setup({ directScopes });
   const id = (await t.start(hello, { as: 'aliceSignedIn' })).body.conversation_id;
   const claim = await t.service.claim();
-  await t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read', 'poppy:write', 'poppy:read']);
+  await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read', 'orders:write', 'orders:read']);
   const event = await latest(t, id);
-  assert.deepEqual([expectValue(event).error, expectValue(event).scope], ['insufficient_scope', 'poppy:read poppy:write']);
+  assert.deepEqual([expectValue(event).error, expectValue(event).scope], ['insufficient_scope', 'orders:read orders:write']);
 });
 
 test('requestAuthorization dedupes a stable output ID and rejects changed reuse', async () => {
   const t = setup({ directScopes });
   const id = (await t.start(hello)).body.conversation_id;
   const claim = await t.service.claim();
-  await t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']);
-  await t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']);
+  await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']);
+  await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']);
   const events = (await t.store.read()).conversations[id].events;
   assert.equal(events.filter((event:ConversationEvent) => event.type === 'authorization').length, 1);
-  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', ['poppy:write']), { code: 'output_conflict' });
+  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:write']), { code: 'output_conflict' });
   await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'Please sign in.' });
-  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'out_1', ['poppy:read']), { code: 'output_conflict' });
+  await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'out_1', ['orders:read']), { code: 'output_conflict' });
   assert.equal((await t.store.read()).conversations[id].events.length, events.length + 1);
 });
 
@@ -54,11 +54,11 @@ test('requestAuthorization validates scopes against the direct scopes before wri
   await t.start(hello);
   const claim = await t.service.claim();
   const before = await t.store.read();
-  for (const scopes of [[], ['poppy:admin'], ['poppy:read', 'openid'], 'poppy:read', [1]]) {
+  for (const scopes of [[], ['poppy:admin'], ['orders:read', 'openid'], 'orders:read', [1]]) {
     // @ts-expect-error The table includes malformed non-string scopes.
     await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', scopes), TypeError, JSON.stringify(scopes));
   }
-  await assert.rejects(setup().service.requestAuthorization(expectValue(claim), 'auth', ['poppy:read']), /supportedScopes is not configured/);
+  await assert.rejects(setup().service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']), /supportedScopes is not configured/);
   assert.deepEqual(await t.store.read(), before);
 });
 
@@ -67,13 +67,13 @@ test('stale fences cannot request authorization or a user', async () => {
   const id = (await t.start(hello)).body.conversation_id;
   const old = await t.service.claim();
   t.clock.advance(1000);
-  await assert.rejects(t.service.requestAuthorization(expectValue(old), 'auth', ['poppy:read']), { code: 'stale_work' }, 'expired lease');
+  await assert.rejects(t.service.requestAuthorization(expectValue(old), 'auth', ['orders:read']), { code: 'stale_work' }, 'expired lease');
   const fresh = await t.service.claim();
-  await assert.rejects(t.service.requestAuthorization(expectValue(old), 'auth', ['poppy:read']), { code: 'stale_work' }, 'reclaimed');
+  await assert.rejects(t.service.requestAuthorization(expectValue(old), 'auth', ['orders:read']), { code: 'stale_work' }, 'reclaimed');
   await assert.rejects(t.service.requestUser(expectValue(old), 'user', 'A specialist needs you.'), { code: 'stale_work' });
-  await assert.rejects(t.service.requestAuthorization({ workId: 'wrk_unknown', fence: expectValue(fresh).fence }, 'auth', ['poppy:read']), { code: 'stale_work' });
+  await assert.rejects(t.service.requestAuthorization({ workId: 'wrk_unknown', fence: expectValue(fresh).fence }, 'auth', ['orders:read']), { code: 'stale_work' });
   await t.service.finish(expectValue(fresh), 'suspended');
-  await assert.rejects(t.service.requestAuthorization(expectValue(fresh), 'auth', ['poppy:read']), { code: 'stale_work' }, 'finished');
+  await assert.rejects(t.service.requestAuthorization(expectValue(fresh), 'auth', ['orders:read']), { code: 'stale_work' }, 'finished');
   const events = (await t.store.read()).conversations[id].events;
   assert.ok(!events.some((event:ConversationEvent) => event.type === 'authorization' || event.type === 'user_requested'));
 });

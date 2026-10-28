@@ -181,11 +181,11 @@ async function heldAuthorityCase(t:ReturnType<typeof staffSetup>,id:string,handB
   assert.equal(expectValue(a).message.id, 'msg_a');
   // Signed out: no account to bind, and no read scope either.
   await assert.rejects(t.service.requireAccount(expectValue(a), []), { code: 'sign_in_required' });
-  await assert.rejects(t.service.requireAccount(expectValue(a), ['poppy:read']), { code: 'insufficient_scope' });
+  await assert.rejects(t.service.requireAccount(expectValue(a), ['orders:read']), { code: 'insufficient_scope' });
   await t.service.finish(expectValue(a), 'completed');
   const b = await t.service.claim();
   assert.equal(expectValue(b).message.id, 'msg_b');
-  assert.deepEqual(await t.service.requireAccount(expectValue(b), ['poppy:read']), { accountId: 'acct_1' });
+  assert.deepEqual(await t.service.requireAccount(expectValue(b), ['orders:read']), { accountId: 'acct_1' });
 }
 
 test("no-staff: work held while queued keeps every message's own accepted authority", async () => {
@@ -393,7 +393,7 @@ test('reset: a fresh generation invalidates every old fence and conversation', a
 
 test('waited POST receipt survives a crash after commit: a retry on a fresh service returns it without a second job', async () => {
   const t = setup();
-  const crashing = createConversationService({
+  const crashing = createConversationService({ historyScopes: ['orders:read'],
     endpoint, authenticator: { authenticate: async () => principals.alice },
     policy: t.policy, clock: t.clock,
     store: { read: () => t.store.read(), transaction: (selection, change) => t.store.transaction(selection, change).then(() => { throw new Error('crash after commit'); }) },

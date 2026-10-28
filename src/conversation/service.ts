@@ -1,3 +1,4 @@
+import { companyScopes } from '../network/discovery.js';
 import { randomBytes } from 'node:crypto';
 import { createConversationNotifications } from './store.js';
 import { ValidationError, canonical, parseJson, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
@@ -56,8 +57,8 @@ export interface ConversationOptions {
   authorizeOperator?: (operator: unknown, conversationId: string) => Promise<void>;
   /** Mandatory for requestAuthorization: the scopes the issuer's Direct Sign-In grants; work may ask only for these. */
   directScopes?: readonly string[];
-  /** Scopes that allow reading account-bound history; default ['poppy:read']. A Company offering only custom scopes sets its own. */
-  historyScopes?: readonly string[];
+  /** Required nonempty company scopes for account-bound history. */
+  historyScopes: readonly string[];
 }
 export interface WorkRef { workId: string; fence: string }
 export interface WorkClaim extends WorkRef { conversationId: string; message: Message; context: JsonObject }
@@ -66,7 +67,7 @@ export interface ConversationService {
   handle(request: Request): Promise<Response>;
   claim(): Promise<WorkClaim | null>;
   renew(work: WorkRef): Promise<void>;
-  /** Conversation history for a model or handler; account-bound history needs the bound account and poppy:read. */
+  /** Conversation history for a model or handler; account-bound history needs the bound account and configured historyScopes. */
   history(work: WorkRef): Promise<ConversationEvent[]>;
   /** Account-use gate: call before any account read or tool. Checks accepted authority, then binds the shared ownership once. */
   requireAccount(work: WorkRef, scopes: readonly string[]): Promise<{ accountId: string }>;
@@ -138,7 +139,9 @@ async function readJson(request: Request): Promise<unknown> {
 export function createConversationService(options: ConversationOptions): ConversationService {
   const { store, authenticator, policy, clock } = options;
   const pageSize = options.pageSize ?? 100;
-  const historyScopes = [...(options.historyScopes ?? ['poppy:read'])];
+  const historyScopes = [...companyScopes(options.historyScopes)];
+  if (options.supportedScopes) companyScopes(options.supportedScopes, true);
+  if (options.directScopes) companyScopes(options.directScopes, true);
   const leaseMs = options.leaseMs ?? 60000;
   const operatorLeaseMs = options.operatorLeaseMs ?? 900000;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
@@ -262,7 +265,7 @@ export function createConversationService(options: ConversationOptions): Convers
   function ack(conversation: ConversationRecord): JsonObject {
     return { conversation_id: conversation.id, status: conversation.status, responder: conversation.responder };
   }
-  // Account-bound history needs poppy:read; sending alone does not read history. Other readers fail ownership first.
+  // Account-bound history needs the configured scopes; sending alone does not read history. Other readers fail ownership first.
   const scopesFor = (state: ConversationStoreState, principal: Principal, conversation: ConversationRecord | undefined, history: boolean) =>
     // Only an owner may see a scope error; for anyone else ownership fails first with 404, so existence never leaks.
     conversation && history && conversation.issuer === principal.issuer && conversation.clientId === principal.clientId && principal.accountId !== undefined

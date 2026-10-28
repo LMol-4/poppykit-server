@@ -1,5 +1,9 @@
 # PoppyKit server
 
+Unreleased migration checkpoint (2026-10-28): discovery now targets draft 0.3.
+Authentication, conversation wire/storage and optional integrations still have
+staged migration work; this checkout is not ready to publish or deploy as 0.3.
+
 The Node 24.21.0 minimum is an owner-accepted compatibility baseline. Use a current patched Node 24 runtime where available; this minimum does not establish that older runtimes contain later security fixes. Build and release CI read `.node-version`.
 
 TypeScript SDK for companies implementing [Personal Agent Protocol draft 0.2](https://personalagentprotocol.org/docs/0.2/spec).
@@ -37,11 +41,12 @@ try {
   const endpoint = 'https://company.example/conversations';
   const auth = createReferenceIssuer({
     issuer, tokenEndpoint: issuer + '/token', revocationEndpoint: issuer + '/revoke',
-    poppyDomains: ['company.example'], directScopes: [], resources: [endpoint],
+    protectedResources: ['https://company.example'], supportedScopes: [], resources: [endpoint],
     metadata: createMetadataResolver(transport), store: database.issuer(issuer),
     coordinator: database, now: Date.now,
   });
   const service = createConversationService({
+    historyScopes: ['orders:read'],
     endpoint, store: database.conversations(issuer), policy: auth.authority.policy,
     authenticator: createRequestAuthenticator({ authority: auth.authority,
       endpoints: [{ origin: 'https://company.example', pathPrefix: '/conversations', resource: endpoint }],

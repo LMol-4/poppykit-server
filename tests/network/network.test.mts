@@ -10,7 +10,7 @@ import tls from 'node:tls';
 import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { createNodeTransport, isPublicAddress } from '../../dist/network/transport.js';
-import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl } from '../../dist/network/discovery.js';
+import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl, signInMethods } from '../../dist/network/discovery.js';
 import * as wire from '../../dist/protocol/wire.js';
 
 
@@ -20,7 +20,7 @@ const state = { conversation_id: 'c1', status: 'idle', responder: 'agent' };
 const event = { id: 'e1', type: 'future', created_at: '2026-10-19T00:00:00Z', opaque: { preserved: true } };
 test('wire validates every known event while preserving unknown events and message fields', () => {
   assert.equal(wire.parseEvent(event), event);
-  const variants = [{ type: 'message', message: { id: 'm', sender: 'human', role: 'user', text: '' } }, { type: 'state', status: 'working', responder: 'human' }, { type: 'authorization', error: 'sign_in_required' }, { type: 'authorization', error: 'insufficient_scope', scope: 'poppy:read' }, { type: 'user_requested', reason: '' }, { type: 'direct_opened', conversation_id: 'child' }, { type: 'direct_closed', conversation_id: 'child' }];
+  const variants = [{ type: 'message', message: { id: 'm', sender: 'human', role: 'user', text: '' } }, { type: 'state', status: 'working', responder: 'human' }, { type: 'authorization', error: 'sign_in_required' }, { type: 'authorization', error: 'insufficient_scope', scope: 'orders:read' }, { type: 'user_requested', reason: '' }, { type: 'direct_opened', conversation_id: 'child' }, { type: 'direct_closed', conversation_id: 'child' }];
   for (const variant of variants) wire.parseEvent({ ...event, ...variant });
   assert.throws(() => wire.parseEvent({ ...event, type: 'message' }));
   assert.throws(() => wire.parseEvent({ ...event, type: 'authorization', error: 'insufficient_scope' }));
@@ -50,15 +50,15 @@ test('token/error/retry codecs enforce semantic minimums without logging secret 
   wire.parseProtocolError({ error: 'extension_required', extension: 'future' });
   assert.equal(wire.retryAfterMilliseconds('12', 0), 12000); assert.equal(wire.retryAfterMilliseconds('Mon, 19 Oct 2026 00:00:00 GMT', Date.parse('2026-10-18T23:59:59Z')), 1000); assert.equal(wire.retryAfterMilliseconds('-1', 0), undefined);
 });
-const document = { protocol_version: '0.2', organization: { name: 'Shop', domain: 'shop.example' }, auth: { issuer: 'https://auth.example/tenant', direct: { scopes: ['poppy:read'] } }, agent: { protocols: [{ type: 'future', endpoint: 'https://shop.example/conversations' }] } };
-const authorization = { issuer: 'https://auth.example/tenant', token_endpoint: 'https://auth.example/token', revocation_endpoint: 'https://auth.example/revoke', authorization_endpoint: 'https://auth.example/authorize', poppy_domains: ['shop.example'], client_id_metadata_document_supported: true };
+const document = { protocol_version: '0.3', organization: { name: 'Shop', domain: 'shop.example' }, auth: { issuer: 'https://auth.example/tenant', scopes: { 'orders:read': 'Read orders' } }, agent: { protocols: [{ type: 'future', endpoint: 'https://shop.example/conversations' }] } };
+const authorization = { issuer: 'https://auth.example/tenant', token_endpoint: 'https://auth.example/token', revocation_endpoint: 'https://auth.example/revoke', authorization_endpoint: 'https://auth.example/authorize', protected_resources: ['https://shop.example'], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token', 'authorization_code'], scopes_supported: ['orders:read'], client_id_metadata_document_supported: true };
 test('discovery enforces version, reciprocal issuer, algorithms, capability and client URL rules', () => {
   parsePoppyDocument(document, 'https://shop.example/.well-known/poppy.json');
-  parsePoppyDocument({ protocol_version: '0.2', organization: document.organization, web: {} }, 'https://shop.example/x');
+  parsePoppyDocument({ protocol_version: '0.3', organization: document.organization, web: {} }, 'https://shop.example/.well-known/poppy.json');
   parseAuthorizationMetadata(authorization, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json'));
   assert.equal(authorizationMetadataUrl('https://auth.example/tenant'), 'https://auth.example/.well-known/oauth-authorization-server/tenant');
-  for (const bad of [{ ...document, protocol_version: '0.3' }, { ...document, organization: { name: 'Shop', domain: 'other.example' } }, { protocol_version: '0.2', organization: document.organization, feedback: { endpoint: 'https://shop.example/feedback' } }]) assert.throws(() => parsePoppyDocument(bad, 'https://shop.example/x'));
-  for (const bad of [{ ...authorization, issuer: 'https://auth.example/other' }, { ...authorization, poppy_domains: ['other.example'] }, { ...authorization, dpop_signing_alg_values_supported: ['RS256'] }]) assert.throws(() => parseAuthorizationMetadata(bad, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));
+  for (const bad of [{ ...document, protocol_version: '0.2' }, { ...document, organization: { name: 'Shop', domain: 'other.example' } }, { protocol_version: '0.3', organization: document.organization, feedback: { endpoint: 'https://shop.example/feedback' } }]) assert.throws(() => parsePoppyDocument(bad, 'https://shop.example/.well-known/poppy.json'));
+  for (const bad of [{ ...authorization, issuer: 'https://auth.example/other' }, { ...authorization, protected_resources: ['https://other.example'] }, { ...authorization, dpop_signing_alg_values_supported: ['RS256'] }]) assert.throws(() => parseAuthorizationMetadata(bad, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));
   for (const bad of ['https://client.example', 'https://client.example/a/../client', 'https://client.example/%2e/client', 'https://user@client.example/client', 'http://client.example/client']) assert.throws(() => validateClientId(bad));
   validateClientId('https://client.example/');
 });
@@ -82,9 +82,9 @@ test('issuer auth consistency is checked across cached domains and errors never 
   let bad = true; let requests = 0;
   const resolver = createMetadataResolver({ async fetch(request) {
     requests++;
-    if (request.url.includes('oauth-authorization-server')) return Response.json({ ...authorization, poppy_domains: ['shop.example', 'other.example'] }, { headers: { 'cache-control': 'max-age=300' } });
+    if (request.url.includes('oauth-authorization-server')) return Response.json({ ...authorization, protected_resources: ['https://shop.example', 'https://other.example'] }, { headers: { 'cache-control': 'max-age=300' } });
     const other = request.url.includes('other.example');
-    return Response.json({ ...document, protocol_version: bad ? 'wrong' : '0.2', organization: { name: 'Shop', domain: other ? 'other.example' : 'shop.example' }, auth: other ? { ...document.auth, unknown: 'changed' } : document.auth }, { headers: { 'cache-control': 'max-age=300' } });
+    return Response.json({ ...document, protocol_version: bad ? 'wrong' : '0.3', organization: { name: 'Shop', domain: other ? 'other.example' : 'shop.example' }, auth: other ? { ...document.auth, unknown: 'changed' } : document.auth }, { headers: { 'cache-control': 'max-age=300' } });
   } });
   await assert.rejects(resolver.resolveCompany('shop.example')); bad = false; await resolver.resolveCompany('shop.example'); assert.equal(requests, 3);
   await assert.rejects(resolver.resolveCompany('other.example'), /auth.consistency/);
@@ -275,9 +275,9 @@ test('authDocuments inner and outer maps are bounded; live entries still conflic
   const scopesFor:Record<string,string[]> = {}; // domain -> direct scopes
   const make = (clock:{t:number},extra:MetadataOptions = {}) => createMetadataResolver({ async fetch(request) {
     const url = new URL(request.url); const headers = { 'cache-control': `max-age=${url.hostname === 'b1.example' ? 300 : 100}` };
-    if (url.pathname.includes('oauth-authorization-server')) return Response.json({ ...authorization, issuer: `https://${url.hostname}`, poppy_domains: Object.keys(issuers) }, { headers });
+    if (url.pathname.includes('oauth-authorization-server')) return Response.json({ ...authorization, issuer: `https://${url.hostname}`, protected_resources: Object.keys(issuers).map(domain => `https://${domain}`), scopes_supported: ['x','y'] }, { headers });
     const domain = url.hostname;
-    return Response.json({ ...document, organization: { name: 'S', domain }, auth: { issuer: `https://${issuers[domain]}.example`, direct: { scopes: scopesFor[domain] } } }, { headers });
+    return Response.json({ ...document, organization: { name: 'S', domain }, auth: { issuer: `https://${issuers[domain]}.example`, scopes: {x:"Permission x",y:"Permission y"}, fixture_policy: scopesFor[domain] } }, { headers });
   } }, { now: () => clock.t, maxFetchesPerMinute: 1000, ...extra });
   Object.assign(scopesFor, { 'a1.example': ['x'], 'a2.example': ['x'], 'a3.example': ['x'], 'a4.example': ['y'] });
   const full = make({ t: 0 }); for (const d of ['a1', 'a2', 'a3']) await full.resolveCompany(`${d}.example`);
@@ -455,4 +455,45 @@ test('close during DNS prevents a resumed lookup from opening any connection',as
   mock.method(dns,'lookup',(_host:string,_opts:dns.LookupOptions,callback:(error:NodeJS.ErrnoException|null,addresses:dns.LookupAddress[])=>void)=>{release=()=>callback(null,[{address:'8.8.8.8',family:4}]);entered();});mock.method(tls,'connect',(options:tls.ConnectionOptions,listener?:()=>void)=>{connects++;return connect(options,listener);});syncBuiltinESMExports();
   const transport=createNodeTransport();
   try{const pending=transport.fetch(new Request('https://late.example/'));await ready;expectValue(transport.close).call(transport);release();await assert.rejects(pending,{code:'closed'});assert.equal(connects,0);}finally{dns.lookup=original;tls.connect=connect;syncBuiltinESMExports();expectValue(transport.close).call(transport);}
+});
+
+// Independent peer literals: no reference issuer or publisher helper supplies this contract.
+test('0.3 peer grants select methods and require described company scopes and endpoints', () => {
+  const doc = parsePoppyDocument(document, 'https://shop.example/.well-known/poppy.json');
+  const grants = ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token'];
+  const peer = { ...authorization, grant_types_supported: [...grants, 'authorization_code', 'urn:ietf:params:oauth:grant-type:device_code'], device_authorization_endpoint: 'https://auth.example/device' };
+  const parsed = parseAuthorizationMetadata(peer, doc);
+  assert.deepEqual(signInMethods({ document: doc, authorization: parsed, url: 'https://shop.example/.well-known/poppy.json' }), [{method:'direct',scopes:['orders:read']},{method:'device',scopes:['orders:read']}]);
+  assert.deepEqual(signInMethods({ document: doc, authorization: parseAuthorizationMetadata({...peer,grant_types_supported:grants},doc), url:'' }), [], 'endpoints and old auth.direct/device fields alone never select a method');
+  for (const changes of [{grant_types_supported:undefined},{grant_types_supported:['refresh_token']},{grant_types_supported:[grants[0]]},{authorization_endpoint:undefined},{device_authorization_endpoint:undefined},{scopes_supported:undefined},{scopes_supported:['poppy:read']},{scopes_supported:['bad scope']}]) assert.throws(()=>parseAuthorizationMetadata({...peer,...changes},doc));
+  assert.throws(()=>parseAuthorizationMetadata({...peer,scopes_supported:['unexplained']},doc),{field:'auth.scopes'});
+  assert.throws(()=>parsePoppyDocument({...document,auth:{...document.auth,scopes:{'poppy:future':'Reserved'}}},'https://shop.example/.well-known/poppy.json'),{field:'scopes'});
+  const mediated = parsePoppyDocument({...document,auth:{...document.auth,mediated:{endpoint:'https://auth.example/sign-in',scopes:['orders:read'],fields:[{name:'password',label:'Password',secret:true}]}}},'https://shop.example/.well-known/poppy.json');
+  assert.throws(()=>parseAuthorizationMetadata({...peer,scopes_supported:[]},mediated),{field:'mediated.scopes'});
+  assert.equal(signInMethods({document:mediated,authorization:parsed,url:''})[2].method,'mediated');
+});
+
+test('reciprocal resources compare host case only and issuer character for character', () => {
+  const doc = parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json');
+  parseAuthorizationMetadata({...authorization,protected_resources:['https://SHOP.Example','https://mcp.example/mcp']},doc);
+  for(const resource of ['https://shop.example/','https://shop.example/path','https://shop.example:443','https://shop.example?','https://shop.example.evil','https://shop.example.','HTTPS://shop.example']) assert.throws(()=>parseAuthorizationMetadata({...authorization,protected_resources:[resource]},doc),{field:'protected_resources'},resource);
+  assert.throws(()=>parseAuthorizationMetadata({...authorization,issuer:authorization.issuer+'/'},doc),{field:'issuer'});
+});
+
+test('final well-known path is checked before use, cache and 304 revalidation', async () => {
+  let now=0,calls=0,finalUrl='https://shop.example/.well-known/poppy.json',status=200;
+  const resolver=createMetadataResolver({async fetch(request){
+    calls++; if(request.url.includes('oauth-authorization-server')) return Response.json(authorization);
+    const response=status===304?new Response(null,{status,headers:{'cache-control':'max-age=1'}}):Response.json(document,{headers:{'cache-control':'max-age=1',etag:'peer-v1'}});
+    Object.defineProperty(response,'url',{value:finalUrl}); return response;
+  }},{now:()=>now});
+  for(const destination of ['https://shop.example/uploads/claim.json','https://shop.example/.well-known/poppy.json?x=1','https://shop.example/.well-known/poppy.json?']) {
+    finalUrl=destination;await assert.rejects(resolver.resolveCompany('www.shop.example'),{field:'discovery.url'});
+  }
+  finalUrl='https://shop.example/.well-known/poppy.json';
+  assert.equal((await resolver.resolveCompany('www.shop.example')).url,finalUrl,'cross-host HTTPS well-known redirects work');
+  const cachedCalls=calls; await resolver.resolveCompany('www.shop.example');assert.equal(calls,cachedCalls);
+  now=1001;status=304;finalUrl='https://shop.example/uploads/claim.json?x=1';
+  await assert.rejects(resolver.resolveCompany('www.shop.example'),{field:'discovery.url'});
+  finalUrl='https://shop.example/.well-known/poppy.json';assert.equal((await resolver.resolveCompany('www.shop.example')).url,finalUrl);
 });

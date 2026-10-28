@@ -62,14 +62,14 @@ export const endpoint = 'https://api.example.test/poppy/conversations';
 const base = { issuer: 'https://auth.example.test', clientId: 'https://agent.example.test/client', sessionId: 's1', scopes: [], tokenExpiresAt: 9e12, sessionVersion: 1 };
 export const principals:Record<string,Principal> = {
   alice: { ...base, userId: 'u_alice' },
-  aliceSignedIn: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
+  aliceSignedIn: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['orders:read'] },
   aliceCustomScope: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: ['shop:history'] },
   aliceNoScopes: { ...base, userId: 'u_alice', accountId: 'acct_1', scopes: [] },
-  aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['poppy:read'] },
+  aliceOtherAccount: { ...base, userId: 'u_alice', accountId: 'acct_2', scopes: ['orders:read'] },
   bob: { ...base, userId: 'u_bob' },
-  bobOtherAccount: { ...base, userId: 'u_bob', accountId: 'acct_2', scopes: ['poppy:read'] },
-  carolSameAccount: { ...base, userId: 'u_carol', accountId: 'acct_1', scopes: ['poppy:read'] },
-  otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['poppy:read'] },
+  bobOtherAccount: { ...base, userId: 'u_bob', accountId: 'acct_2', scopes: ['orders:read'] },
+  carolSameAccount: { ...base, userId: 'u_carol', accountId: 'acct_1', scopes: ['orders:read'] },
+  otherClientSameAccount: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: ['orders:read'] },
   otherClientNoScopes: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice', accountId: 'acct_1', scopes: [] },
   otherClient: { ...base, clientId: 'https://evil.example.test/client', userId: 'u_alice' },
 };
@@ -101,7 +101,7 @@ export function setup(options:Partial<ConversationOptions> = {}) {
       return action();
     },
   };
-  const service = createConversationService({ endpoint, store, authenticator, policy, clock, ...options });
+  const service = createConversationService({ historyScopes: ['orders:read'], endpoint, store, authenticator, policy, clock, ...options });
   async function call(method:string,path:string, { as = 'alice', body, query = '', signal }:CallOptions = {}) {
     const response = await service.handle(new Request(`${endpoint}${path}${query}`, {
       method, signal, headers: { authorization: `DPoP ${as}`, 'content-type': 'application/json' },

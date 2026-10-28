@@ -57,7 +57,7 @@ export async function setup(overrides:Partial<ReferenceIssuerOptions> = {}) {
     async resolveClient(id) { env.calls.client++; await env.onClient?.(); if (id !== CLIENT && id !== OTHER_CLIENT) throw new Error('unknown client'); return { client_id: id, client_name: 'Agent', jwks_uri: JWKS_URI, redirect_uris: [REDIRECT], token_endpoint_auth_method: 'private_key_jwt' as const }; },
     async resolveJwks(uri, settings = {}) { assert.equal(uri, JWKS_URI); if (settings.refresh) { env.calls.refresh++; return structuredClone(env.refreshedJwks); } env.calls.jwks++; await env.onJwks?.(); return structuredClone(env.jwks); },
   };
-  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, poppyDomains: ['shop.test'], directScopes: ['poppy:read', 'poppy:write'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, authorizationResultCipher: resultCipher(), ...overrides });
+  env.issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'], supportedScopes: ['orders:read', 'orders:write'], resources: [RESOURCE], metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => clock.now, authorizationResultCipher: resultCipher(), ...overrides });
   env.assertion = (claims = {}, { key = identity, header = {} } = {}) => {
     const iat = Math.floor(clock.now / 1000);
     return new SignJWT({ iss: CLIENT, sub: 'usr_1', aud: ISSUER, iat, exp: iat + 60, jti: randomUUID(), ...claims }).setProtectedHeader({ alg: 'ES256', kid: 'k1', ...header }).sign(key.privateKey);

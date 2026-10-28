@@ -3,6 +3,7 @@ import { calculateJwkThumbprint, compactVerify, createLocalJWKSet, errors } from
 import type { JSONWebKeySet } from 'jose';
 import { ValidationError, parseAssertionClaims, parseJson } from '../protocol/wire.js';
 import type { AssertionClaims } from '../protocol/wire.js';
+import { companyScopes } from '../network/discovery.js';
 import type { MetadataResolver } from '../network/discovery.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
@@ -54,7 +55,7 @@ export interface IssuerState {
 }
 export interface ReferenceIssuerOptions {
   issuer: string; tokenEndpoint: string; revocationEndpoint: string; authorizationEndpoint?: string;
-  poppyDomains: string[]; directScopes: string[];
+  protectedResources: string[]; supportedScopes: string[];
   resources?: string[]; // exact supported resource identifiers; absent resource means default
   mcpResources?: { url: string; dpop: boolean }[];
   metadata: MetadataResolver;
@@ -69,7 +70,7 @@ export interface ReferenceIssuerOptions {
   maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
   maxPendingAuthorizationsPerClient?: number; // default 100, so one client cannot use up the global cap
   maxSessionsPerClient?: number; // default 10000 live Sessions (one client serves all its users); new ones are refused with rate_limited
-  device?: { endpoint: string; verificationUri: string; scopes: string[]; intervalSeconds?: number };
+  device?: { endpoint: string; verificationUri: string; intervalSeconds?: number };
   mediated?: MediatedOptions;
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
@@ -160,6 +161,11 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const { issuer, metadata, store, now } = options;
   if (secureUrl(issuer).search) throw new TypeError('issuer');
   secureUrl(options.tokenEndpoint); secureUrl(options.revocationEndpoint);
+  if (!options.protectedResources.length) throw new TypeError('protectedResources');
+  options.protectedResources.forEach(value => secureUrl(value));
+  companyScopes(options.supportedScopes, true);
+  if (options.authorizationEndpoint) secureUrl(options.authorizationEndpoint);
+  if (options.mediated && companyScopes(options.mediated.scopes).some(scope => !options.supportedScopes.includes(scope))) throw new TypeError('mediated.scopes');
   const positive = (value: number | undefined, fallback: number, name: string) => {
     const result = value ?? fallback;
     if (!Number.isSafeInteger(result) || result <= 0) throw new TypeError(name);
@@ -173,7 +179,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const maxSessionsPerClient = positive(options.maxSessionsPerClient, 10_000, 'maxSessionsPerClient');
   const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
   const requireNonce = options.requireDpopNonce ?? true;
-  if (options.device) { secureUrl(options.device.endpoint); const url = secureUrl(options.device.verificationUri); const hosts = [new URL(issuer).hostname, ...options.poppyDomains];
+  if (options.device) { secureUrl(options.device.endpoint); const url = secureUrl(options.device.verificationUri); const hosts = [new URL(issuer).hostname, ...options.protectedResources.map(resource => new URL(resource).hostname)];
     if (!hosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) throw new TypeError('verificationUri'); }
   if (options.mediated) { secureUrl(options.mediated.endpoint); if (!options.mediated.fields.length || new Set(options.mediated.fields.map(field => field.name)).size !== options.mediated.fields.length) throw new TypeError('mediated.fields'); }
   const deviceIntervalMs = positive(options.device?.intervalSeconds, 5, 'intervalSeconds') * 1000;
@@ -295,7 +301,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   async function startDevice(request: Request): Promise<Response> {
     if (!options.device) throw new TokenError('unsupported_grant_type');
     const params = await readParams(request), { clientId, clientAssertion } = clientCredentials(params);
-    const scopes = signInScopes(params.get('scope'), options.device.scopes), { client } = await authenticateClient(clientId, clientAssertion);
+    const scopes = signInScopes(params.get('scope'), options.supportedScopes), { client } = await authenticateClient(clientId, clientAssertion);
     const { generation } = await read(), userCode = random(8).toUpperCase(), deviceCode = `${userCode}.${random(32)}`, id = tokenHash(userCode);
     const replayKey = `assertion ${clientId} ${client.jti}`;
     await commit({ kind: 'sign_in', ids: [id, clientRevisionKey(clientId)], clientId, replayKeys: [replayKey], at: now() }, draft => {
@@ -700,7 +706,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const codeChallenge = params.get('code_challenge') ?? '';
       if (params.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw fail('invalid_request');
       const scopes = [...new Set((params.get('scope') ?? '').split(' ').filter(Boolean))];
-      if (!scopes.length || !scopes.every(scope => options.directScopes.includes(scope))) throw fail('invalid_scope');
+      if (!scopes.length || !scopes.every(scope => options.supportedScopes.includes(scope))) throw fail('invalid_scope');
       // resource is accepted and ignored here: grants cover every resource, and each token request selects one (spec 4.3).
       const resource = params.get('resource');
       if (resource !== undefined && !resources.includes(resource)) throw fail('invalid_target');
@@ -757,7 +763,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         ...(options.authorizationEndpoint ? { authorization_endpoint: options.authorizationEndpoint, response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] } : {}),
         ...(options.device ? { device_authorization_endpoint: options.device.endpoint } : {}),
         dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true,
-        poppy_domains: [...options.poppyDomains],
+        protected_resources: [...options.protectedResources],
+        grant_types_supported: [JWT_BEARER, 'refresh_token', ...(options.authorizationEndpoint ? ['authorization_code'] : []), ...(options.device ? [DEVICE_GRANT] : [])],
+        scopes_supported: [...options.supportedScopes],
       };
     },
     authority: {
