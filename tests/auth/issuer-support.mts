@@ -72,8 +72,8 @@ export async function setup(overrides:Partial<ReferenceIssuerOptions> = {}) {
     const result = { status: response.status, headers: response.headers, body: await response.json() };
     // Internal authority is separate from the protocol response, which has no Session ID/sign-in fields.
     if (result.status === 200 && result.body.access_token) {
-      const { principal } = await env.issuer.authority.introspect(result.body.access_token, fields.resource);
-      return { ...result, sessionId: principal.sessionId, signedIn: !!principal.accountId };
+      try {const { principal } = await env.issuer.authority.introspect(result.body.access_token, fields.resource);
+      return { ...result, sessionId: principal.sessionId, signedIn: !!principal.accountId };}catch(error){if(!(error instanceof Error)||!('code' in error)||error.code!=='invalid_token')throw error;}
     }
     return result;
   };
