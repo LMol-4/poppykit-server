@@ -1,18 +1,19 @@
 # PoppyKit server
 
-Unreleased migration checkpoint (2026-10-28): discovery now targets draft 0.3.
-Authentication, conversation wire/storage and optional integrations still have
-staged migration work; this checkout is not ready to publish or deploy as 0.3.
+Unreleased draft 0.3 candidate (2026-10-28), pinned to the public source captured that day.
+Client/CLI 0.5.0 and server 0.4.0 are breaking local candidates. Publication,
+deployment and live acceptance remain separate; stop old writers and follow the
+documented storage/reset procedure before compatible writers resume.
 
 The Node 24.21.0 minimum is an owner-accepted compatibility baseline. Use a current patched Node 24 runtime where available; this minimum does not establish that older runtimes contain later security fixes. Build and release CI read `.node-version`.
 
-TypeScript SDK for companies implementing [Personal Agent Protocol draft 0.2](https://personalagentprotocol.org/docs/0.2/spec).
+TypeScript SDK for companies implementing [Personal Agent Protocol draft 0.3](https://personalagentprotocol.org/docs/0.3/spec).
 Verify requests, serve conversations and enforce current authority. Your company
 supplies accounts, consent UI, agent, business tools and HTTPS routing. [MIT](LICENSE).
 
 ## Install
 
-This source contains unreleased repairs; final version selection and publication are pending.
+This candidate is not published. Use the reviewed local tarball for candidate checks; registry installation requires its separately approved release.
 
 Requires Node **24.x, at least 24.21.0**, and ESM. CI tests Node 24.21.0 on Linux, macOS and Windows;
 other Node majors are unsupported. SQLite is optional/experimental and
