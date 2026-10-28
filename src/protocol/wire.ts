@@ -15,7 +15,7 @@ export type KnownEvent =
   | (ConversationEvent & { type: 'user_requested'; reason: string })
   | (ConversationEvent & { type: 'direct_opened' | 'direct_closed'; conversation_id: string });
 export interface EventPage extends ConversationState { events: ConversationEvent[]; cursor: string | null; has_more: boolean }
-export interface TokenResponse { access_token: string; token_type: 'DPoP' | 'Bearer'; expires_in: number; scope: string; session_id: string; signed_in: boolean; refresh_token?: string; refresh_token_expires_in?: number; [key: string]: unknown }
+export interface TokenResponse { access_token: string; token_type: 'DPoP' | 'Bearer'; expires_in: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number; [key: string]: unknown }
 export interface ProtocolErrorBody { error: string; error_description?: string; error_uri?: string; extension?: string; conversation_id?: string; [key: string]: unknown }
 
 export class ValidationError extends Error {
@@ -116,8 +116,12 @@ export function parseEventPage(value: unknown, requestCursor?: string): EventPag
   return page as EventPage;
 }
 export function parseTokenResponse(value: unknown): TokenResponse {
-  const token = object(value); string(token.access_token, 'access_token'); string(token.session_id, 'session_id'); string(token.scope, 'scope', false);
-  member(token.token_type, ['DPoP', 'Bearer'], 'token_type'); member(token.signed_in, [true, false], 'signed_in'); positive(token.expires_in, 'expires_in');
+  const token = object(value); string(token.access_token, 'access_token');
+  if ('scope' in token) {
+    const scope = string(token.scope, 'scope', false);
+    if (scope !== '' && (!/^[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*$/.test(scope) || new Set(scope.split(' ')).size !== scope.split(' ').length)) throw new ValidationError('scope');
+  }
+  member(token.token_type, ['DPoP', 'Bearer'], 'token_type'); positive(token.expires_in, 'expires_in');
   if ('refresh_token' in token) string(token.refresh_token, 'refresh_token');
   if ('refresh_token_expires_in' in token) positive(token.refresh_token_expires_in, 'refresh_token_expires_in');
   return token as TokenResponse;
@@ -150,6 +154,7 @@ export interface DpopClaims { jti: string; htm: string; htu: string; iat: number
 export function parseAssertionClaims(value: unknown): AssertionClaims {
   const claims = object(value, 'claims');
   for (const key of ['iss', 'sub', 'aud', 'jti']) string(claims[key], key);
+  if ('agent_id' in claims) { string(claims.agent_id, 'agent_id'); if ((claims.agent_id as string).length > 256) throw new ValidationError('agent_id'); }
   // 128 random bits is at least 16 bytes; cap length since jti lands in the replay store. Encoding is not constrained.
   if ((claims.jti as string).length < 16 || (claims.jti as string).length > 256) throw new ValidationError('jti');
   positive(claims.iat, 'iat'); positive(claims.exp, 'exp');

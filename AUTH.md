@@ -46,13 +46,13 @@ preserving the accepted scope ceiling, reset generation and configured revocatio
 Account Token rotation retains all issued hashes through the fixed grant lifetime.
 Replaying any ancestor revokes its entire lineage and signs its Sessions out;
 rotation never extends the grant. Client authentication remains mandatory, while
-Session Tokens can move to a new DPoP key as the protocol permits. Shared provider
+Account Tokens can start Sessions with new keys; a Session never changes its key. Shared provider
 signing does not bind a copied refresh token to one provider enrollment. Keep
 tokens secret and serialize rotation; never retry a lost token response blindly.
 Bounded database cleanup removes hashes only after their lineage is expired,
 revoked or absent. No plaintext callback code is persisted.
 
-Upgrade prerequisite: older issuers discarded ancestors beyond the previous hash.
+Pre-version-3 upgrade prerequisite: older issuers discarded ancestors beyond the previous hash.
 Those missing hashes cannot be reconstructed by this update. Before public
 enablement, revoke every pre-upgrade live lineage through the issuer's normal
 revocation/disconnect flow and require fresh consent, or prove it has expired.
@@ -98,9 +98,15 @@ revision. Revision and per-account fence records remain until explicit issuer
 reset and never count as pending requests. Terminal method tombstones also do
 not consume pending quota.
 
-Issuer state is version 3. Older development state is refused without mutation;
-there is no automatic migration. Follow the explicit stop/backup/reset procedure
-in [STORAGE.md](STORAGE.md) only for state you choose to discard.
+Issuer state is version 4. SQLite/PostgreSQL upgrade normalized version 3 under
+their writer lock; grant lineage survives. Earlier unsupported development versions
+still fail closed. See [STORAGE.md](STORAGE.md) for the exact upgrade behavior.
+
+Token admission selects an internal Session ID atomically by the DPoP thumbprint.
+It checks the client, User and optional assertion `agent_id` against the existing
+Session. Known ended keys return `invalid_grant`; key mappings/tombstones are
+retained indefinitely in this reference implementation. Token requests reject the
+old `session_id` parameter; responses omit `session_id` and `signed_in`.
 
 Advertise only configured methods in your `poppy.json`; `authorizationMetadata()`
 adds the device endpoint only when enabled. There is no login/consent UI, identity

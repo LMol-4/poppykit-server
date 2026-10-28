@@ -5,12 +5,41 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { AuthorizationError, initialIssuerState } from '../../dist/reference-auth/index.js';
-import { NOW } from './support.mjs';
+import { NOW, keyPair } from './support.mjs';
 import { CLIENT, ISSUER, OTHER_CLIENT, REDIRECT, RESOURCE, expectError, setup } from './issuer-support.mjs';
 
 const BINDING = 'browser-binding-0123456789abcdef';
 const DAY = 86_400_000;
 const REVOKE = `${ISSUER}/oauth/revoke`;
+
+test('key-selected sign-in and refresh preserve ownership, sticky accounts and revocation', async () => {
+  const env = await setup({ requireDpopNonce: false });
+  const started = await env.send(), id = (await env.issuer.authority.introspect(expectValue(started.body.access_token))).principal.sessionId;
+  const consent = async (accountId: string) => {
+    const { verifier, challenge } = pkce();
+    const view = await env.issuer.beginAuthorization(authorizeRequest({ code_challenge: challenge }), BINDING);
+    const callback = await env.issuer.completeAuthorization(view.id, BINDING, { accountId, scopes: ['orders:read'] });
+    return env.send({ grant_type: 'authorization_code', assertion: undefined, code: callback.searchParams.get('code')!, redirect_uri: REDIRECT, code_verifier: verifier });
+  };
+  const signed = await consent('account-one'); assert.equal(signed.status, 200);
+  assert.deepEqual(Object.keys(signed.body).sort(), ['access_token', 'expires_in', 'refresh_token', 'refresh_token_expires_in', 'scope', 'token_type']);
+  const refresh = (token: string, dpop?: string) => env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: token }, { dpop });
+  const foreign = await keyPair();
+  assert.equal((await env.send({ assertion: await env.assertion({ sub: 'usr_foreign' }) }, { dpop: await env.proof({ key: foreign }) })).status, 200);
+  expectError(await refresh(expectValue(signed.body.refresh_token), await env.proof({ key: foreign })), 'invalid_grant');
+  const renewed = await refresh(expectValue(signed.body.refresh_token)); assert.equal(renewed.status, 200);
+  assert.notEqual(renewed.body.refresh_token, signed.body.refresh_token);
+  const principal = (await env.issuer.authority.introspect(expectValue(renewed.body.access_token))).principal;
+  assert.deepEqual([principal.sessionId, principal.userId, principal.accountId, principal.scopes], [id, 'usr_1', 'account-one', ['orders:read']]);
+  expectError(await consent('account-two'), 'account_mismatch');
+  const revoked = await env.issuer.revoke(new Request(REVOKE, { method: 'POST', body: new URLSearchParams({ token: expectValue(renewed.body.refresh_token), client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion() }) }));
+  assert.equal(revoked.status, 200);
+  await assert.rejects(env.issuer.authority.introspect(expectValue(renewed.body.access_token)), { code: 'invalid_token' });
+  const signedOut = await env.send(); assert.equal(signedOut.status, 200);
+  assert.equal((await env.issuer.authority.introspect(expectValue(signedOut.body.access_token))).principal.sessionId, id);
+  expectError(await refresh(expectValue(renewed.body.refresh_token)), 'invalid_grant');
+  expectError(await consent('account-two'), 'account_mismatch');
+});
 
 function pkce() {
   const verifier = randomBytes(32).toString('base64url');

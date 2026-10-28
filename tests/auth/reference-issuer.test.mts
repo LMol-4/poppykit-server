@@ -18,18 +18,45 @@ test('issues and renews a signed-out DPoP session after a nonce challenge', asyn
   assert.equal(challenge.status, 400); assert.equal(challenge.headers.get('cache-control'), 'no-store'); assert.ok(expectValue(env.nonce).length >= 16);
   const first = await env.send();
   assert.equal(first.status, 200); assert.equal(first.headers.get('cache-control'), 'no-store');
-  assert.deepEqual(Object.keys(first.body).sort(), ['access_token', 'expires_in', 'scope', 'session_id', 'signed_in', 'token_type']);
-  assert.equal(first.body.token_type, 'DPoP'); assert.equal(first.body.expires_in, 3600); assert.equal(first.body.scope, ''); assert.equal(first.body.signed_in, false);
+  assert.deepEqual(Object.keys(first.body).sort(), ['access_token', 'expires_in', 'token_type']);
+  assert.equal(first.body.token_type, 'DPoP'); assert.equal(first.body.expires_in, 3600);
   assert.ok(Buffer.from(expectValue(first.body.access_token), 'base64url').length >= 32);
   assert.ok(!JSON.stringify(env.store.state).includes(expectValue(first.body.access_token)), 'plaintext token is not persisted');
-  const renewed = await env.send({ session_id: first.body.session_id });
-  assert.equal(renewed.status, 200); assert.equal(renewed.body.session_id, first.body.session_id); assert.notEqual(renewed.body.access_token, first.body.access_token);
+  const sessionId = (await env.issuer.authority.introspect(expectValue(first.body.access_token))).principal.sessionId;
+  const renewed = await env.send();
+  assert.equal(renewed.status, 200); assert.notEqual(renewed.body.access_token, first.body.access_token);
 
   const authenticator = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://api.shop.test', pathPrefix: '/poppy' }], now: () => env.clock.now });
   const resourceProof = await proof(env.dpopKey, { htu: API, iat: NOW / 1000, token: renewed.body.access_token });
   const principal = await authenticator.authenticate(new Request(API, { method: 'POST', headers: { authorization: `DPoP ${renewed.body.access_token}`, dpop: resourceProof } }));
-  assert.deepEqual(principal, { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: first.body.session_id, scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1, issuerGeneration: env.store.state.generation });
+  assert.deepEqual(principal, { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId, scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1, issuerGeneration: env.store.state.generation });
   assert.deepEqual(env.issuer.authorizationMetadata(), { issuer: ISSUER, token_endpoint: TOKEN_ENDPOINT, revocation_endpoint: `${ISSUER}/oauth/revoke`, dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true, protected_resources: ['https://shop.test'], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token'], scopes_supported: ['orders:read','orders:write'] });
+});
+
+test('Session Keys atomically name one owned Session and retain ended-key rejection and agent identity', async () => {
+  const env = await setup({ requireDpopNonce: false });
+  const responses = await Promise.all([env.send(), env.send()]);
+  assert.deepEqual(responses.map(r => r.status), [200, 200]);
+  assert.equal(Object.keys(env.store.state.sessions).length, 1);
+  const [id] = Object.keys(env.store.state.sessions);
+  expectError(await env.send({ assertion: await env.assertion({ sub: 'foreign-user' }) }), 'invalid_grant');
+  expectError(await env.send({ client_id: 'https://agent.test/other.json', client_assertion: await env.clientAssertion({ iss: 'https://agent.test/other.json', sub: 'https://agent.test/other.json' }), assertion: await env.assertion({ iss: 'https://agent.test/other.json' }) }), 'invalid_grant');
+  expectError(await env.send({ session_id: id }), 'invalid_request');
+  env.clock.now += 86_400_001;
+  expectError(await env.send(), 'invalid_grant');
+  const key = await keyPair();
+  assert.equal((await env.send({ assertion: await env.assertion({ agent_id: 'opaque-agent' }) }, { dpop: await env.proof({ key }) })).status, 200);
+  expectError(await env.send({}, { dpop: await env.proof({ key }) }), 'invalid_grant');
+  assert.equal((await env.send({ assertion: await env.assertion({ agent_id: 'opaque-agent' }) }, { dpop: await env.proof({ key }) })).status, 200);
+});
+
+test('key-selected Bearer acquisition remains unbound at the exact MCP resource', async () => {
+  const resource = 'https://mcp.shop.test/mcp', env = await setup({ requireDpopNonce: false, mcpResources: [{ url: resource, dpop: false }] });
+  const issued = await env.send({ resource }); assert.equal(issued.status, 200); assert.equal(issued.body.token_type, 'Bearer');
+  const auth = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://mcp.shop.test', pathPrefix: '/mcp', resource, mcp: { dpop: false, metadataUrl: 'https://mcp.shop.test/.well-known/oauth-protected-resource/mcp' } }], now: () => env.clock.now });
+  const principal = await auth.authenticate(new Request(resource, { method: 'POST', headers: { authorization: `Bearer ${issued.body.access_token}` } }));
+  assert.equal(principal.userId, 'usr_1'); assert.equal(Object.keys(env.store.state.sessionKeys).length, 1);
+  await assert.rejects(auth.authenticate(new Request(resource + '/other', { headers: { authorization: `Bearer ${issued.body.access_token}` } })), { code: 'invalid_token' });
 });
 
 test('nonce challenge precedes network fetches and replay consumption, and nonce state stays bounded', async () => {
@@ -98,7 +125,7 @@ test('session assertion defects, reuse and cross-role jti reuse are invalid_gran
   const reusedClient = await env.clientAssertion();
   assert.equal((await env.send({ client_assertion: reusedClient })).status, 200);
   expectError(await env.send({ client_assertion: reusedClient }), 'invalid_grant');
-  assert.equal(Object.keys(env.store.state.sessions).length, 3);
+  assert.equal(Object.keys(env.store.state.sessions).length, 1);
 });
 
 test('replay retention survives a restart and expires with the assertion', async () => {
@@ -161,9 +188,9 @@ test('unknown kid triggers exactly one JWKS refresh', async () => {
 test('session, scope, resource and request shape checks', async () => {
   const env = await setup(); await env.challenge();
   const first = await env.send();
-  expectError(await env.send({ session_id: first.body.session_id, assertion: await env.assertion({ sub: 'usr_2' }) }), 'invalid_session');
-  expectError(await env.send({ session_id: 'ses_missing' }), 'invalid_session');
-  expectError(await env.send({ session_id: '__proto__' }), 'invalid_session');
+  expectError(await env.send({ assertion: await env.assertion({ sub: 'usr_2' }) }), 'invalid_grant');
+  expectError(await env.send({ session_id: 'ses_missing' }), 'invalid_request');
+  expectError(await env.send({ session_id: '__proto__' }), 'invalid_request');
   expectError(await env.send({ scope: 'orders:read' }), 'invalid_scope');
   expectError(await env.send({ resource: 'https://api.shop.test/other' }), 'invalid_target');
   expectError(await env.send({ grant_type: 'password' }), 'unsupported_grant_type');
@@ -192,7 +219,7 @@ test('session, scope, resource and request shape checks', async () => {
   const scoped = await env.send({ resource: RESOURCE });
   assert.equal(scoped.status, 200);
   const authority = env.issuer.authority;
-  assert.equal((await authority.introspect(expectValue(scoped.body.access_token), RESOURCE)).principal.sessionId, scoped.body.session_id);
+  assert.equal((await authority.introspect(expectValue(scoped.body.access_token), RESOURCE)).principal.sessionId, (await authority.introspect(expectValue(first.body.access_token))).principal.sessionId);
   await assert.rejects(authority.introspect(expectValue(scoped.body.access_token)), { code: 'invalid_token' });
   await assert.rejects(authority.introspect(expectValue(first.body.access_token), RESOURCE), { code: 'invalid_token' });
   await assert.rejects(authority.introspect('unknown'), { code: 'invalid_token' });

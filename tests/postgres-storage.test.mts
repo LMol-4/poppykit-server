@@ -23,9 +23,47 @@ function database(path: string) {
 import { setup, hello } from './conversation/support.mjs';
 import { setup as issuerSetup, CLIENT, ISSUER, REDIRECT } from './auth/issuer-support.mjs';
 import { effect } from '../test-support/synthetic-effect.mjs';
+import { keyPair } from './auth/support.mjs';
+import { initialIssuerState, createReferenceIssuer } from '../dist/reference-auth/index.js';
+import { calculateJwkThumbprint } from 'jose';
 const directories: string[] = [];
 after(async () => { for (const dir of directories) await rm(dir, { recursive: true, force: true }); });
 async function fixture() { const dir = await mkdtemp(join(tmpdir(), 'poppy-company-')); directories.push(dir); return join(dir, (process.env.D1_NAMESPACE ?? 'd1') + '-state.db'); }
+
+test('Session Key upgrade preserves grant lineage and internal IDs; independent writers create one Session', async t => {
+  const path = await fixture(), namespace = path + ':upgrade';
+  const env = await issuerSetup({ requireDpopNonce: false });
+  const jkt = await calculateJwkThumbprint(env.dpopKey.jwk), hash = (s: string) => createHash('sha256').update(s).digest('base64url');
+  const legacy = initialIssuerState(); legacy.version = 3;
+  legacy.sessions.old = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: env.clock.now, expiresAt: env.clock.now + 86400000, accountId: 'account', grantId: 'grant' };
+  legacy.sessions.other = { ...legacy.sessions.old, userId: 'usr_other', accountId: null, grantId: null };
+  legacy.grants.grant = { clientId: CLIENT, userId: 'usr_1', accountId: 'account', scopes: ['orders:read'], expiresAt: env.clock.now + 86400000, revoked: false, refreshHash: hash('old-account-token'), previousHash: '' };
+  legacy.refreshTokens[hash('old-account-token')] = 'grant';
+  legacy.accessTokens[hash('old-access-token')] = { sessionId: 'old', grantId: 'grant', scopes: ['orders:read'], resource: null, jkt, expiresAt: env.clock.now + 3600000 };
+  legacy.accessTokens[hash('other-old-token')] = { ...legacy.accessTokens[hash('old-access-token')], sessionId: 'other', grantId: null };
+  await pool!.query('INSERT INTO poppy_server.records VALUES ($1,$2,$3,$4)', [namespace, 'issuer_meta', 'meta', JSON.stringify({ version: 3, generation: legacy.generation, nonces: [] })]);
+  for (const kind of ['sessions', 'grants', 'refreshTokens', 'accessTokens'] as const) for (const [id, row] of Object.entries(legacy[kind])) await pool!.query('INSERT INTO poppy_server.records VALUES ($1,$2,$3,$4)', [namespace, kind, id, JSON.stringify(row)]);
+  const a = database(path), b = database(path); t.after(() => { a.close(); b.close(); });
+  const make = (db: ReturnType<typeof database>) => createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/oauth/token`, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'], supportedScopes: ['orders:read'], metadata: env.metadata, now: () => env.clock.now, requireDpopNonce: false, coordinator: db, store: db.issuer('upgrade') });
+  const one = make(a), two = make(b), state = await a.issuer('upgrade').read({ kind: 'principal', sessionId: 'old', grantId: 'grant' });
+  assert.equal(state.version, 4); assert.equal(state.sessions.old.accountId, 'account'); assert.equal(state.sessions.old.expiresAt, 0);
+  assert.equal(state.grants.grant.refreshHash, hash('old-account-token'));
+  await assert.rejects(one.authority.introspect('old-access-token'), { code: 'invalid_token' });
+  const send = async (issuer: typeof one, key = env.dpopKey, refresh?: string) => {
+    const body = new URLSearchParams({ client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...(refresh ? { grant_type: 'refresh_token', refresh_token: refresh } : { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: await env.assertion() }) });
+    return issuer.token(new Request(`${ISSUER}/oauth/token`, { method: 'POST', body, headers: { dpop: await env.proof({ key }) } }));
+  };
+  assert.deepEqual(await (await send(one)).json(), { error: 'invalid_grant' });
+  const key = await keyPair(), responses = await Promise.all([send(one, key), send(two, key)]);
+  const principals = await Promise.all(responses.map(async r => { assert.equal(r.status, 200); const token = await r.json(); assert.equal('session_id' in token, false); return (await one.authority.introspect(token.access_token)).principal; }));
+  assert.equal(principals[0].sessionId, principals[1].sessionId);
+  const signed = await send(two, key, 'old-account-token'); assert.equal(signed.status, 200);
+  const token = await signed.json(), principal = (await one.authority.introspect(token.access_token)).principal;
+  assert.deepEqual([principal.userId, principal.accountId, principal.grantId, principal.sessionId], ['usr_1', 'account', 'grant', principals[0].sessionId]);
+  const reopened = database(path); t.after(() => reopened.close());
+  assert.equal((await make(reopened).authority.introspect(token.access_token)).principal.sessionId, principal.sessionId);
+  assert.equal(Number((await pool!.query("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='sessionKeys'", [namespace])).rows[0].n), 2);
+});
 
 interface Packets {accept:{receipt:ConversationState};'after-commit':{receipt:ConversationState};'before-commit':{ready:true};effect:{work:WorkRef};'effect-contract':{work:WorkRef;result:string};rotate:{status:number;error?:string};revoke:{status:number;error?:string}}
 function assertPacket<M extends keyof Packets>(mode:M,value:unknown):asserts value is Packets[M]{

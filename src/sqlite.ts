@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { initialConversationState } from './conversation/service.js';
 import type { ConversationStoreState, ConversationRecord } from './conversation/service.js';
 import type { ConversationStore, ConversationSelection } from './conversation/store.js';
-import { initialIssuerState } from './reference-auth/index.js';
+import { initialIssuerState, upgradeIssuerState } from './reference-auth/index.js';
 import { clientRevisionKey, accountRevisionKey } from './reference-auth/store.js';
 import type { IssuerState } from './reference-auth/index.js';
 import type { IssuerStore, IssuerSelection } from './reference-auth/store.js';
@@ -196,9 +196,9 @@ export class SqliteCompanyDatabase {
     };
   }
   issuer(namespace: string): IssuerStore {
-    const kinds = ['sessions', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
+    const kinds = ['sessions', 'sessionKeys', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
     const load = (selection: IssuerSelection): IssuerState => {
-      const state: IssuerState = { ...this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {} };
+      const state: IssuerState = { ...this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, sessionKeys: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {} };
       const get = (kind: typeof kinds[number], id: string | undefined) => {
         if (!id) return;
         const value = this.one(namespace, kind, id);
@@ -207,6 +207,19 @@ export class SqliteCompanyDatabase {
       const find = (kind: typeof kinds[number], where: string, ...params: (string | number)[]) => {
         for (const row of this.rows(namespace, kind, where, params)) (state[kind] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
       };
+      if (state.version === 3) {
+        for (const kind of kinds) find(kind, '');
+        const before = structuredClone(state);
+        upgradeIssuerState(state);
+        for (const kind of kinds) this.save(namespace, kind, before[kind], state[kind]);
+        this.put(namespace, 'issuer_meta', 'meta', { version: state.version, generation: state.generation, nonces: state.nonces });
+        for (const kind of kinds) state[kind] = {};
+      }
+      if (state.version !== 4) throw new Error('unsupported issuer state version');
+      if ((selection.kind === 'token' || selection.kind === 'sign_in') && selection.sessionKey) {
+        get('sessionKeys', selection.sessionKey);
+        get('sessions', state.sessionKeys[selection.sessionKey]);
+      }
       if (selection.kind === 'access') get('accessTokens', selection.hash);
       if (selection.kind === 'sign_in') {
         for (const id of selection.ids) get('signIns', id);
@@ -220,7 +233,7 @@ export class SqliteCompanyDatabase {
       if (selection.kind === 'browser') { get('sessions', selection.sessionId); get('replay', selection.replayKey); }
       if (selection.kind === 'authorization') { get('authorizations', selection.id); get('signIns', selection.revocationKey); }
       if (selection.kind === 'token') {
-        get('sessions', selection.sessionId); get('codes', selection.codeHash); get('refreshTokens', selection.refreshHash);
+        get('codes', selection.codeHash); get('refreshTokens', selection.refreshHash);
         for (const key of selection.replayKeys) get('replay', key);
         const counts = this.db.prepare("SELECT count(*) AS n, min(json_extract(body,'$.expiresAt')) AS expiry FROM records WHERE ns=? AND kind='sessions' AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.expiresAt')>?").get(namespace, selection.clientId, selection.at)!;
         state.limits = { sessions: Number(counts.n), earliestSessionExpiry: Number(counts.expiry ?? selection.at), pending: 0, pendingForClient: 0 };

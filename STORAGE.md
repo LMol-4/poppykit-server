@@ -81,6 +81,22 @@ force another conversation's receipts out of storage.
 
 ## Non-durable use and resets
 
+Normalized issuer state version 3 upgrades to version 4 once, under the existing
+SQLite writer/PostgreSQL namespace lock. Stop old writers before using the new
+adapter. No SQL schema change is needed: `sessionKeys` records use the existing
+namespace/kind/ID primary key. Token selectors load that mapping and its internal
+Session ID in the same transaction as creation, ownership checks and rotation.
+Mappings remain indefinitely after a Session ends, preventing key reuse.
+
+Old keys could belong to several Sessions, so the upgrade ends old Sessions and
+tombstones every known old access-token key rather than guessing a mapping.
+Internal Session IDs, sticky account records, stable Users, grants, all retained
+Account Token hashes, revocation fences and accepted-work authority remain.
+Legacy pending authorization/code/Device/Mediated records are retired: restart
+sign-in rather than accepting consent without the new binding. Existing compatible
+Account Tokens can create fresh-key Sessions. Unsupported earlier state versions
+are refused. The upgrade scans a namespace once; normal selectors stay targeted.
+
 `new SqliteCompanyDatabase(':memory:')` is an explicit non-durable adapter for tests
 and development. Each instance is separate, is lost at close/process death, and
 offers no cross-process persistence. The test fixture's object store is also

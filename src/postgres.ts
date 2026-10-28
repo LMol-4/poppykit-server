@@ -2,7 +2,7 @@ import type { Pool } from 'pg';
 import { initialConversationState } from './conversation/service.js';
 import type { ConversationStoreState, ConversationRecord } from './conversation/service.js';
 import type { ConversationStore, ConversationSelection } from './conversation/store.js';
-import { initialIssuerState } from './reference-auth/index.js';
+import { initialIssuerState, upgradeIssuerState } from './reference-auth/index.js';
 import { clientRevisionKey, accountRevisionKey } from './reference-auth/store.js';
 import type { IssuerState } from './reference-auth/index.js';
 import type { IssuerStore, IssuerSelection } from './reference-auth/store.js';
@@ -180,10 +180,10 @@ export class PostgresCompanyDatabase {
         };
     }
     issuer(namespace: string): IssuerStore {
-        const kinds = ['sessions', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
+        const kinds = ['sessions', 'sessionKeys', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
         const load = async (selection: IssuerSelection): Promise<IssuerState> => {
             await this.db.lock(JSON.stringify([namespace, 'issuer']));
-            const state: IssuerState = { ...await this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {} };
+            const state: IssuerState = { ...await this.meta(namespace, 'issuer_meta', () => { const { version, generation, nonces } = initialIssuerState(); return { version, generation, nonces }; }), sessions: {}, sessionKeys: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {} };
             const get = async (kind: typeof kinds[number], id: string | undefined) => {
                 if (!id)
                     return;
@@ -195,6 +195,19 @@ export class PostgresCompanyDatabase {
                 for (const row of await this.rows(namespace, kind, where, params))
                     (state[kind] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
             };
+            if (state.version === 3) {
+                for (const kind of kinds) await find(kind, '');
+                const before = structuredClone(state);
+                upgradeIssuerState(state);
+                for (const kind of kinds) await this.save(namespace, kind, before[kind], state[kind]);
+                await this.put(namespace, 'issuer_meta', 'meta', { version: state.version, generation: state.generation, nonces: state.nonces });
+                for (const kind of kinds) state[kind] = {};
+            }
+            if (state.version !== 4) throw new Error('unsupported issuer state version');
+            if ((selection.kind === 'token' || selection.kind === 'sign_in') && selection.sessionKey) {
+                await get('sessionKeys', selection.sessionKey);
+                await get('sessions', state.sessionKeys[selection.sessionKey]);
+            }
             if (selection.kind === 'access')
                 await get('accessTokens', selection.hash);
             if (selection.kind === 'sign_in') {
@@ -220,7 +233,6 @@ export class PostgresCompanyDatabase {
                 await get('signIns', selection.revocationKey);
             }
             if (selection.kind === 'token') {
-                await get('sessions', selection.sessionId);
                 await get('codes', selection.codeHash);
                 await get('refreshTokens', selection.refreshHash);
                 for (const key of selection.replayKeys)
