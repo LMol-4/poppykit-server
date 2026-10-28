@@ -1,4 +1,4 @@
-import type {Message,Sender,ConversationEvent} from '../../dist/protocol/wire.js';
+import type {Message,AuthorType,ConversationEvent} from '../../dist/protocol/wire.js';
 import type {ConversationOptions} from '../../dist/conversation/service.js';
 import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
@@ -9,14 +9,14 @@ import { hello, setup } from './support.mjs';
 const directScopes = ['orders:read', 'orders:write'];
 const latest = async (t:ReturnType<typeof setup>,id:string) => (await t.store.read()).conversations[id].events.at(-1);
 
-test('requestAuthorization on signed-out work adds a sign_in_required authorization event', async () => {
+test('requestAuthorization on signed-out work adds a insufficient_scope authorization event', async () => {
   const t = setup({ directScopes });
   const id = (await t.start(hello)).body.conversation_id;
   const claim = await t.service.claim();
   await t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:read']);
   const event = await latest(t, id);
   assert.deepEqual(Object.keys(expectValue(event)).sort(), ['created_at', 'error', 'id', 'scope', 'type']);
-  assert.deepEqual({ type: expectValue(event).type, error: expectValue(event).error, scope: expectValue(event).scope }, { type: 'authorization', error: 'sign_in_required', scope: 'orders:read' });
+  assert.deepEqual({ type: expectValue(event).type, error: expectValue(event).error, scope: expectValue(event).scope }, { type: 'authorization', error: 'insufficient_scope', scope: 'orders:read' });
   assert.match(expectValue(event).id, /^evt_/);
   assert.equal(expectValue(event).created_at, new Date(t.clock.now()).toISOString());
   // The conversation stays open and the work continues until it finishes (7.11).
@@ -44,7 +44,7 @@ test('requestAuthorization dedupes a stable output ID and rejects changed reuse'
   const events = (await t.store.read()).conversations[id].events;
   assert.equal(events.filter((event:ConversationEvent) => event.type === 'authorization').length, 1);
   await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'auth', ['orders:write']), { code: 'output_conflict' });
-  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', sender: 'agent', text: 'Please sign in.' });
+  await t.service.reply(expectValue(claim), 'out_1', { id: 'msg_r1', author: { type: 'agent' }, text: 'Please sign in.' });
   await assert.rejects(t.service.requestAuthorization(expectValue(claim), 'out_1', ['orders:read']), { code: 'output_conflict' });
   assert.equal((await t.store.read()).conversations[id].events.length, events.length + 1);
 });
@@ -110,12 +110,12 @@ test('requestUser is refused inside a Direct Conversation, where the User is alr
   const t = setup();
   const parent = (await t.start(hello)).body.conversation_id;
   await t.service.finish(expectValue(await t.service.claim()), 'completed');
-  const child = (await t.direct(parent, { id: 'msg_child', sender: 'human', text: 'Hi.' })).body.conversation_id;
+  const child = (await t.direct(parent, { id: 'msg_child', author: { type: 'human' }, text: 'Hi.' })).body.conversation_id;
   const claim = await t.service.claim();
   assert.equal(expectValue(claim).conversationId, child);
   await assert.rejects(t.service.requestUser(expectValue(claim), 'user', 'A specialist needs you.'), { name: 'TypeError', message: /Direct Conversation/ });
   assert.ok(!(await t.store.read()).conversations[child].events.some((event:ConversationEvent) => event.type === 'user_requested'));
-  await t.service.reply(expectValue(claim), 'user', { id: 'msg_r1', sender: 'agent', text: 'Hello.' }); // the refused request used no output ID
+  await t.service.reply(expectValue(claim), 'user', { id: 'msg_r1', author: { type: 'agent' }, text: 'Hello.' }); // the refused request used no output ID
 });
 
 test('a request body with a duplicate member is 400 invalid_request', async () => {

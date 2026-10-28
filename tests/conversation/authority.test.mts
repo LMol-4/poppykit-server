@@ -1,4 +1,4 @@
-import type {Message,Sender,ConversationEvent} from '../../dist/protocol/wire.js';
+import type {Message,AuthorType,ConversationEvent} from '../../dist/protocol/wire.js';
 import type {ConversationOptions} from '../../dist/conversation/service.js';
 import type {Principal,WorkRevocationPolicy} from '../../dist/auth/authority.js';
 import {createMetadataResolver} from '../../dist/network/discovery.js';
@@ -37,8 +37,8 @@ function setup(revocationPolicy?:WorkRevocationPolicy) {
   };
   return { clock, issuer, issuerStore, store, service, call, coordinator, signOut };
 }
-const message:Message = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?' };
-const reply:Message = { id: 'msg_r1', sender: 'agent', text: 'Shipped.' };
+const message:Message = { id: 'msg_1', author: { type: 'agent' }, text: 'Where is order 1042?' };
+const reply:Message = { id: 'msg_r1', author: { type: 'agent' }, text: 'Shipped.' };
 
 test('token expiry fences buffered SSE frames and body reads after initial authentication', async () => {
   const t = setup(), id = (await t.call('POST', '', { message })).body.conversation_id;
@@ -132,7 +132,7 @@ test('stop-account-work: revoked work can still ask to sign in, but cannot ask f
   await t.service.finish(expectValue(claim), 'suspended');
   const conversation = (await t.store.read()).conversations[id];
   const event = conversation.events.at(-2);
-  assert.deepEqual([expectValue(event).type, expectValue(event).error, expectValue(event).scope], ['authorization', 'sign_in_required', 'orders:read']);
+  assert.deepEqual([expectValue(event).type, expectValue(event).error, expectValue(event).scope], ['authorization', 'insufficient_scope', 'orders:read']);
   assert.equal(conversation.status, 'idle');
   assert.equal(t.coordinator.held, false);
 });
@@ -146,7 +146,7 @@ test('revoked work asking for a scope it never had is told to sign in, not to wi
     await t.issuer.disconnect(CLIENT, 'acct_1');
     await t.service.requestAuthorization(expectValue(claim), 'revoked', ['orders:write']);
     const events = (await t.store.read()).conversations[id].events.filter((event:ConversationEvent) => event.type === 'authorization');
-    assert.deepEqual(events.map((event:ConversationEvent) => [event.error, event.scope]), [['insufficient_scope', 'orders:write'], ['sign_in_required', 'orders:write']], revocationPolicy);
+    assert.deepEqual(events.map((event:ConversationEvent) => [event.error, event.scope]), [['insufficient_scope', 'orders:write'], ['insufficient_scope', 'orders:write']], revocationPolicy);
   }
 });
 
@@ -158,16 +158,16 @@ test("stop-account-work: a person's replies use no account and still publish aft
   await assert.rejects(t.service.requireAccount(person, ['orders:read']), { code: 'invalid_token' });
   await assert.rejects(t.service.history(person), { code: 'invalid_token' });
   await t.service.renew(person);
-  await t.service.reply(person, 'out_1', { id: 'msg_h1', sender: 'human', text: 'I can help with that.' });
+  await t.service.reply(person, 'out_1', { id: 'msg_h1', author: { type: 'human' }, text: 'I can help with that.' });
   const { generation } = await t.issuerStore.read();
   t.issuerStore.set(state => { state.generation = 'after-reset'; });
   await assert.rejects(t.service.finish(person, 'completed'), { code: 'invalid_token' }, 'a reset still stops it');
   t.issuerStore.set(state => { state.generation = generation; });
   await t.service.finish(person, 'completed');
   const state = await t.store.read();
-  assert.equal(messageValue(expectValue(state.conversations[id].events.at(-1)).message).sender, 'human');
+  assert.equal(messageValue(expectValue(state.conversations[id].events.at(-1)).message).author.type, 'human');
   assert.deepEqual(state.bindings[id], {}, 'no account was used');
-  await assert.rejects(t.service.reply(person, 'out_2', { id: 'msg_h2', sender: 'human', text: 'x' }), { code: 'stale_work' }, 'the fence still applies');
+  await assert.rejects(t.service.reply(person, 'out_2', { id: 'msg_h2', author: { type: 'human' }, text: 'x' }), { code: 'stale_work' }, 'the fence still applies');
   await assert.rejects(t.service.joinHuman({}, id), { code: 'invalid_token' }, 'joining acts under the revoked customer authority');
 });
 

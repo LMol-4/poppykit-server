@@ -33,8 +33,8 @@ const principals: Record<string, Principal> = {
   account1: { ...base, accountId: 'acct_1', scopes: ['orders:read'] },
   account2: { ...base, accountId: 'acct_2', scopes: ['orders:read'] },
 };
-const message = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?' } as const;
-const reply = { id: 'msg_r1', sender: 'agent', text: 'Shipped.' } as const;
+const message = { id: 'msg_1', author: { type: 'agent' }, text: 'Where is order 1042?' } as const;
+const reply = { id: 'msg_r1', author: { type: 'agent' }, text: 'Shipped.' } as const;
 
 function check<T>(held: readonly string[], needed: readonly string[], action: () => Promise<T>): Promise<T> {
   if (!needed.every(scope => held.includes(scope))) return Promise.reject(new AuthorityError('insufficient_scope'));
@@ -117,7 +117,7 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     const results = await Promise.all([
       outcome(a.requireAccount(parentWork, ['orders:read'])),
       (async () => {
-        const opened = await call(b, '', 'account2', { parent_conversation_id: parent, message: { id: 'msg_c', sender: 'human', text: 'Hi.' } });
+        const opened = await call(b, '', 'account2', { parent_conversation_id: parent, message: { id: 'msg_c', author: { type: 'human' }, text: 'Hi.' } });
         if (opened.status !== 201) return String(opened.body.error);
         return outcome(b.claim().then(work => b.requireAccount(work!, ['orders:read'])));
       })(),
@@ -128,7 +128,7 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     assert.ok(Object.values(state.conversations).every(conversation => conversation.bindingId === parent));
     assert.deepEqual(state.bindings[parent], { accountId: winners[0] });
     const loser = winners[0] === 'acct_1' ? 'account2' : 'account1';
-    for (const id of Object.keys(state.conversations)) assert.deepEqual((await call(b, `/${id}/events`, loser)).body, { error: 'sign_in_required' });
+    for (const id of Object.keys(state.conversations)) assert.deepEqual((await call(b, `/${id}/events`, loser)).body, { error: 'insufficient_scope' });
   }));
 
   test('adapter contract: lease reclaim on the other handle fences the old worker; output IDs dedupe', () => withFixture(async ({ store, second }) => {

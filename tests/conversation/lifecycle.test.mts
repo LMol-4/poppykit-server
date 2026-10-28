@@ -1,4 +1,4 @@
-import type {Message,Sender,ConversationEvent} from '../../dist/protocol/wire.js';
+import type {Message,AuthorType,ConversationEvent} from '../../dist/protocol/wire.js';
 import type {ConversationOptions} from '../../dist/conversation/service.js';
 import { expectValue,messageValue,optionalMessage } from '../../test-support/assertions.mjs';
 import test from 'node:test';
@@ -6,8 +6,8 @@ import assert from 'node:assert/strict';
 import { AuthorityError, createConversationService, resetConversationState } from '../../dist/index.js';
 import { endpoint, hello, principals, setup } from './support.mjs';
 
-const human = (id:string, text = 'Hi, it is me.'):Message => ({ id, sender: 'human', text });
-const reply = (id:string,sender:Sender='agent'):Message => ({ id, sender, text: 'Here to help.' });
+const human = (id:string, text = 'Hi, it is me.'):Message => ({ id, author: { type: 'human' }, text });
+const reply = (id:string,type:AuthorType='agent'):Message => ({ id, author:{type}, text: 'Here to help.' });
 const types = (events:ConversationEvent[]) => events.map((event:ConversationEvent) => event.type);
 const operator = { staff: 'op_1' };
 function staffSetup(options:Partial<ConversationOptions> = {}) {
@@ -34,13 +34,13 @@ test('Direct Conversation: opens linked, suspends the parent, and closing it res
   assert.equal(await t.service.claim(), null);
   // Parent is readable but takes no messages or handoff; a second child is refused; children cannot nest.
   assert.equal((await t.read(parent)).status, 200);
-  for (const res of [await t.send(parent, { id: 'msg_p2', sender: 'agent', text: 'x' }), await t.handoff(parent), await t.direct(parent, human('msg_d2'))]) {
+  for (const res of [await t.send(parent, { id: 'msg_p2', author: { type: 'agent' }, text: 'x' }), await t.handoff(parent), await t.direct(parent, human('msg_d2'))]) {
     assert.deepEqual([res.status, res.body], [409, { error: 'direct_conversation_open', conversation_id: child }]);
   }
   assert.deepEqual((await t.direct(child, human('msg_d3'))).body, { error: 'conversation_not_found' });
   // Direct messages carry the User's own words.
-  assert.equal((await t.send(child, { id: 'msg_a', sender: 'agent', text: 'summary' })).status, 400);
-  assert.equal((await t.send(child, { id: 'msg_a2', sender: 'agent', data: { k: 1 } })).status, 400);
+  assert.equal((await t.send(child, { id: 'msg_a', author: { type: 'agent' }, text: 'summary' })).status, 400);
+  assert.equal((await t.send(child, { id: 'msg_a2', author: { type: 'agent' }, data: { k: 1 } })).status, 400);
   assert.equal((await t.send(child, human('msg_d4', 'Medium, please.'))).status, 202);
   // Both workers' history is the linked history: parent events with the child's spliced in after direct_opened.
   await t.service.reply(expectValue(childClaim), 'out_1', reply('msg_r1'));
@@ -56,14 +56,14 @@ test('Direct Conversation: opens linked, suspends the parent, and closing it res
   const resumed = await t.service.claim();
   assert.equal(expectValue(resumed).conversationId, parent);
   assert.equal(expectValue(resumed).workId, expectValue(stale).workId);
-  assert.equal((await t.send(parent, { id: 'msg_p3', sender: 'agent', text: 'back' })).status, 202);
+  assert.equal((await t.send(parent, { id: 'msg_p3', author: { type: 'agent' }, text: 'back' })).status, 202);
   const parentHistory = await t.service.history(expectValue(resumed));
   assert.deepEqual(types(parentHistory), ['message', 'state', 'direct_opened', 'message', 'state', 'message', 'message', 'state', 'direct_closed', 'message']);
   // A new Direct Conversation may open once the previous one closed; a retried start returns the same child.
   const again = await t.direct(parent, human('msg_d5'));
   assert.equal(again.status, 201);
   assert.deepEqual((await t.direct(parent, human('msg_d5'))).body, again.body);
-  assert.equal((await t.send(again.body.conversation_id, { id: 'msg_a3', sender: 'agent', context: { page: 'cart' } })).status, 202);
+  assert.equal((await t.send(again.body.conversation_id, { id: 'msg_a3', author: { type: 'agent' }, context: { page: 'cart' } })).status, 202);
 });
 
 test('Direct Conversation: parent must exist, belong to the caller and be open', async () => {
@@ -72,7 +72,7 @@ test('Direct Conversation: parent must exist, belong to the caller and be open',
   for (const as of ['bob', 'otherClient']) assert.deepEqual((await t.direct(parent, human('msg_x'), { as })).body, { error: 'conversation_not_found' });
   assert.deepEqual((await t.direct('cnv_unknown', human('msg_x'))).body, { error: 'conversation_not_found' });
   t.store.set(state => { state.bindings[parent].accountId = 'acct_1'; });
-  assert.deepEqual((await t.direct(parent, human('msg_x'))).body, { error: 'sign_in_required' });
+  assert.deepEqual((await t.direct(parent, human('msg_x'))).body, { error: 'insufficient_scope' });
   assert.equal((await t.direct(parent, human('msg_x'), { as: 'carolSameAccount' })).status, 201, 'bound: same account through the same client is the owner');
   const closedParent = (await t.start({ ...hello, id: 'msg_2' })).body.conversation_id;
   await t.close(closedParent);
@@ -106,7 +106,7 @@ test('close is idempotent, keeps history readable and rejects new messages, hand
   const second = await t.close(id);
   assert.deepEqual([second.status, second.body], [first.status, first.body]);
   assert.equal((await t.read(id)).body.events.length, events, 'closing again adds no event');
-  assert.deepEqual((await t.send(id, { id: 'msg_2', sender: 'agent', text: 'x' })).body, { error: 'conversation_closed' });
+  assert.deepEqual((await t.send(id, { id: 'msg_2', author: { type: 'agent' }, text: 'x' })).body, { error: 'conversation_closed' });
   assert.deepEqual((await t.handoff(id)).body, { error: 'conversation_closed' });
   await assert.rejects(t.service.reply(expectValue(claim), 'out_1', reply('msg_r')), { code: 'stale_work' });
   await assert.rejects(t.service.finish(expectValue(claim), 'completed'), { code: 'stale_work' });
@@ -123,7 +123,7 @@ test('handoff and close routes check ownership like every other route', async ()
   }
   t.store.set(state => { state.bindings[id].accountId = 'acct_1'; });
   for (const action of ['handoff', 'close'] as const) {
-    assert.deepEqual((await t[action](id)).body, { error: 'sign_in_required' });
+    assert.deepEqual((await t[action](id)).body, { error: 'insufficient_scope' });
     assert.deepEqual((await t[action](id, { as: 'bobOtherAccount' })).body, { error: 'conversation_not_found' });
   }
   assert.equal((await t.store.read()).conversations[id].status, 'working', 'nothing changed');
@@ -146,7 +146,7 @@ test('handoff queues and cancels the agent attempt; a repeat changes nothing; no
   const page = (await t.read(id)).body;
   assert.deepEqual([page.status, page.responder], ['idle', 'agent']);
   const tail = page.events.slice(-2);
-  assert.deepEqual([tail[0].message.text, tail[0].message.sender, tail[0].message.role], ['Nobody is available right now.', 'agent', 'company']);
+  assert.deepEqual([tail[0].message.text, tail[0].message.author.type, tail[0].message.role], ['Nobody is available right now.', 'agent', 'company']);
   assert.deepEqual([tail[1].type, tail[1].status, tail[1].responder], ['state', 'idle', 'agent']);
   assert.equal(page.events.filter((event: { message: { text: string; }; }) => event.message?.text === 'Nobody is available right now.').length, 1, 'idempotent');
   assert.equal(await t.service.claim(), null, 'the handed-off message is not retried by automation');
@@ -158,8 +158,8 @@ test('messages sent while queued wait for the person; with no staff the agent an
   const id = (await t.start(hello)).body.conversation_id;
   await t.service.claim();
   await t.handoff(id);
-  assert.equal((await t.send(id, { id: 'msg_2', sender: 'agent', text: 'More detail for the person.' })).body.status, 'queued');
-  assert.equal((await t.send(id, { id: 'msg_ctx', sender: 'agent', context: { user_available: false } })).status, 202);
+  assert.equal((await t.send(id, { id: 'msg_2', author: { type: 'agent' }, text: 'More detail for the person.' })).body.status, 'queued');
+  assert.equal((await t.send(id, { id: 'msg_ctx', author: { type: 'agent' }, context: { user_available: false } })).status, 202);
   assert.equal(await t.service.claim(), null, 'messages while queued create no automated work');
   await t.service.noHumanAvailable(operator, id, 'Nobody is available right now.');
   const page = (await t.read(id)).body;
@@ -173,14 +173,14 @@ test('messages sent while queued wait for the person; with no staff the agent an
 
 // A signed-out message A, then a signed-in message B: A's work must keep A's own accepted authority.
 async function heldAuthorityCase(t:ReturnType<typeof staffSetup>,id:string,handBack:()=>Promise<void>) {
-  await t.send(id, { id: 'msg_a', sender: 'agent', text: 'Signed-out question.' });
-  await t.send(id, { id: 'msg_b', sender: 'agent', text: 'Signed-in question.' }, { as: 'aliceSignedIn' });
+  await t.send(id, { id: 'msg_a', author: { type: 'agent' }, text: 'Signed-out question.' });
+  await t.send(id, { id: 'msg_b', author: { type: 'agent' }, text: 'Signed-in question.' }, { as: 'aliceSignedIn' });
   assert.equal(await t.service.claim(), null, 'held work is not claimable');
   await handBack();
   const a = await t.service.claim();
   assert.equal(expectValue(a).message.id, 'msg_a');
   // Signed out: no account to bind, and no read scope either.
-  await assert.rejects(t.service.requireAccount(expectValue(a), []), { code: 'sign_in_required' });
+  await assert.rejects(t.service.requireAccount(expectValue(a), []), { code: 'insufficient_scope' });
   await assert.rejects(t.service.requireAccount(expectValue(a), ['orders:read']), { code: 'insufficient_scope' });
   await t.service.finish(expectValue(a), 'completed');
   const b = await t.service.claim();
@@ -207,7 +207,7 @@ test('return to agent does not resume completed or suspended work', async () => 
   const t = staffSetup();
   const id = (await t.start(hello)).body.conversation_id;
   await t.service.finish(expectValue(await t.service.claim()), 'completed');
-  await t.send(id, { id: 'msg_2', sender: 'agent', text: 'Needs sign-in.' });
+  await t.send(id, { id: 'msg_2', author: { type: 'agent' }, text: 'Needs sign-in.' });
   await t.service.finish(expectValue(await t.service.claim()), 'suspended');
   await t.handoff(id);
   await t.service.joinHuman(operator, id);
@@ -236,13 +236,13 @@ test('returning to the agent queues user messages the person left unanswered', a
   await t.handoff(id);
   const person = await t.service.joinHuman(operator, id);
   await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
-  await t.send(id, { id: 'msg_2', sender: 'human', text: 'One more thing.' });
-  await t.send(id, { id: 'msg_3', sender: 'human', text: 'And another.' });
+  await t.send(id, { id: 'msg_2', author: { type: 'human' }, text: 'One more thing.' });
+  await t.send(id, { id: 'msg_3', author: { type: 'human' }, text: 'And another.' });
   await t.service.returnToAgent(operator, id);
   assert.deepEqual([(await t.read(id)).body.status, (await t.read(id)).body.responder], ['working', 'agent']);
   const first = await t.service.claim();
   assert.equal(expectValue(first).message.id, 'msg_2');
-  assert.deepEqual(expectValue(first).message, { id: 'msg_2', sender: 'human', text: 'One more thing.' });
+  assert.deepEqual(expectValue(first).message, { id: 'msg_2', author: { type: 'human' }, text: 'One more thing.' });
   await t.service.finish(expectValue(first), 'completed');
   assert.equal(expectValue((await t.service.claim())).message.id, 'msg_3');
 });
@@ -264,7 +264,7 @@ test('a person joins, publishes as human, then returns the conversation to the a
   await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
   assert.deepEqual((await t.handoff(id)).body, { conversation_id: id, status: 'idle', responder: 'human' });
   // Messages while a person responds create no automated work; the person reads them in history.
-  await t.send(id, { id: 'msg_2', sender: 'human', text: 'Thanks!' });
+  await t.send(id, { id: 'msg_2', author: { type: 'human' }, text: 'Thanks!' });
   assert.equal(await t.service.claim(), null);
   assert.equal(messageValue(expectValue((await t.service.history(person)).at(-1)).message).text, 'Thanks!');
   // The person's claim has its own, longer operator lease.
@@ -274,9 +274,9 @@ test('a person joins, publishes as human, then returns the conversation to the a
   await t.service.returnToAgent(operator, id);
   page = (await t.read(id)).body;
   assert.deepEqual([page.status, page.responder], ['idle', 'agent']);
-  assert.deepEqual(page.events.filter((event: { type: string; message: { role: string; }; }) => event.type === 'message' && event.message.role === 'company').map((event:ConversationEvent) => messageValue(event.message).sender), ['human', 'human']);
+  assert.deepEqual(page.events.filter((event: { type: string; message: { role: string; }; }) => event.type === 'message' && event.message.role === 'company').map((event:ConversationEvent) => messageValue(event.message).author.type), ['human', 'human']);
   await assert.rejects(t.service.reply(person, 'out_3', reply('msg_h3', 'human')), { code: 'stale_work' });
-  await t.send(id, { id: 'msg_3', sender: 'agent', text: 'Back to you.' });
+  await t.send(id, { id: 'msg_3', author: { type: 'agent' }, text: 'Back to you.' });
   assert.equal(expectValue((await t.service.claim())).message.id, 'msg_3');
 });
 
@@ -357,7 +357,7 @@ test('staff operations on a conversation stored without an authority fail clearl
     await assert.rejects(action(), { message: 'Conversation has no stored customer authority' });
   }
   assert.equal(t.calls.filter(call => call.kind === 'accepted').length, 0, 'policy never sees an undefined authority');
-  await t.send(id, { id: 'msg_2', sender: 'agent', text: 'Still there?' });
+  await t.send(id, { id: 'msg_2', author: { type: 'agent' }, text: 'Still there?' });
   assert.equal((await t.service.joinHuman(operator, id)).conversationId, id);
 });
 
@@ -477,9 +477,9 @@ test("a person's reply cancels the messages held before it; later ones stay held
   const id = (await t.start(hello)).body.conversation_id;
   await t.handoff(id);
   const person = await t.service.joinHuman(operator, id);
-  await t.send(id, { id: 'msg_2', sender: 'human', text: 'Still there?' });
+  await t.send(id, { id: 'msg_2', author: { type: 'human' }, text: 'Still there?' });
   await t.service.reply(person, 'out_1', reply('msg_h1', 'human'));
-  await t.send(id, { id: 'msg_3', sender: 'human', text: 'Thanks.' });
+  await t.send(id, { id: 'msg_3', author: { type: 'human' }, text: 'Thanks.' });
   const phases = (await t.store.read()).work.filter(work => !work.human).map(work => [work.message.id, work.phase]);
   assert.deepEqual(phases, [[hello.id, 'cancelled'], ['msg_2', 'cancelled'], ['msg_3', 'held']]);
 });
@@ -489,7 +489,7 @@ test('close cancels work held for a person', async () => {
   const id = (await t.start(hello)).body.conversation_id;
   await t.handoff(id);
   await t.service.joinHuman(operator, id);
-  await t.send(id, { id: 'msg_2', sender: 'human', text: 'Still there?' });
+  await t.send(id, { id: 'msg_2', author: { type: 'human' }, text: 'Still there?' });
   assert.equal(expectValue((await t.store.read()).work.at(-1)).phase, 'held');
   await t.close(id);
   assert.deepEqual((await t.store.read()).work.filter(work => !work.human).map(work => work.phase), ['cancelled', 'cancelled']);
@@ -500,7 +500,7 @@ test('a failed finish adds no canned message for a person, but the agent still a
   const id = (await t.start(hello)).body.conversation_id;
   await t.service.finish(expectValue(await t.service.claim()), 'failed');
   const last = async () => expectValue((await t.store.read()).conversations[id].events.filter((event:ConversationEvent) => event.type === 'message').at(-1)).message;
-  assert.deepEqual([messageValue((await last())).sender, expectValue(messageValue((await last())).text).startsWith('Sorry')], ['agent', true]);
+  assert.deepEqual([messageValue((await last())).author.type, expectValue(messageValue((await last())).text).startsWith('Sorry')], ['agent', true]);
   await t.handoff(id);
   const person = await t.service.joinHuman(operator, id);
   const before = (await t.store.read()).conversations[id].events.length;

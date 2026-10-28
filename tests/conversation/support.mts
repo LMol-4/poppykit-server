@@ -2,7 +2,7 @@ import type {ConversationOptions,ConversationStoreState} from '../../dist/conver
 import type {ConversationSelection} from '../../dist/conversation/store.js';
 import type {IssuerSelection} from '../../dist/reference-auth/store.js';
 import type {Principal,AuthorityPolicy,RequestAuthenticator} from '../../dist/auth/authority.js';
-import type {ConversationState,ConversationEvent,Status,Sender,Message} from '../../dist/protocol/wire.js';
+import type {ConversationState,ConversationEvent,Status,AuthorType,Message} from '../../dist/protocol/wire.js';
 import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { AuthorityError, createConversationService, initialConversationState } from '../../dist/index.js';
@@ -118,4 +118,4 @@ export function setup(options:Partial<ConversationOptions> = {}) {
   return { service, store, clock, calls, policy, call, start, send, read, direct, handoff, close };
 }
 
-export const hello = { id: 'msg_1', sender: 'agent', text: 'Where is order 1042?', data: { b: 1, a: [1, 2] }, x_extension: { keep: true } } satisfies Message;
+export const hello = { id: 'msg_1', author: { type: 'agent' }, text: 'Where is order 1042?', data: { b: 1, a: [1, 2] }, x_extension: { keep: true } } satisfies Message;

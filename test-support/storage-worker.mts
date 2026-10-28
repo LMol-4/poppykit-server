@@ -48,7 +48,7 @@ if (mode === 'rotate' || mode === 'revoke') {
   // Application contract: the stable work ID deduplicates its own side effect.
   external.prepare('INSERT OR IGNORE INTO effects VALUES (?)').run(work.workId); external.close();
   if (mode === 'effect') { expectValue(process.send).call(process, { ready: true, work }); pause(); }
-  await t.service.reply(work, 'output', { id: 'reply', sender: 'agent', text: 'done' });
+  await t.service.reply(work, 'output', { id: 'reply', author: { type: 'agent' }, text: 'done' });
   await t.service.finish(work, 'completed'); await db.close();
   expectValue(process.send).call(process, { ready: true, work });
 }

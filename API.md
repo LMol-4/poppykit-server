@@ -7,6 +7,7 @@ completion for complete options and results; this map identifies the integration
 | --- | --- | --- |
 | `@poppykit/server` | `createRequestAuthenticator`, `AuthorityError`, authority types | [authentication](AUTH.md) |
 | `@poppykit/server` | `createConversationService`, `createConversationNotifications` | [delivery](DELIVERY.md) |
+| `@poppykit/server` | `Author`, `AuthorType`, `Message`, `RecordedMessage`, conversation/event types | [delivery](DELIVERY.md) |
 | `@poppykit/server` | `createBrowserSessions`, `createFeedbackHandler`, MCP metadata/error helpers | [integrations](INTEGRATIONS.md) |
 | `@poppykit/server/reference-auth` | `createReferenceIssuer`, `createMetadataResolver`, `createNodeTransport` | [authentication](AUTH.md) |
 | `@poppykit/server/sqlite` | `SqliteCompanyDatabase` | [storage](STORAGE.md) |

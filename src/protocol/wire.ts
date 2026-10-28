@@ -1,16 +1,16 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
-export type Sender = 'agent' | 'human';
+export type AuthorType = 'agent' | 'human';
+export interface Author { type: AuthorType; id?: string; name?: string; image?: string; [key: string]: unknown }
 export type Status = 'working' | 'idle' | 'queued' | 'closed';
-export interface Message { id: string; sender: Sender; text?: string; data?: JsonObject; context?: JsonObject; [key: string]: unknown }
+export interface Message { id: string; author: Author; text?: string; data?: JsonObject; context?: JsonObject; [key: string]: unknown }
 export interface RecordedMessage extends Message { role: 'user' | 'company' }
 export interface ConversationRequest { message: Message; parent_conversation_id?: string; [key: string]: unknown }
-export interface ConversationState { conversation_id: string; status: Status; responder: Sender; [key: string]: unknown }
+export interface ConversationState { conversation_id: string; status: Status; responder: AuthorType; [key: string]: unknown }
 export interface ConversationEvent { id: string; type: string; created_at: string; [key: string]: unknown }
 export type KnownEvent =
   | (ConversationEvent & { type: 'message'; message: RecordedMessage })
-  | (ConversationEvent & { type: 'state'; status: Status; responder: Sender })
-  | (ConversationEvent & { type: 'authorization'; error: 'sign_in_required'; scope?: string })
+  | (ConversationEvent & { type: 'state'; status: Status; responder: AuthorType })
   | (ConversationEvent & { type: 'authorization'; error: 'insufficient_scope'; scope: string })
   | (ConversationEvent & { type: 'user_requested'; reason: string })
   | (ConversationEvent & { type: 'direct_opened' | 'direct_closed'; conversation_id: string });
@@ -54,7 +54,18 @@ function positive(value: unknown, field: string): void {
 }
 export function parseMessage(value: unknown, options: { recorded?: boolean; company?: boolean } = {}): Message | RecordedMessage {
   const message = { ...object(value, 'message') };
-  id(message.id, 'message.id'); member(message.sender, ['agent', 'human'], 'message.sender');
+  id(message.id, 'message.id');
+  const author = object(message.author, 'message.author');
+  member(author.type, ['agent', 'human'], 'message.author.type');
+  if ('sender' in message) throw new ValidationError('message.sender');
+  for (const key of ['id', 'name', 'image']) if (key in author) {
+    if (!options.company && !(options.recorded && message.role === 'company')) throw new ValidationError('message.author.' + key);
+    string(author[key], 'message.author.' + key);
+  }
+  if ('image' in author) {
+    try { const url = new URL(author.image as string); if (url.protocol !== 'https:' || url.username || url.password) throw 0; }
+    catch { throw new ValidationError('message.author.image'); }
+  }
   if (!['text', 'data', 'context'].some(key => key in message)) throw new ValidationError('message.content');
   if ('text' in message) string(message.text, 'message.text', false);
   if ('data' in message) object(message.data, 'message.data');
@@ -96,7 +107,10 @@ export function parseEvent(value: unknown): ConversationEvent {
   switch (event.type) {
     case 'message': parseMessage(event.message, { recorded: true }); break;
     case 'state': member(event.status, ['working', 'idle', 'queued', 'closed'], 'event.status'); member(event.responder, ['agent', 'human'], 'event.responder'); break;
-    case 'authorization': member(event.error, ['sign_in_required', 'insufficient_scope'], 'event.error'); if (event.error === 'insufficient_scope' || 'scope' in event) string(event.scope, 'event.scope', false); break;
+    case 'authorization':
+      member(event.error, ['insufficient_scope'], 'event.error');
+      if (!/^[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*$/.test(string(event.scope, 'event.scope'))) throw new ValidationError('event.scope');
+      break;
     case 'user_requested': string(event.reason, 'event.reason', false); break;
     case 'direct_opened': case 'direct_closed': id(event.conversation_id, 'event.conversation_id'); break;
   }

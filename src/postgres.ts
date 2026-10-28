@@ -40,6 +40,7 @@ export class PostgresCompanyDatabase {
     conversations(namespace: string): ConversationStore {
         const load = async (selection: ConversationSelection): Promise<ConversationStoreState> => {
             const state: ConversationStoreState = { ...await this.meta(namespace, 'conversation_meta', () => { const { version, generation } = initialConversationState(); return { version, generation }; }), conversations: {}, bindings: {}, messages: {}, work: [] };
+            if (state.version !== 2) throw new Error('conversation reset required for draft 0.3');
             if (selection.messageKey) await this.db.lock(JSON.stringify([namespace, 'message', selection.messageKey]));
             let id = selection.conversationId;
             if (selection.messageKey) {

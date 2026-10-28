@@ -100,6 +100,7 @@ export class SqliteCompanyDatabase {
   conversations(namespace: string): ConversationStore {
     const load = (selection: ConversationSelection): ConversationStoreState => {
       const state: ConversationStoreState = { ...this.meta(namespace, 'conversation_meta', () => { const { version, generation } = initialConversationState(); return { version, generation }; }), conversations: {}, bindings: {}, messages: {}, work: [] };
+      if (state.version !== 2) throw new Error('conversation reset required for draft 0.3');
       let id = selection.conversationId;
       if (selection.messageKey) {
         const message = this.one<ConversationStoreState['messages'][string]>(namespace, 'messages', selection.messageKey);

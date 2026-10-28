@@ -33,19 +33,31 @@ function serverPort(server:Server):number {const address=server.address();assert
 
 const state = { conversation_id: 'c1', status: 'idle', responder: 'agent' };
 const event = { id: 'e1', type: 'future', created_at: '2026-10-19T00:00:00Z', opaque: { preserved: true } };
+test('draft 0.3 authors preserve company identity and reject old or malformed wire messages', () => {
+  const author = { type: 'human', id: 'alex', name: 'Alex', image: 'https://shop.example/alex.png' };
+  const message = { id: 'reply', role: 'company', author, text: 'I can help.' };
+  assert.deepEqual(wire.parseEvent({ ...event, type: 'message', message }).message, message);
+  for (const invalid of [undefined, 'human', {}, { type: 'robot' }, { ...author, image: 'http://shop.example/a' }, { ...author, image: 'https://user:password@shop.example/a' }]) {
+    assert.throws(() => wire.parseMessage({ ...message, author: invalid }, { recorded: true }));
+  }
+  assert.throws(() => wire.parseMessage({ id: 'old', sender: 'agent', text: 'old format' }));
+  assert.throws(() => wire.parseMessage({ ...message, role: 'user' }, { recorded: true }));
+  assert.throws(() => wire.parseEvent({ ...event, type: 'authorization', error: 'sign_in_required', scope: 'orders:read' }));
+  for (const scope of ['', ' orders:read', 'orders:read\norders:write']) assert.throws(() => wire.parseEvent({ ...event, type: 'authorization', error: 'insufficient_scope', scope }));
+});
 test('wire validates every known event while preserving unknown events and message fields', () => {
   assert.equal(wire.parseEvent(event), event);
-  const variants = [{ type: 'message', message: { id: 'm', sender: 'human', role: 'user', text: '' } }, { type: 'state', status: 'working', responder: 'human' }, { type: 'authorization', error: 'sign_in_required' }, { type: 'authorization', error: 'insufficient_scope', scope: 'orders:read' }, { type: 'user_requested', reason: '' }, { type: 'direct_opened', conversation_id: 'child' }, { type: 'direct_closed', conversation_id: 'child' }];
+  const variants = [{ type: 'message', message: { id: 'm', author: { type: 'human' }, role: 'user', text: '' } }, { type: 'state', status: 'working', responder: 'human' }, { type: 'authorization', error: 'insufficient_scope', scope: 'orders:read' }, { type: 'user_requested', reason: '' }, { type: 'direct_opened', conversation_id: 'child' }, { type: 'direct_closed', conversation_id: 'child' }];
   for (const variant of variants) wire.parseEvent({ ...event, ...variant });
   assert.throws(() => wire.parseEvent({ ...event, type: 'message' }));
   assert.throws(() => wire.parseEvent({ ...event, type: 'authorization', error: 'insufficient_scope' }));
-  const source = { id: 'm', sender: 'human', role: 'company', context: { locale: 'en-US', time_zone: 'Europe/Dublin', user_available: false }, unknown: 1 };
-  assert.equal(wire.parseMessage(source).role, undefined); assert.equal(source.role, 'company'); assert.equal(wire.parseMessage(source).unknown, 1);
-  for (const invalid of [{ id: 'm', sender: 'agent' }, { id: 'bad/id', sender: 'human', text: 'x' }, { id: 'm', sender: 'human', context: { time_zone: '+01:00' } }]) assert.throws(() => wire.parseMessage(invalid));
-  assert.throws(() => wire.parseMessage({ id: 'm', sender: 'agent', context: {} }, { company: true }));
+  const source = { id: 'm', author: { type: 'human' }, role: 'user', context: { locale: 'en-US', time_zone: 'Europe/Dublin', user_available: false }, unknown: 1 };
+  assert.equal(wire.parseMessage(source).role, undefined); assert.equal(source.role, 'user'); assert.equal(wire.parseMessage(source).unknown, 1);
+  for (const invalid of [{ id: 'm', author: { type: 'agent' } }, { id: 'bad/id', author: { type: 'human' }, text: 'x' }, { id: 'm', author: { type: 'human' }, context: { time_zone: '+01:00' } }]) assert.throws(() => wire.parseMessage(invalid));
+  assert.throws(() => wire.parseMessage({ id: 'm', author: { type: 'agent' }, context: {} }, { company: true }));
   assert.throws(() => wire.parseEvent({ ...event, created_at: '2026-02-31T00:00:00Z' }));
   let nested = {}; for (let i = 0; i < 70; i++) nested = { nested };
-  assert.throws(() => wire.parseMessage({ id: 'm', sender: 'human', data: nested }));
+  assert.throws(() => wire.parseMessage({ id: 'm', author: { type: 'human' }, data: nested }));
 });
 test('six-field pages and narrow null cursor preserve replay position', () => {
   const page = { ...state, events: [event], cursor: 'e1', has_more: false }; assert.deepEqual(wire.parseEventPage(page), page);

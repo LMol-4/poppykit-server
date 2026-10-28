@@ -11,3 +11,5 @@ export type { BrowserBinding, BrowserSession, BrowserSessionAuthority, BrowserCo
 export { createFeedbackHandler } from './feedback.js';
 export type { FeedbackReport } from './feedback.js';
 export { mcpResourceMetadata, mcpAuthorizationError } from './mcp.js';
+
+export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest, ConversationState, ConversationEvent, KnownEvent, EventPage } from './protocol/wire.js';

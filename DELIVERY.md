@@ -1,6 +1,6 @@
 # Conversation delivery and transport
 
-Conversation wire migration to draft 0.3 is pending; this layer still uses draft 0.2. Company content, messages,
+Conversation messages and authorization events now use draft 0.3. Company content, messages,
 unknown events and partial text remain untrusted data for the host application.
 
 Account-history access requires explicit, nonempty company `historyScopes` in
@@ -81,3 +81,16 @@ Pruning is explicit operator policy, never automatic data loss. It preserves old
 message receipts and cursor identity. Concurrent reads see a coherent snapshot or
 `cursor_expired`. Invalid/expired waited-POST cursors are rejected before accepting
 the new write; an existing message ID still returns its original receipt.
+
+## Unreleased draft 0.3 breaking change
+
+Protocol messages use `author: { type: 'agent' | 'human' }`; company authors may
+also carry `id`, `name` and an HTTPS `image`. Responder checks use `author.type`,
+and only the server assigns recorded `role`. Authorization events always use
+`insufficient_scope` and name required scopes, including signed-out requests.
+
+Conversation state version 2 requires an explicit clean reset of old runtime
+state; SQLite/PostgreSQL reject version 1. Stop old writers and clear history,
+receipts, cursor identities, work, client outboxes and retry handles together.
+Preserve required configuration. No historical conversion or dual wire format is
+provided. An accepted request's fingerprint is never rewritten.

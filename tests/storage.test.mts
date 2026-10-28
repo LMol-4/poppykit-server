@@ -22,6 +22,14 @@ const directories: string[] = [];
 after(async () => { for (const dir of directories) await rm(dir, { recursive: true, force: true }); });
 async function fixture() { const dir = await mkdtemp(join(tmpdir(), 'poppy-company-')); directories.push(dir); return join(dir, 'state.db'); }
 
+test('draft 0.3 refuses old conversation namespaces until an explicit data reset',async t=>{
+  const path=await fixture(),first=new SqliteCompanyDatabase(path);first.close();
+  const raw=new DatabaseSync(path);raw.prepare('INSERT INTO records VALUES (?,?,?,?)').run('old','conversation_meta','meta',JSON.stringify({version:1,generation:'old'}));raw.close();
+  const db=new SqliteCompanyDatabase(path);t.after(()=>db.close());
+  await assert.rejects(db.conversations('old').read({}),/conversation reset required/);
+  const fresh=await db.conversations('fresh').read({});assert.equal(fresh.version,2);
+});
+
 test('Session Key upgrade preserves grant lineage and internal IDs; independent writers create one Session', async t => {
   const path = await fixture(), bootstrap = new SqliteCompanyDatabase(path); bootstrap.close();
   const env = await issuerSetup({ requireDpopNonce: false });
@@ -101,12 +109,12 @@ test('death after an external side effect needs application idempotency, and sta
   const db = new SqliteCompanyDatabase(path); const store = db.conversations('test'); const current = setup({ store, leaseMs: 1 });
   current.clock.advance(2000);
   const fresh = await current.service.claim(); assert.equal(expectValue(fresh).workId, old.work.workId); assert.notEqual(expectValue(fresh).fence, old.work.fence);
-  await assert.rejects(current.service.reply(old.work, 'output', { id: 'reply', sender: 'agent', text: 'done' }), { code: 'stale_work' });
+  await assert.rejects(current.service.reply(old.work, 'output', { id: 'reply', author: { type: 'agent' }, text: 'done' }), { code: 'stale_work' });
   const external = new DatabaseSync(path + '.external');
   external.prepare('INSERT OR IGNORE INTO effects VALUES (?)').run(expectValue(fresh).workId);
   assert.equal(expectValue(external.prepare('SELECT count(*) AS n FROM effects').get()).n, 1); external.close();
-  await current.service.reply(expectValue(fresh), 'output', { id: 'reply', sender: 'agent', text: 'done' });
-  await current.service.reply(expectValue(fresh), 'output', { id: 'reply', sender: 'agent', text: 'done' });
+  await current.service.reply(expectValue(fresh), 'output', { id: 'reply', author: { type: 'agent' }, text: 'done' });
+  await current.service.reply(expectValue(fresh), 'output', { id: 'reply', author: { type: 'agent' }, text: 'done' });
   const state = await store.read({ conversationId: receipt.receipt.conversation_id });
   assert.equal(state.conversations[receipt.receipt.conversation_id].events.filter(e => optionalMessage(e.message)?.id === 'reply').length, 1);
   db.close();
@@ -121,13 +129,13 @@ test('process death, competing recovery and retention preserve the application e
   one.clock.advance(2000);two.clock.advance(2000);
   const claims=(await Promise.all([one.service.claim(),two.service.claim()])).filter(Boolean);assert.equal(claims.length,1);
   const fresh=claims[0];assert.notEqual(expectValue(fresh).fence,old.work.fence);
-  await assert.rejects(one.service.reply(old.work,'result',{id:'stale',sender:'agent',text:'must not publish'}),{code:'stale_work'});
+  await assert.rejects(one.service.reply(old.work,'result',{id:'stale',author: { type: 'agent' },text:'must not publish'}),{code:'stale_work'});
   const payload={record:'opaque-17',value:1};
   assert.equal(effect(path+'.contract','tenant-a',expectValue(fresh).workId,payload),old.result,'recovered execution uses its own retained effect receipt');
   assert.throws(()=>effect(path+'.contract','tenant-a',expectValue(fresh).workId,{...payload,value:2}),/effect_payload_conflict/);
   effect(path+'.contract','tenant-b',expectValue(fresh).workId,payload);
   const external=new DatabaseSync(path+'.contract');assert.equal(expectValue(external.prepare('SELECT count(*) AS n FROM effects').get()).n,2);external.close();
-  await one.service.reply(expectValue(fresh),'result',{id:'recovered_result',sender:'agent',text:old.result});await one.service.finish(expectValue(fresh),'completed');
+  await one.service.reply(expectValue(fresh),'result',{id:'recovered_result',author: { type: 'agent' },text:old.result});await one.service.finish(expectValue(fresh),'completed');
   const id=receipt.receipt.conversation_id,cursor=(await one.read(id)).body.cursor;
   await expectValue(a.conversations('test').pruneEvents).call(a.conversations('test'), id, one.clock.now()+1, 100);
   const [retry,read]=await Promise.all([two.start(hello),two.read(id,{query:'?cursor='+cursor})]);

@@ -1,8 +1,8 @@
 import { companyScopes } from '../network/discovery.js';
 import { randomBytes } from 'node:crypto';
 import { createConversationNotifications } from './store.js';
-import { ValidationError, canonical, parseJson, object, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
-import type { ConversationEvent, ConversationRequest, JsonObject, Message, Sender, Status } from '../protocol/wire.js';
+import { ValidationError, canonical, parseJson, object, parseEvent, parseConversationRequest, parseMessage, parseReadOptions } from '../protocol/wire.js';
+import type { ConversationEvent, ConversationRequest, JsonObject, Message, AuthorType, Status } from '../protocol/wire.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
 import type { ConversationStore, ConversationSelection, ConversationNotifications } from './store.js';
@@ -12,7 +12,7 @@ import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticato
 export interface ConversationRecord {
   id: string; issuer: string; clientId: string; userId: string; bindingId: string;
   lastUserMessage?: Message;
-  status: Status; responder: Sender; context: JsonObject; events: ConversationEvent[];
+  status: Status; responder: AuthorType; context: JsonObject; events: ConversationEvent[];
   eventWindow?: { invalid?: boolean; expired?: boolean; hasMore: boolean };
   authority: AcceptedAuthority; // of the latest accepted message; staff operations act under it
   parentId?: string; // set on a Direct Conversation
@@ -29,7 +29,7 @@ export interface WorkRecord {
 export interface MessageRecord { conversationId: string; fingerprint: string; receipt: { status: number; body: JsonObject } }
 export interface ConversationStoreState {
   cursorStatus?: 'expired' | 'invalid';
-  version: 1; generation: string;
+  version: 2; generation: string;
   conversations: Record<string, ConversationRecord>;
   bindings: Record<string, { accountId?: string }>;
   messages: Record<string, MessageRecord>; // keyed by JSON [issuer, clientId, userId, messageId]
@@ -81,7 +81,7 @@ export interface ConversationService {
   handoff(work: WorkRef): Promise<void>;
   /** The company closes the conversation (and its open Direct Conversation); idempotent. */
   close(work: WorkRef): Promise<void>;
-  /** A person joins: automated work is fenced and the returned claim publishes with sender human. Renew it within operatorLeaseMs. */
+  /** A person joins: automated work is fenced and the returned claim publishes with author.type human. Renew it within operatorLeaseMs. */
   joinHuman(operator: unknown, conversationId: string): Promise<WorkClaim>;
   /** Nobody can join a queued conversation: the agent says why and the conversation leaves the queue. No-op unless queued. */
   noHumanAvailable(operator: unknown, conversationId: string, reason: string): Promise<void>;
@@ -93,13 +93,13 @@ export class PublicationError extends Error {
 }
 
 // Spec 7.10: text or data in a Direct Conversation is the User's own words; context-only messages may come from the agent.
-const directWords = (message: Message) => message.sender !== 'human' && (message.text !== undefined || message.data !== undefined);
+const directWords = (message: Message) => message.author.type !== 'human' && (message.text !== undefined || message.data !== undefined);
 const maxBodyBytes = 1048576;
 const maxWaitSeconds = 30;
 const randomId = (prefix: string) => prefix + randomBytes(16).toString('base64url');
 
 export function initialConversationState(): ConversationStoreState {
-  return { version: 1, generation: randomId(''), conversations: {}, bindings: {}, messages: {}, work: [] };
+  return { version: 2, generation: randomId(''), conversations: {}, bindings: {}, messages: {}, work: [] };
 }
 /** For the host's reset transaction: a fresh state with a new generation, so every old fence is stale. */
 export function resetConversationState(draft: ConversationStoreState): void {
@@ -255,7 +255,7 @@ export function createConversationService(options: ConversationOptions): Convers
     }
     const events: ConversationEvent[] = [];
     let bytes = 1024; // Worst-case IDs, status, responder, cursor and JSON envelope.
-    for (const event of conversation.events.slice(start, start + pageSize)) { const size = Buffer.byteLength(JSON.stringify(event)) + 1; if (bytes + size > maxPageBytes) break; events.push(event); bytes += size; }
+    for (const stored of conversation.events.slice(start, start + pageSize)) { const event = parseEvent(stored); const size = Buffer.byteLength(JSON.stringify(event)) + 1; if (bytes + size > maxPageBytes) break; events.push(event); bytes += size; }
     if (!events.length && (conversation.events.length > start || conversation.eventWindow?.hasMore)) throw new ValidationError('page.size');
     return {
       conversation_id: conversation.id, events: events as unknown as JsonObject[], cursor: events.at(-1)?.id ?? cursor ?? null,
@@ -278,7 +278,7 @@ export function createConversationService(options: ConversationOptions): Convers
     const accountId = own(state.bindings, conversation.bindingId)?.accountId;
     if (accountId === undefined ? conversation.userId === principal.userId : principal.accountId === accountId) return conversation;
     // Spec 7.11: the same User not signed in to the bound account (signed out or another account) is told to sign in; anyone else learns nothing.
-    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError('sign_in_required');
+    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError('insufficient_scope', { scope: historyScopes.join(' ') });
     throw notFound();
   }
 
@@ -305,7 +305,7 @@ export function createConversationService(options: ConversationOptions): Convers
     const body: ConversationRequest = parseConversationRequest(await readJson(request));
     const parentId = conversationId === undefined ? body.parent_conversation_id : undefined;
     // A Direct Conversation carries the User's own words (7.10).
-    if (parentId !== undefined && directWords(body.message)) throw new ValidationError('message.sender');
+    if (parentId !== undefined && directWords(body.message)) throw new ValidationError('message.author.type');
     const key = JSON.stringify([principal.issuer, principal.clientId, principal.userId, body.message.id]);
     const fingerprint = canonical({ target: conversationId ?? null, request: body });
     const authority = JSON.parse(JSON.stringify({ principal, acceptedAt: clock.now(), revocationPolicy })) as AcceptedAuthority;
@@ -351,7 +351,7 @@ export function createConversationService(options: ConversationOptions): Convers
         conversation = owned(draft, principal, conversationId);
         if (conversation.status === 'closed') throw closed();
         if (conversation.childId !== undefined) throw directOpen(conversation.childId);
-        if (conversation.parentId !== undefined && directWords(body.message)) throw new ValidationError('message.sender');
+        if (conversation.parentId !== undefined && directWords(body.message)) throw new ValidationError('message.author.type');
         if (read.cursor !== undefined) page(conversation, read.cursor, draft.cursorStatus);
         conversation.authority = authority;
       }
@@ -570,7 +570,7 @@ export function createConversationService(options: ConversationOptions): Convers
           work.phase = 'claimed';
           work.fence = newFence(draft);
           work.leaseUntil = now + leaseMs;
-          return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: work.message, context: conversation.context };
+          return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: parseMessage(work.message), context: conversation.context };
         }
         return null;
       });
@@ -586,8 +586,8 @@ export function createConversationService(options: ConversationOptions): Convers
     history(ref) {
       return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : historyScopes, (draft, work, conversation) => {
         const accountId = boundAccount(draft, work);
-        if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('sign_in_required');
-        return linkedHistory(draft, conversation);
+        if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('insufficient_scope', { scope: historyScopes.join(' ') });
+        return linkedHistory(draft, conversation).map(parseEvent);
       }, never, true);
     },
 
@@ -596,7 +596,7 @@ export function createConversationService(options: ConversationOptions): Convers
         const accountId = work.authority.principal.accountId;
         const binding = draft.bindings[conversation.bindingId];
         // Parent and child share this record, so the first account use wins for both and no other account can.
-        if (accountId === undefined || (binding.accountId ?? accountId) !== accountId) throw new AuthorityError('sign_in_required');
+        if (accountId === undefined || (binding.accountId ?? accountId) !== accountId) throw new AuthorityError('insufficient_scope', { scope: (scopes.length ? scopes : historyScopes).join(' ') });
         binding.accountId = accountId;
         return { accountId };
       });
@@ -606,7 +606,7 @@ export function createConversationService(options: ConversationOptions): Convers
       const parsed = parseMessage(message, { company: true });
       const payload = canonical({ reply: parsed });
       await publish(ref, noScopes, (draft, work, conversation) => {
-        if (parsed.sender !== conversation.responder) throw new ValidationError('message.sender');
+        if (parsed.author.type !== conversation.responder) throw new ValidationError('message.author.type');
         if (!firstOutput(work, outputId, payload)) return;
         // A person's reply answers the messages held for them so far.
         if (work.human) for (const item of draft.work) if (item.conversationId === conversation.id && item.phase === 'held') item.phase = 'cancelled';
@@ -619,13 +619,9 @@ export function createConversationService(options: ConversationOptions): Convers
       if (!direct) throw new TypeError('supportedScopes is not configured');
       if (!Array.isArray(scopes) || !scopes.length || !scopes.every(scope => typeof scope === 'string' && direct.includes(scope))) throw new TypeError('scopes');
       const scope = [...new Set(scopes)].join(' ');
-      await publish(ref, noScopes, (draft, work, conversation, live) => {
+      await publish(ref, noScopes, (_draft, work, conversation) => {
         if (!firstOutput(work, outputId, canonical({ authorization: scope }))) return;
-        const { accountId, scopes: granted } = work.authority.principal;
-        const bound = boundAccount(draft, work);
-        // More scopes only helps a live sign-in on the right account; signed out, another account or revoked all need sign-in.
-        const narrow = live && accountId !== undefined && (bound ?? accountId) === accountId && !scopes.every(item => granted.includes(item));
-        addEvent(conversation, { type: 'authorization', error: narrow ? 'insufficient_scope' : 'sign_in_required', scope });
+        addEvent(conversation, { type: 'authorization', error: 'insufficient_scope', scope });
       }, always);
     },
 
@@ -645,7 +641,7 @@ export function createConversationService(options: ConversationOptions): Convers
         delete work.leaseUntil;
         // Spec 7.8: 'human' means a person's own words, so a person's failed work gets no canned apology.
         if (outcome === 'failed' && !work.human) {
-          addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: 'Sorry, something went wrong and this request could not be completed.' } });
+          addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', author: { type: 'agent' }, text: 'Sorry, something went wrong and this request could not be completed.' } });
         }
         if (conversation.status === 'working') setState(conversation, idleOrWorking(draft, conversation.id));
       }, work => outcome !== 'completed' || byPerson(work));
@@ -671,7 +667,7 @@ export function createConversationService(options: ConversationOptions): Convers
         const last = conversation.events.findLast(event => event.type === 'message' && (event.message as Message).role === 'user');
         const source = conversation.lastUserMessage ?? last?.message as Message | undefined;
         if (!source) throw new PublicationError('stale_work');
-        const { role: _role, ...message } = source;
+        const { role: _role, ...message } = parseMessage(source);
         const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), leaseUntil: clock.now() + operatorLeaseMs, human: true, outputs: {} };
         conversation.humanUntil = work.leaseUntil;
         draft.work.push(work);
@@ -688,7 +684,7 @@ export function createConversationService(options: ConversationOptions): Convers
         if (conversation.childId !== undefined) throw new PublicationError('stale_work');
         // Messages sent while queued were meant for a person; the agent answers them now.
         release(draft, conversationId);
-        addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', sender: 'agent', text: reason } });
+        addEvent(conversation, { type: 'message', message: { id: randomId('msg_'), role: 'company', author: { type: 'agent' }, text: reason } });
         setState(conversation, idleOrWorking(draft, conversationId), 'agent');
       });
     },
