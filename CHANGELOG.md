@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+Target pinned Personal Agent Protocol draft 0.3. Break discovery, proof-key grants, author, browser joining and MCP Token Exchange contracts. Upgrade issuer state 3→4; stop old writers and reset conversation state to version 2. Require explicit company history scopes.
+
+Local migration candidate only. Publication and deployment require separate approval.
+
 ## 0.3.1
 
 Support Node 24.21.0 and later within Node 24 under the owner-accepted runtime policy.

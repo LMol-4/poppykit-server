@@ -35,7 +35,7 @@ export function memoryStore(initial:IssuerState) {
 type KeyPair=Awaited<ReturnType<typeof keyPair>>;
 type AssertionOptions={key?:KeyPair;header?:ProtectedHeaderParameters};
 type ProofOptions=NonNullable<Parameters<typeof proof>[1]>&{key?:KeyPair};
-export interface Reply {status:number;headers:Headers;body:Record<string,unknown> & {access_token?:string;refresh_token?:string;session_id?:string;scope?:string;error?:string}}
+export interface Reply {sessionId?:string;signedIn?:boolean;status:number;headers:Headers;body:Record<string,unknown> & {access_token?:string;refresh_token?:string;session_id?:string;scope?:string;error?:string}}
 export interface Environment {
  identity:KeyPair;dpopKey:KeyPair;clock:{now:number};store:ReturnType<typeof memoryStore>;calls:{client:number;jwks:number;refresh:number};
  jwks:{keys:({kty:string}&ReturnType<typeof jsonObject>)[]};refreshedJwks:{keys:({kty:string}&ReturnType<typeof jsonObject>)[]};metadata:MetadataResolver;issuer:ReturnType<typeof createReferenceIssuer>;
@@ -69,7 +69,13 @@ export async function setup(overrides:Partial<ReferenceIssuerOptions> = {}) {
     const form = { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: await env.assertion(), client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...fields };
     const body = new URLSearchParams(Object.entries(form).filter((entry):entry is [string,string]=>entry[1]!==undefined));
     const response = await env.issuer.token(new Request(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...(dpop === null ? {} : { dpop: dpop ?? await env.proof() }), ...headers }, body }));
-    return { status: response.status, headers: response.headers, body: await response.json() };
+    const result = { status: response.status, headers: response.headers, body: await response.json() };
+    // Internal authority is separate from the protocol response, which has no Session ID/sign-in fields.
+    if (result.status === 200 && result.body.access_token) {
+      const { principal } = await env.issuer.authority.introspect(result.body.access_token, fields.resource);
+      return { ...result, sessionId: principal.sessionId, signedIn: !!principal.accountId };
+    }
+    return result;
   };
   env.challenge = async () => { const response = await env.send(); assert.equal(response.body.error, 'use_dpop_nonce'); env.nonce = response.headers.get('dpop-nonce'); return response; };
   return env;

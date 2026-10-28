@@ -212,15 +212,15 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   const env = await issuerSetup({ store: db.issuer(ISSUER), coordinator: db, requireDpopNonce: false });
   const start = await env.send(); assert.equal(start.status, 200);
   const verifier = 'v'.repeat(43), url = new URL(ISSUER + '/authorize');
-  const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: 'state', code_challenge_method: 'S256', code_challenge: createHash('sha256').update(verifier).digest('base64url') };
+  const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: 'state', code_challenge_method: 'S256', dpop_jkt: await calculateJwkThumbprint(env.dpopKey.jwk), code_challenge: createHash('sha256').update(verifier).digest('base64url') };
   for (const [name, value] of Object.entries(fields)) url.searchParams.set(name, value);
   const view = await env.issuer.beginAuthorization(new Request(url), 'binding');
   const callback = await env.issuer.completeAuthorization(view.id, 'binding', { accountId: 'account', scopes: ['orders:read'] });
-  const signed = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier, session_id: start.body.session_id });
+  const signed = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier });
   assert.equal(signed.status, 200, JSON.stringify(signed.body));
   const { principal } = await env.issuer.authority.introspect(expectValue(signed.body.access_token));
   const rotation = worker(t, 'rotate', path), revocation = worker(t, 'revoke', path);
-  const input = { refreshToken: signed.body.refresh_token, sessionId:expectValue(start.body.session_id) };
+  const input = { refreshToken: signed.body.refresh_token, sessionId:expectValue(start.sessionId) };
   rotation.child.send(input); revocation.child.send(input);
   const [rotatedResult, revokedResult] = await Promise.all([rotation.message, revocation.message]);
   await Promise.all([rotation.exited, revocation.exited]);
@@ -231,7 +231,7 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   // Start a new grant to test the policy/transaction ordering separately.
   const view2 = await env.issuer.beginAuthorization(new Request(url), 'binding2');
   const callback2 = await env.issuer.completeAuthorization(view2.id, 'binding2', { accountId: 'account', scopes: ['orders:read'] });
-  const signed2 = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback2.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier, session_id: start.body.session_id });
+  const signed2 = await env.send({ grant_type: 'authorization_code', assertion: undefined, code:expectValue(callback2.searchParams.get('code')), redirect_uri: REDIRECT, code_verifier: verifier });
   const currentPrincipal = (await env.issuer.authority.introspect(expectValue(signed2.body.access_token))).principal;
   const conversations = setup({ store: db.conversations(ISSUER), policy: env.issuer.authority.policy, authenticator: { authenticate: async () => currentPrincipal } });
   let entered!:()=>void; const gate=new Promise<void>(r=>{entered=r;});let release!:()=>void;const hold=new Promise<void>(r=>{release=r;});
@@ -241,7 +241,7 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   expectValue(release)(); const receipt = await accepted; assert.equal(receipt.status, 201); await revoked;
   assert.equal((await conversations.read(receipt.body.conversation_id)).status, 401);
   await assert.rejects(env.issuer.authority.policy.withCurrent(currentPrincipal, [], async () => { throw new Error('must not run'); }), { code: 'invalid_token' });
-  const rotated = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: signed.body.refresh_token, session_id: start.body.session_id });
+  const rotated = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: signed.body.refresh_token });
   assert.equal(rotated.body.error, 'invalid_grant');
-  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:expectValue(start.body.session_id) })).sessions, {});
+  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:expectValue(start.sessionId) })).sessions, {});
 });

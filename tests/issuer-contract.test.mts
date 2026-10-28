@@ -1,3 +1,4 @@
+import { calculateJwkThumbprint } from 'jose';
 import { mkdtemp,rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,7 +36,7 @@ function completionContract(fixture: IssuerAdapterFixture) {
       for (const decision of [{ denied: true as const }, { accountId: 'acct_1', scopes: ['orders:read'] }]) {
         const url = new URL(`${ISSUER}/authorize`);
         const verifier = 'v'.repeat(43);
-        url.search = new URLSearchParams({ response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: randomUUID(), code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' }).toString();
+        url.search = new URLSearchParams({ response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: randomUUID(), code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', dpop_jkt: await calculateJwkThumbprint(a.dpopKey.jwk) }).toString();
         const view = await a.issuer.beginAuthorization(new Request(url), binding);
         fault = 'before';
         await assert.rejects(a.issuer.completeAuthorization(view.id, binding, decision), /before commit/);
@@ -55,7 +56,7 @@ function completionContract(fixture: IssuerAdapterFixture) {
         if (code) {
           assert.ok(!JSON.stringify(saved).includes(code));
           const session = await a.send(); assert.equal(session.status, 200);
-          const signed = await a.send({ grant_type: 'authorization_code', assertion: undefined, code, redirect_uri: REDIRECT, code_verifier: verifier, session_id: session.body.session_id });
+          const signed = await a.send({ grant_type: 'authorization_code', assertion: undefined, code, redirect_uri: REDIRECT, code_verifier: verifier });
           assert.equal(signed.status, 200);
           const refresh = (token: string | undefined) => a.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: token });
           const first = signed.body.refresh_token;

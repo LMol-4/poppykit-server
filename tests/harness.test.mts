@@ -11,7 +11,7 @@ test('compiled harness binds complete LF source inventory and unchanged emitted 
  try{
   for(const path of ['scripts','tests','test-support','node_modules/typescript'])await mkdir(join(root,path),{recursive:true});
   await writeFile(join(root,'node_modules/typescript/package.json'),JSON.stringify({version:'5.9.3'}));
-  await cp(new URL('../.node-version',import.meta.url),join(root,'.node-version'));
+  await writeFile(join(root,'.node-version'),process.version.slice(1)+'\n');
   await cp(new URL('../scripts/harness-artifact.mjs',import.meta.url),join(root,'scripts/harness-artifact.mjs'));
   await writeFile(join(root,'scripts/harness-artifact.mts'),'// canonical manifest tool fixture data\n');
   await writeFile(join(root,'tests/example.mts'),'// canonical test fixture data\n');await writeFile(join(root,'tests/example.mjs'),'// emitted fixture data\n');
@@ -19,8 +19,8 @@ test('compiled harness binds complete LF source inventory and unchanged emitted 
   const commit=git(['rev-parse','HEAD']);assert.equal(run('write').status,0);
   await cp(join(root,'.test-build/harness/harness-manifest.json'),join(root,'harness-manifest.json'));
   const manifest=await readFile(join(root,'harness-manifest.json'),'utf8');
-  assert.equal(run('check').status,0);assert.notEqual(run('check',{GITHUB_SHA:'0'.repeat(40)}).status,0);
-  await writeFile(join(root,'.node-version'),'24.99.0\n');assert.notEqual(run('check').status,0,'changed runtime baseline fails');await cp(new URL('../.node-version',import.meta.url),join(root,'.node-version'));
+  assert.equal(run('check').status,0,run('check').stderr);assert.notEqual(run('check',{GITHUB_SHA:'0'.repeat(40)}).status,0);
+  await writeFile(join(root,'.node-version'),'24.99.0\n');assert.notEqual(run('check').status,0,'changed runtime baseline fails');await writeFile(join(root,'.node-version'),process.version.slice(1)+'\n');
   const changed: {commit:string;files:unknown[]}=JSON.parse(manifest);changed.commit='0'.repeat(40);await writeFile(join(root,'harness-manifest.json'),JSON.stringify(changed));assert.notEqual(run('check').status,0);
   changed.commit=commit;changed.files.pop();await writeFile(join(root,'harness-manifest.json'),JSON.stringify(changed));assert.notEqual(run('check').status,0,'omitted canonical source fails');await writeFile(join(root,'harness-manifest.json'),manifest);
   await writeFile(join(root,'tests/example.mjs'),'// tampered output\n');assert.notEqual(run('check').status,0);await writeFile(join(root,'tests/example.mjs'),'// emitted fixture data\n');

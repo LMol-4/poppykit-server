@@ -50,10 +50,10 @@ const read = async (response:Response) => ({ status: response.status, headers: r
 async function startDevice(env:Environment, scopes = 'orders:read orders:write') {
   return read(await env.issuer.deviceAuthorization(new Request(DEVICE, { method: 'POST', body: new URLSearchParams({ scope: scopes, client_id: CLIENT, client_assertion_type: TYPE, client_assertion: await env.clientAssertion() }) })));
 }
-const pollDevice = (env:Environment,deviceCode:string,sessionId:string|undefined,extra:Record<string,string>={}) => env.send({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', assertion: undefined, device_code: deviceCode, session_id: sessionId, ...extra });
-async function mediated(env:Environment,token:string|undefined,input:unknown,id='') {
+const pollDevice = (env:Environment,deviceCode:string,sessionId:string|undefined,extra:Record<string,string>={}) => env.send({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', assertion: undefined, device_code: deviceCode, ...extra });
+async function mediated(env:Environment,token:string|undefined,input:unknown,id='',key?:Awaited<ReturnType<typeof keyPair>>) {
   const endpoint = MEDIATED + (id ? `/${id}` : '');
-  return read(await env.issuer.mediatedSignIn(new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `DPoP ${token}`, dpop: await env.proof({ htu: endpoint, token, nonce: undefined }) }, body: JSON.stringify(input) })));
+  return read(await env.issuer.mediatedSignIn(new Request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `DPoP ${token}`, dpop: await env.proof({ htu: endpoint, token, nonce: undefined, ...(key?{key}:{}) }) }, body: JSON.stringify(input) })));
 }
 async function environment(t: test.TestContext, durable: boolean, extra:Partial<MediatedOptions> = {}) {
   const dir = durable ? await mkdtemp(join(tmpdir(), 'poppy-methods-')) : undefined;
@@ -119,11 +119,11 @@ for (const durable of [false, true]) {
   });
   test(`Mediated challenge/session correlation, wrong-code bound and terminal tombstones (${durable ? 'SQLite' : 'memory'})`, async t => {
     const env = await environment(t, durable, { maxCodeAttempts: 2, authenticate: async () => ({ accountId: 'acct_1', challenge: { id: 'host-challenge', sentTo: 'Your phone' } }) });
-    const a = (await env.send()).body, b = (await env.send()).body;
+    const a = (await env.send()).body, other=await keyPair(), b = (await env.send({assertion:await env.assertion({sub:'usr_other'})},{dpop:await env.proof({key:other})})).body;
     const first = await mediated(env, a.access_token, { scope: 'orders:read', credentials: { password: 'private-password' } });
     assert.equal(first.body.status, 'code_required'); const id = first.body.sign_in_id;
-    assert.equal((await mediated(env, b.access_token, { code: '123456' }, id)).body.error, 'sign_in_not_found');
-    assert.equal((await mediated(env, b.access_token, { code: '123456' }, 'unknown')).body.error, 'sign_in_not_found');
+    assert.equal((await mediated(env, b.access_token, { code: '123456' }, id, other)).body.error, 'sign_in_not_found');
+    assert.equal((await mediated(env, b.access_token, { code: '123456' }, 'unknown', other)).body.error, 'sign_in_not_found');
     assert.equal((await mediated(env, a.access_token, { code: 'wrong' }, id)).body.status, 'code_required');
     assert.equal((await mediated(env, a.access_token, { code: 'wrong' }, id)).body.status, 'failed');
     assert.equal((await mediated(env, a.access_token, { code: '123456' }, id)).body.status, 'failed');
@@ -160,7 +160,7 @@ for (const durable of [false, true]) test(`disconnect cancels delayed credential
   const active = mediated(env, session.access_token, { scope: 'orders:read', credentials: { password: 'private-password' } });
   await ready; await env.issuer.disconnect(CLIENT, 'acct_1'); expectValue(deliver)({ accountId: 'acct_1' });
   const result = await active; assert.equal(result.body.error, 'invalid_grant'); assert.equal(result.status, 400);
-  if (durable) assert.equal((await expectValue(env.db).issuer(ISSUER).read({ kind: 'principal', sessionId:expectValue(session.session_id) })).sessions[expectValue(session.session_id)].grantId, null);
+  if (durable) assert.equal((await expectValue(env.db).issuer(ISSUER).read({ kind: 'principal', sessionId:(await env.issuer.authority.introspect(expectValue(session.access_token))).principal.sessionId })).sessions[(await env.issuer.authority.introspect(expectValue(session.access_token))).principal.sessionId].grantId, null);
   else assert.deepEqual(env.store.state.grants, {});
 });
 
@@ -188,7 +188,7 @@ test('Mediated challenge verifies once under concurrency and rejects non-boolean
   assert.equal((await mediated(env, session.access_token, { code: '123456' }, first.body.sign_in_id)).status, 429);
   // @ts-expect-error Host deliberately violates the boolean decision contract.
   expectValue(deliver)('false'); const invalid = await active; assert.equal(invalid.status, 503); assert.equal(invalid.body.error, 'temporarily_unavailable');
-  assert.equal((await expectValue(env.db).issuer(ISSUER).read({ kind: 'principal', sessionId:expectValue(session.session_id) })).sessions[expectValue(session.session_id)].grantId, null);
+  assert.equal((await expectValue(env.db).issuer(ISSUER).read({ kind: 'principal', sessionId:(await env.issuer.authority.introspect(expectValue(session.access_token))).principal.sessionId })).sessions[(await env.issuer.authority.introspect(expectValue(session.access_token))).principal.sessionId].grantId, null);
 });
 
 for (const durable of [false, true]) test(`account-specific disconnect fences preserve unrelated pending users (${durable ? 'SQLite' : 'memory'})`, async t => {

@@ -52,7 +52,9 @@ test('Session Keys atomically name one owned Session and retain ended-key reject
 
 test('key-selected Bearer acquisition remains unbound at the exact MCP resource', async () => {
   const resource = 'https://mcp.shop.test/mcp', env = await setup({ requireDpopNonce: false, mcpResources: [{ url: resource, dpop: false }] });
-  const issued = await env.send({ resource }); assert.equal(issued.status, 200); assert.equal(issued.body.token_type, 'Bearer');
+  expectError(await env.send({ resource }), 'invalid_target');
+  const subject = await env.send();
+  const issued = await env.send({ grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange', assertion: undefined, subject_token: subject.body.access_token, subject_token_type: 'urn:ietf:params:oauth:token-type:access_token', requested_token_type: 'urn:ietf:params:oauth:token-type:access_token', resource }); assert.equal(issued.status, 200); assert.equal(issued.body.token_type, 'Bearer');
   const auth = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://mcp.shop.test', pathPrefix: '/mcp', resource, mcp: { dpop: false, metadataUrl: 'https://mcp.shop.test/.well-known/oauth-protected-resource/mcp' } }], now: () => env.clock.now });
   const principal = await auth.authenticate(new Request(resource, { method: 'POST', headers: { authorization: `Bearer ${issued.body.access_token}` } }));
   assert.equal(principal.userId, 'usr_1'); assert.equal(Object.keys(env.store.state.sessionKeys).length, 1);

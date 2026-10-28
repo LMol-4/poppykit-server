@@ -18,7 +18,7 @@ if (mode === 'rotate' || mode === 'revoke') {
   const input:unknown=await new Promise(resolve=>process.once('message',resolve));assert.ok(input&&typeof input==='object'&&'refreshToken' in input&&typeof input.refreshToken==='string'&&'sessionId' in input&&typeof input.sessionId==='string');
   const env = await issuerSetup({ store: db.issuer(prefix + ISSUER), coordinator: db, requireDpopNonce: false });
   if (mode === 'rotate') {
-    const result = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: input.refreshToken, session_id: input.sessionId });
+    const result = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: input.refreshToken });
     expectValue(process.send).call(process, { status: result.status, error: result.body.error });
   } else {
     const response = await env.issuer.revoke(new Request(ISSUER + '/oauth/revoke', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: input.refreshToken, client_id: 'https://agent.test/agent.json', client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion() }) }));
