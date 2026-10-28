@@ -5,6 +5,7 @@ import { ValidationError, parseAssertionClaims, parseJson } from '../protocol/wi
 import type { AssertionClaims } from '../protocol/wire.js';
 import { companyScopes } from '../network/discovery.js';
 import type { MetadataResolver } from '../network/discovery.js';
+import { registeredRedirect } from '../network/redirect.js';
 import { secureUrl } from '../network/transport.js';
 import { own } from '../store.js';
 import type { IssuerStore, IssuerSelection } from './store.js';
@@ -23,11 +24,11 @@ interface SessionRecord { clientId: string; userId: string; agentId?: string; ve
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
 interface AccessTokenRecord { sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
-interface AuthorizationRecord { clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
+interface AuthorizationRecord { sessionKey: string; clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
-interface CodeRecord { clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
+interface CodeRecord { sessionKey: string; clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
 export type SignInRecord =
-  | { kind: 'device'; clientId: string; scopes: string[]; expiresAt: number; deviceHash: string; status: 'pending' | 'approved' | 'denied' | 'consumed'; nextPollAt: number; intervalMs: number; revision: number; browserHash?: string; accountId?: string }
+  | { kind: 'device'; sessionKey: string | null; clientId: string; scopes: string[]; expiresAt: number; deviceHash: string; status: 'pending' | 'approved' | 'denied' | 'consumed'; nextPollAt: number; intervalMs: number; revision: number; browserHash?: string; accountId?: string }
   | { kind: 'mediated'; clientId: string; userId: string; sessionId: string; scopes: string[]; expiresAt: number; status: 'verifying' | 'pending' | 'failed' | 'expired' | 'complete'; attempts: number; executionId: string; revision: number; accountId?: string; challengeId?: string; sentTo?: string }
   | { kind: 'attempts'; clientId: string; sessionId?: string; expiresAt: number; count: number }
   | { kind: 'revision'; clientId: string; accountId?: string; expiresAt: number; revision: number };
@@ -78,6 +79,7 @@ export interface AuthorizationView { id: string; clientId: string; clientName: s
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
 export interface ReferenceIssuer {
   browserSessions: BrowserSessionAuthority;
+  sessionForKey(binding: { clientId: string; userId: string; sessionKey: string }): Promise<BrowserSession>;
   token(request: Request): Promise<Response>;
   revoke(request: Request): Promise<Response>;
   beginAuthorization(request: Request, browserBinding: string): Promise<AuthorizationView>;
@@ -323,7 +325,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
       if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
       consumeReplay(draft, replayKey, client.exp * 1000);
-      draft.signIns[id] = { kind: 'device', clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs, revision: revision(draft, clientRevisionKey(clientId)) };
+      draft.signIns[id] = { kind: 'device', sessionKey: null, clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs, revision: revision(draft, clientRevisionKey(clientId)) };
     });
     const complete = new URL(options.device.verificationUri); complete.searchParams.set('user_code', userCode);
     return json(200, { device_code: deviceCode, user_code: userCode, verification_uri: options.device.verificationUri, verification_uri_complete: complete.href, expires_in: AUTHORIZATION_MS / 1000, interval: deviceIntervalMs / 1000 });
@@ -344,14 +346,17 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       consumeReplay(draft, replayKey, client.exp * 1000); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
       const record = own(draft.signIns, id);
       if (!record || record.kind !== 'device' || record.clientId !== clientId || record.deviceHash !== tokenHash(code)) return { error: 'invalid_grant' };
+      if (record.sessionKey === undefined || (record.sessionKey !== null && record.sessionKey !== proof.jkt)) return { error: 'invalid_grant' };
+      const sessionId = own(draft.sessionKeys, proof.jkt), session = sessionId ? own(draft.sessions, sessionId) : undefined;
+      if (!session || session.clientId !== clientId || session.expiresAt <= now()) return { error: 'invalid_grant' };
+      record.sessionKey ??= proof.jkt;
       if (record.expiresAt <= now()) return { error: 'expired_token' };
       if (record.status === 'denied') return { error: 'access_denied' };
       if (record.status === 'consumed') return { error: 'invalid_grant' };
       if (record.nextPollAt > now()) { record.intervalMs += 5000; record.nextPollAt = now() + record.intervalMs; return { error: 'slow_down' }; }
       record.nextPollAt = now() + record.intervalMs;
       if (record.status === 'pending') return { error: 'authorization_pending' };
-      const sessionId = own(draft.sessionKeys, proof.jkt), session = sessionId ? own(draft.sessions, sessionId) : undefined;
-      if (!session || session.clientId !== clientId || session.expiresAt <= now()) throw new TokenError('invalid_grant');
+      if (session.accountId !== null && session.accountId !== record.accountId) return { error: 'account_mismatch' };
       const granted = issueSignIn(draft, sessionId!, session, record.accountId!, record.scopes, proof.jkt, resource);
       record.status = 'consumed'; return granted.body;
     });
@@ -566,7 +571,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       }
       if (grantType === 'authorization_code') {
         const record = own(draft.codes, tokenHash(code!));
-        if (!record || record.expiresAt <= at || record.clientId !== clientId) throw new TokenError('invalid_grant');
+        if (!record || record.expiresAt <= at || record.clientId !== clientId || record.sessionKey !== proof.jkt) throw new TokenError('invalid_grant');
         if (record.grantId !== null) { revokeGrant(draft, record.grantId); return null; }
         if (record.redirectUri !== redirectUri || tokenHash(codeVerifier!) !== record.codeChallenge) throw new TokenError('invalid_grant');
         if (!consentCurrent(draft, record.clientId, record.accountId, record.revision)) throw new TokenError('invalid_grant');
@@ -670,6 +675,12 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     },
     token: request => respond(request, issue),
     revoke: request => respond(request, revokeToken),
+    async sessionForKey(binding) {
+      const state = await read({ kind: 'sign_in', ids: [], sessionKey: binding.sessionKey, replayKeys: [], at: now() });
+      const sessionId = own(state.sessionKeys, binding.sessionKey);
+      if (!sessionId) throw new AuthorityError('invalid_token');
+      return browserSession(state, { clientId: binding.clientId, userId: binding.userId, sessionId });
+    },
     deviceAuthorization: request => respond(request, startDevice),
     mediatedSignIn: request => respond(request, mediatedSignIn),
     async beginDeviceAuthorization(userCode, browserBinding) {
@@ -713,15 +724,15 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const { generation } = await read();
       let client;
       try { client = await metadata.resolveClient(clientId); } catch { throw new AuthorizationError('invalid_client'); }
-      // Exact string match against the client's metadata (spec 4.5).
-      if (!client.redirect_uris.includes(redirectUri)) throw new AuthorizationError('invalid_request');
-      try { if (secureUrl(redirectUri).hostname !== secureUrl(clientId).hostname) throw 0; } catch { throw new AuthorizationError('invalid_request'); }
+      if (!registeredRedirect(redirectUri, client.redirect_uris, clientId)) throw new AuthorizationError('invalid_request');
       const state = params.get('state');
       const fail = (code: string) => new AuthorizationError(code, new URL(callback(redirectUri, { error: code, ...(state ? { state } : {}), iss: issuer })));
       if (params.get('response_type') !== 'code') throw fail('unsupported_response_type');
       if (!state || state.length > 512) throw fail('invalid_request');
       const codeChallenge = params.get('code_challenge') ?? '';
       if (params.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw fail('invalid_request');
+      const sessionKey = params.get('dpop_jkt');
+      if (!sessionKey || !/^[A-Za-z0-9_-]{43}$/.test(sessionKey)) throw fail('invalid_request');
       const scopes = [...new Set((params.get('scope') ?? '').split(' ').filter(Boolean))];
       if (!scopes.length || !scopes.every(scope => options.supportedScopes.includes(scope))) throw fail('invalid_scope');
       // resource is accepted and ignored here: grants cover every resource, and each token request selects one (spec 4.3).
@@ -734,7 +745,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         const pending = Object.values(draft.authorizations).filter(record => !record.completion);
         if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(record => record.clientId === clientId).length) >= maxPendingPerClient) throw fail('temporarily_unavailable');
         const id = random(16); const expiresAt = at + AUTHORIZATION_MS;
-        draft.authorizations[id] = { clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt, revision: revision(draft, clientRevisionKey(clientId)) };
+        draft.authorizations[id] = { sessionKey, clientId, redirectUri, state, codeChallenge, scopes, browserHash: tokenHash(browserBinding), expiresAt, revision: revision(draft, clientRevisionKey(clientId)) };
         return { id, clientId, clientName: client.client_name, scopes, expiresAt };
       });
     },
@@ -748,7 +759,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const accountId = 'accountId' in decision && typeof decision.accountId === 'string' ? decision.accountId : undefined;
       const href = await commit({ kind: 'authorization', id, ...(snapshot && accountId ? { revocationKey: accountRevisionKey(snapshot.clientId, accountId) } : {}) }, draft => {
         const record = own(draft.authorizations, id);
-        if (!record || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
+        if (!record || !record.sessionKey || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
         const denied = 'denied' in decision && decision.denied === true;
         const { accountId, scopes } = decision as { accountId: unknown; scopes: unknown };
         // Partial consent narrows; the host may never grant more than was requested.
@@ -767,7 +778,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         }
         const code = random(32);
         record.expiresAt = Math.min(record.expiresAt, now() + CODE_MS);
-        draft.codes[tokenHash(code)] = { clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId: accountId as string, scopes: granted, expiresAt: record.expiresAt, grantId: null, revision: record.revision };
+        draft.codes[tokenHash(code)] = { sessionKey: record.sessionKey, clientId: record.clientId, redirectUri: record.redirectUri, codeChallenge: record.codeChallenge, accountId: accountId as string, scopes: granted, expiresAt: record.expiresAt, grantId: null, revision: record.revision };
         const href = callback(record.redirectUri, { code, ...fields });
         record.completion = { decisionHash, callback: cipher.seal(href) }; return href;
       });

@@ -1,3 +1,4 @@
+import { validRedirect } from './redirect.js';
 import { object, string, member, canonical, parseJson, ValidationError } from '../protocol/wire.js';
 import type { JsonObject } from '../protocol/wire.js';
 import { secureUrl } from './transport.js';
@@ -92,7 +93,7 @@ export function parseClientMetadata(value: unknown, clientId: string): ClientMet
   if (metadata.client_id !== clientId) throw new ValidationError('client_id');
   string(metadata.client_name, 'client_name'); member(metadata.token_endpoint_auth_method, ['private_key_jwt'], 'token_endpoint_auth_method');
   const redirects = strings(metadata.redirect_uris, 'redirect_uris', true);
-  for (const endpoint of [url(metadata.jwks_uri, 'jwks_uri'), ...redirects]) if (secureUrl(endpoint).hostname.toLowerCase() !== parsed.hostname.toLowerCase()) throw new ValidationError('client_endpoint_domain');
+  if (secureUrl(url(metadata.jwks_uri, 'jwks_uri')).hostname !== parsed.hostname || redirects.some(endpoint => !validRedirect(endpoint, clientId))) throw new ValidationError('client_endpoint_domain');
   if ('logo_uri' in metadata) url(metadata.logo_uri, 'logo_uri');
   return metadata as unknown as ClientMetadata;
 }

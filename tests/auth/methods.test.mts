@@ -9,6 +9,39 @@ import { join } from 'node:path';
 import { SqliteCompanyDatabase } from '../../dist/sqlite.js';
 import { createReferenceIssuer } from '../../dist/reference-auth/index.js';
 import { setup, ISSUER, CLIENT, OTHER_CLIENT, TOKEN_ENDPOINT } from './issuer-support.mjs';
+import { keyPair } from './support.mjs';
+import { calculateJwkThumbprint } from 'jose';
+
+for (const durable of [false, true]) test(`Device first-poll binding survives races, approval and reconstruction (${durable ? 'SQLite' : 'memory'})`, async t => {
+  const env = await environment(t, durable); await env.send();
+  const other = await keyPair();
+  await env.send({ assertion: await env.assertion({ sub: 'other-user' }) }, { dpop: await env.proof({ key: other }) });
+  const start = (await startDevice(env)).body; env.clock.now += 5000;
+  const fields = { grant_type: 'urn:ietf:params:oauth:grant-type:device_code', assertion: undefined, device_code: start.device_code };
+  const results = await Promise.all([env.send(fields), env.send(fields, { dpop: await env.proof({ key: other }) })]);
+  assert.deepEqual(results.map(result => result.body.error).sort(), ['authorization_pending', 'invalid_grant']);
+  const winner = results[0].body.error === 'authorization_pending' ? env.dpopKey : other, loser = winner === other ? env.dpopKey : other;
+  env.issuer = env.reopen();
+  await env.issuer.beginDeviceAuthorization(start.user_code, BROWSER);
+  await env.issuer.completeDeviceAuthorization(start.user_code, BROWSER, { accountId: 'account', scopes: ['orders:read'] }); env.clock.now += 5000;
+  assert.equal((await env.send(fields, { dpop: await env.proof({ key: loser }) })).body.error, 'invalid_grant');
+  const signed = await env.send(fields, { dpop: await env.proof({ key: winner }) }); assert.equal(signed.status, 200);
+  const expectedUser = winner === other ? 'other-user' : 'usr_1';
+  const current = await env.issuer.sessionForKey({ clientId: CLIENT, userId: expectedUser, sessionKey: await calculateJwkThumbprint(winner.jwk) });
+  assert.equal(current.principal.accountId, 'account'); assert.deepEqual(current.principal.scopes, ['orders:read']);
+  await assert.rejects(env.issuer.sessionForKey({ clientId: CLIENT, userId: 'foreign', sessionKey: await calculateJwkThumbprint(winner.jwk) }), { code: 'invalid_token' });
+  assert.equal((await env.send(fields, { dpop: await env.proof({ key: winner }) })).body.error, 'invalid_grant');
+});
+
+test('Device legacy pending records cannot acquire a new binding', async t => {
+  const env = await environment(t, false); await env.send();
+  const start = (await startDevice(env)).body;
+  const row = Object.values(env.store.state.signIns).find(row => row.kind === 'device')!;
+  delete (row as { sessionKey?: string | null }).sessionKey;
+  env.clock.now += 5000;
+  assert.equal((await pollDevice(env, start.device_code, undefined)).body.error, 'invalid_grant');
+  assert.deepEqual(env.store.state.grants, {});
+});
 
 const DEVICE = `${ISSUER}/device`, VERIFY = `${ISSUER}/verify`, MEDIATED = `${ISSUER}/sign-in`;
 const TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';

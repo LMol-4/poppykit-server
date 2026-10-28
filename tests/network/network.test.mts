@@ -12,6 +12,21 @@ import { EventEmitter } from 'node:events';
 import { createNodeTransport, isPublicAddress } from '../../dist/network/transport.js';
 import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl, signInMethods } from '../../dist/network/discovery.js';
 import * as wire from '../../dist/protocol/wire.js';
+import { parseClientMetadata } from '../../dist/network/discovery.js';
+import { registeredRedirect } from '../../dist/network/redirect.js';
+
+test('loopback redirect exception allows literal IP ports and preserves every other component', async () => {
+  const client = 'https://agent.example/client', registered = ['http://127.0.0.1:8000/cb?route=fixed', 'http://[::1]:8000/cb'];
+  const metadata = { client_id: client, client_name: 'Agent', jwks_uri: 'https://agent.example/keys', redirect_uris: registered, token_endpoint_auth_method: 'private_key_jwt' };
+  assert.deepEqual(parseClientMetadata(metadata, client).redirect_uris, registered);
+  for (const value of ['http://127.0.0.1:49152/cb?route=fixed', 'http://[::1]:49152/cb']) assert.equal(registeredRedirect(value, registered, client), true);
+  for (const value of ['http://localhost:8000/cb', 'http://127.1:8000/cb', 'http://2130706433:8000/cb', 'http://127.0.0.1.evil.example/cb', 'http://127.0.0.2/cb', 'http://[::ffff:127.0.0.1]/cb', 'http://127.0.0.1:8000/cb?route=other', 'http://127.0.0.1:8000/other?route=fixed', 'http://user@127.0.0.1:8000/cb', 'http://127.0.0.1:8000/cb#fragment']) {
+    assert.equal(registeredRedirect(value, registered, client), false, value);
+  }
+  for (const value of ['http://localhost:8000/cb', 'http://127.1:8000/cb', 'http://10.0.0.1/cb']) assert.throws(() => parseClientMetadata({ ...metadata, redirect_uris: [value] }, client));
+  assert.throws(() => parseClientMetadata({ ...metadata, jwks_uri: registered[0] }, client));
+  await assert.rejects(createNodeTransport().fetch(new Request('http://127.0.0.1:49152/cb')), { code: 'invalid_url' });
+});
 
 
 function serverPort(server:Server):number {const address=server.address();assert.ok(address&&typeof address!=='string');return address.port;}

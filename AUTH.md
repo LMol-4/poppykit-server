@@ -20,7 +20,11 @@ Token exchange for Bearer-only MCP remains a later migration stage.
 Reference Direct sign-in uses `beginAuthorization` / `completeAuthorization`.
 The host authenticates the human and protects consent with its own browser
 session/CSRF controls; pass a high-entropy browser binding. Registered callback
-URLs must be HTTPS on the client metadata domain and exactly match registration.
+URLs must be HTTPS on the client metadata domain, or RFC 8252 HTTP loopback IP
+callbacks (`127.0.0.1` or `[::1]`). Registration matching permits only the loopback
+port to vary; exchange must repeat the actual authorization redirect exactly.
+Direct requests require `dpop_jkt`; codes retain it and exchange requires that
+Session Key. Missing bindings in old pending authorizations/codes fail closed.
 
 Direct hosts must configure `authorizationResultCipher: { seal, open }` with
 synchronous authenticated encryption and a durable protected key before calling
@@ -66,6 +70,15 @@ show the client identity and requested scopes. After an authenticated explicit
 approve/decline action call `completeDeviceAuthorization`. Opening a link must
 never approve it. The token endpoint handles durable polling intervals, slowdown,
 denial, expiry, partial consent, one-use codes and the Session's sticky account.
+The first authenticated poll atomically binds the device code to its live Session
+Key, including pending/slow-down polls. Other keys receive `invalid_grant`.
+Old device records without the new binding slot require a fresh flow. Prefer
+Direct whenever viable; enable Device only for appropriate device constraints
+under RFC 10027. Verification links remain HTTPS on issuer/protected-resource hosts.
+
+Hosted consent can resolve `sessionForKey({ clientId, userId, sessionKey })` to the
+current company Session without treating a client's local Session ID as a server
+ID. It validates live client/User ownership and returns current account/scopes.
 
 Enable Mediated sign-in with `mediated: { endpoint, scopes, fields,
 authenticate, verifyCode }` and route that endpoint and its sign-in-ID children

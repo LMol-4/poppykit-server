@@ -162,10 +162,10 @@ test('bounded SQLite cleanup isolates namespaces and retains grants, work, recei
   const seed = async (name: string) => {
     await setup({ store: db.conversations(name) }).start(hello);
     await db.issuer(name).transaction({ kind: 'authorize', clientId: CLIENT, at }, state => {
-      const authorization = { clientId: CLIENT, redirectUri: REDIRECT, state: 'state', codeChallenge: 'challenge', scopes: [], browserHash: 'browser', expiresAt: at, revision: 0 };
+      const authorization = { sessionKey: 'k'.repeat(43), clientId: CLIENT, redirectUri: REDIRECT, state: 'state', codeChallenge: 'challenge', scopes: [], browserHash: 'browser', expiresAt: at, revision: 0 };
       state.authorizations.expired = authorization;
       state.authorizations.future = { ...authorization, expiresAt: at + 1 };
-      state.codes.expired = { clientId: CLIENT, redirectUri: REDIRECT, codeChallenge: 'challenge', accountId: 'account', scopes: [], expiresAt: at, grantId: null, revision: 0 };
+      state.codes.expired = { sessionKey: 'k'.repeat(43), clientId: CLIENT, redirectUri: REDIRECT, codeChallenge: 'challenge', accountId: 'account', scopes: [], expiresAt: at, grantId: null, revision: 0 };
       state.signIns.expired = { kind: 'attempts', clientId: CLIENT, expiresAt: at - 30001, count: 1 };
       state.signIns.grace = { kind: 'attempts', clientId: CLIENT, expiresAt: at - 30000, count: 1 };
       state.signIns.revision = { kind: 'revision', clientId: CLIENT, expiresAt: Number.MAX_SAFE_INTEGER, revision: 1 };

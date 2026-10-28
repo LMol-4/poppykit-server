@@ -3,6 +3,7 @@ import type {ReferenceIssuerOptions} from '../../dist/reference-auth/index.js';
 import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { calculateJwkThumbprint } from 'jose';
 import { createHash, randomBytes } from 'node:crypto';
 import { AuthorizationError, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { NOW, keyPair } from './support.mjs';
@@ -12,12 +13,53 @@ const BINDING = 'browser-binding-0123456789abcdef';
 const DAY = 86_400_000;
 const REVOKE = `${ISSUER}/oauth/revoke`;
 
+test('Direct codes bind the intended key before exchange or replay revocation; old pending codes fail closed', async () => {
+  const env = await setup({ requireDpopNonce: false }); await env.send();
+  const key = await calculateJwkThumbprint(env.dpopKey.jwk), other = await keyPair();
+  await env.send({ assertion: await env.assertion({ sub: 'usr_other' }) }, { dpop: await env.proof({ key: other }) });
+  const { verifier, challenge } = pkce();
+  for (const dpop_jkt of [undefined, '', 'short', 'x'.repeat(44), '+'.repeat(43)]) await assert.rejects(env.issuer.beginAuthorization(authorizeRequest({ dpop_jkt }), BINDING), { code: 'invalid_request' });
+  const view = await env.issuer.beginAuthorization(authorizeRequest({ code_challenge: challenge, dpop_jkt: key }), BINDING);
+  const decision = { accountId: 'acct', scopes: ['orders:read'] };
+  const callback = await env.issuer.completeAuthorization(view.id, BINDING, decision);
+  assert.equal((await env.issuer.completeAuthorization(view.id, BINDING, decision)).href, callback.href, 'lost consent response returns the same code');
+  const fields = { grant_type: 'authorization_code', assertion: undefined, code: callback.searchParams.get('code')!, redirect_uri: REDIRECT, code_verifier: verifier };
+  expectError(await env.send(fields, { dpop: await env.proof({ key: other }) }), 'invalid_grant');
+  expectError(await env.send({ ...fields, code_verifier: pkce().verifier }), 'invalid_grant');
+  expectError(await env.send({ ...fields, redirect_uri: REDIRECT + '?wrong=1' }), 'invalid_grant');
+  const signed = await env.send(fields); assert.equal(signed.status, 200); assert.equal(signed.body.scope, 'orders:read');
+  expectError(await env.send(fields, { dpop: await env.proof({ key: other }) }), 'invalid_grant');
+  assert.equal((await env.issuer.authority.introspect(signed.body.access_token!)).principal.accountId, 'acct');
+  expectError(await env.send(fields), 'invalid_grant');
+  await assert.rejects(env.issuer.authority.introspect(signed.body.access_token!), { code: 'invalid_token' });
+  const old = await env.issuer.beginAuthorization(authorizeRequest({ dpop_jkt: key }), BINDING);
+  delete (env.store.state.authorizations[old.id] as Partial<typeof env.store.state.authorizations[string]>).sessionKey;
+  await assert.rejects(env.issuer.completeAuthorization(old.id, BINDING, decision), { code: 'invalid_request' });
+});
+
+test('Direct loopback registration permits port variation but exchange requires the authorization redirect exactly', async () => {
+  for (const host of ['127.0.0.1', '[::1]']) {
+    const env = await setup({ requireDpopNonce: false }); await env.send();
+    const registered = `http://${host}:8000/cb?route=fixed`, actual = registered.replace(':8000', ':49152');
+    const resolve = env.metadata.resolveClient;
+    env.metadata.resolveClient = async id => ({ ...await resolve(id), redirect_uris: [registered] });
+    const { verifier, challenge } = pkce(), key = await calculateJwkThumbprint(env.dpopKey.jwk);
+    const view = await env.issuer.beginAuthorization(authorizeRequest({ redirect_uri: actual, code_challenge: challenge, dpop_jkt: key }), BINDING);
+    const callback = await env.issuer.completeAuthorization(view.id, BINDING, { accountId: 'acct', scopes: ['orders:read'] });
+    assert.equal(callback.port, '49152'); assert.equal(callback.searchParams.get('route'), 'fixed');
+    const fields = { grant_type: 'authorization_code', assertion: undefined, code: callback.searchParams.get('code')!, code_verifier: verifier };
+    expectError(await env.send({ ...fields, redirect_uri: registered }), 'invalid_grant');
+    assert.equal((await env.send({ ...fields, redirect_uri: actual })).status, 200);
+    for (const redirect_uri of [actual.replace('route=fixed', 'route=other'), actual.replace('/cb', '/other'), 'http://localhost:49152/cb?route=fixed']) await assert.rejects(env.issuer.beginAuthorization(authorizeRequest({ redirect_uri, dpop_jkt: key }), BINDING), { code: 'invalid_request' });
+  }
+});
+
 test('key-selected sign-in and refresh preserve ownership, sticky accounts and revocation', async () => {
   const env = await setup({ requireDpopNonce: false });
   const started = await env.send(), id = (await env.issuer.authority.introspect(expectValue(started.body.access_token))).principal.sessionId;
   const consent = async (accountId: string) => {
     const { verifier, challenge } = pkce();
-    const view = await env.issuer.beginAuthorization(authorizeRequest({ code_challenge: challenge }), BINDING);
+    const view = await env.issuer.beginAuthorization(authorizeRequest({ code_challenge: challenge, dpop_jkt: await calculateJwkThumbprint(env.dpopKey.jwk) }), BINDING);
     const callback = await env.issuer.completeAuthorization(view.id, BINDING, { accountId, scopes: ['orders:read'] });
     return env.send({ grant_type: 'authorization_code', assertion: undefined, code: callback.searchParams.get('code')!, redirect_uri: REDIRECT, code_verifier: verifier });
   };
@@ -47,7 +89,7 @@ function pkce() {
 }
 function authorizeRequest(params:Record<string,string|undefined> = {}) {
   const url = new URL(`${ISSUER}/oauth/authorize`);
-  const query = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read orders:write', state: 'state-1', code_challenge: pkce().challenge, code_challenge_method: 'S256', ...params };
+  const query = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read orders:write', state: 'state-1', code_challenge: pkce().challenge, code_challenge_method: 'S256', dpop_jkt: 'k'.repeat(43), ...params };
   for (const [name, value] of Object.entries(query)) if (value !== undefined) url.searchParams.set(name, value);
   return new Request(url);
 }
@@ -59,7 +101,7 @@ async function signInSetup(overrides:Partial<ReferenceIssuerOptions>={}) {
   async function session(fields:Fields={}):Promise<Reply['body']>{return (await env.send(fields)).body;}
   async function code({accountId='acct_1',scopes,params}:ConsentOptions={}):Promise<Code>{
     const {verifier,challenge}=pkce();
-    const view=await env.issuer.beginAuthorization(authorizeRequest({code_challenge:challenge,...params}),BINDING);
+    const view=await env.issuer.beginAuthorization(authorizeRequest({code_challenge:challenge,dpop_jkt:await calculateJwkThumbprint(env.dpopKey.jwk),...params}),BINDING);
     const url=await env.issuer.completeAuthorization(view.id,BINDING,{accountId,scopes:scopes??view.scopes});
     const code=url.searchParams.get('code');assert.ok(code);return {code,verifier,url,view};
   }
