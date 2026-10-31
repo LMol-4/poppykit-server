@@ -23,7 +23,7 @@ export { createNodeTransport } from '../network/transport.js';
 interface SessionRecord { clientId: string; userId: string; agentId?: string; version: number; createdAt: number; expiresAt: number; accountId: string | null; grantId: string | null }
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
-interface AccessTokenRecord { sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
+interface AccessTokenRecord { clientId?: string; accountId?: string; sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
 interface AuthorizationRecord { sessionKey: string; clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
 interface CodeRecord { sessionKey: string; clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
@@ -42,7 +42,7 @@ export interface MediatedOptions {
 // Plain JSON. Tokens and codes are keyed by SHA-256 hash; plaintext tokens are never stored.
 export interface IssuerState {
   limits?: { sessions: number; earliestSessionExpiry: number; pending: number; pendingForClient: number };
-  version: 3 | 4;
+  version: 3 | 4 | 5;
   generation: string;
   sessions: Record<string, SessionRecord>;
   sessionKeys: Record<string, string>; // Thumbprint -> internal Session ID; retained indefinitely, including ended keys.
@@ -126,19 +126,23 @@ function checked(state: IssuerState): IssuerState {
 
 /** Run once over the complete namespace, under the adapter's writer lock. */
 export function upgradeIssuerState(state: IssuerState): void {
-  if (state.version === 4) return;
-  if (state.version !== 3) throw new Error('unsupported issuer state version');
-  // Old keys could name several Sessions. Never guess ownership; end those Sessions, keeping IDs and grant lineage.
-  state.sessionKeys = {};
-  for (const token of Object.values(state.accessTokens)) if (token.jkt) state.sessionKeys[token.jkt] = '';
-  for (const session of Object.values(state.sessions)) session.expiresAt = 0;
-  state.authorizations = {}; state.codes = {};
-  for (const [id, row] of Object.entries(state.signIns)) if (row.kind === 'device' || row.kind === 'mediated') delete state.signIns[id];
-  state.version = 4;
+  if (state.version === 5) return;
+  if (state.version !== 3 && state.version !== 4) throw new Error('unsupported issuer state version');
+  state.sessionKeys ??= {};
+  for (const token of Object.values(state.accessTokens)) {
+    const grant = token.grantId === null ? undefined : own(state.grants, token.grantId);
+    const session = own(state.sessions, token.sessionId);
+    if (grant && session && grant.clientId !== session.clientId) continue;
+    const clientId = grant?.clientId ?? session?.clientId;
+    if (clientId !== undefined) token.clientId ??= clientId;
+    if (grant) token.accountId ??= grant.accountId;
+  }
+  // Keep legacy Sessions, pending consent, replay fences and uncertain hooks for explicit reconciliation.
+  state.version = 5;
 }
 
 export function initialIssuerState(): IssuerState {
-  return { version: 4, generation: random(16), sessions: {}, sessionKeys: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {}, nonces: [] };
+  return { version: 5, generation: random(16), sessions: {}, sessionKeys: {}, grants: {}, refreshTokens: {}, authorizations: {}, codes: {}, signIns: {}, accessTokens: {}, replay: {}, nonces: [] };
 }
 
 class TokenError extends Error {

@@ -81,21 +81,23 @@ force another conversation's receipts out of storage.
 
 ## Non-durable use and resets
 
-Normalized issuer state version 3 upgrades to version 4 once, under the existing
-SQLite writer/PostgreSQL namespace lock. Stop old writers before using the new
-adapter. No SQL schema change is needed: `sessionKeys` records use the existing
-namespace/kind/ID primary key. Token selectors load that mapping and its internal
-Session ID in the same transaction as creation, ownership checks and rotation.
-Mappings remain indefinitely after a Session ends, preventing key reuse.
+Normalized issuer state versions 3 and 4 upgrade to version 5 once, under the
+existing SQLite writer/PostgreSQL namespace lock. Stop old writers before opening
+the new adapters; their version checks reject the upgraded namespace. Applied SQL
+migration history is unchanged: this is a JSON record-format transition.
 
-Old keys could belong to several Sessions, so the upgrade ends old Sessions and
-tombstones every known old access-token key rather than guessing a mapping.
-Internal Session IDs, sticky account records, stable Users, grants, all retained
-Account Token hashes, revocation fences and accepted-work authority remain.
-Legacy pending authorization/code/Device/Mediated records are retired: restart
-sign-in rather than accepting consent without the new binding. Existing compatible
-Account Tokens can create fresh-key Sessions. Unsupported earlier state versions
-are refused. The upgrade scans a namespace once; normal selectors stay targeted.
+The upgrade preserves the generation, Sessions and key mappings, grants and every
+retained refresh-token hash, pending authorizations/codes, verifying sign-in hooks,
+replay fences and nonces. It does not expire Sessions or clear pending consent.
+Access-token records gain client/account identity only where an existing grant or
+Session proves it; conflicting or missing associations remain unresolved. Unknown
+earlier versions fail closed. Custom issuer adapters must upgrade the complete
+namespace under their writer lock before normal targeted reads.
+
+This record upgrade prepares OAuth account access to be independent of Poppy
+Sessions. It does not itself implement the remaining wire migration. Keep uncertain
+work and encrypted delivery references for reconciliation; do not reset a store or
+reinterpret an unresolved record as a fresh request.
 
 `new SqliteCompanyDatabase(':memory:')` is an explicit non-durable adapter for tests
 and development. Each instance is separate, is lost at close/process death, and

@@ -1,3 +1,5 @@
+import { PostgresCompanyDatabase } from '../dist/postgres.js';
+import { testPool } from '../test-support/postgres.mjs';
 import type {WorkRef} from '../dist/conversation/service.js';
 import type {ConversationState} from '../dist/protocol/wire.js';
 import type {SpawnOptions} from 'node:child_process';
@@ -30,42 +32,42 @@ test('draft 0.3 refuses old conversation namespaces until an explicit data reset
   const fresh=await db.conversations('fresh').read({});assert.equal(fresh.version,2);
 });
 
-test('Session Key upgrade preserves grant lineage and internal IDs; independent writers create one Session', async t => {
-  const path = await fixture(), bootstrap = new SqliteCompanyDatabase(path); bootstrap.close();
-  const env = await issuerSetup({ requireDpopNonce: false });
-  const jkt = await calculateJwkThumbprint(env.dpopKey.jwk), hash = (s: string) => createHash('sha256').update(s).digest('base64url');
-  const legacy = initialIssuerState(); legacy.version = 3;
-  legacy.sessions.old = { clientId: CLIENT, userId: 'usr_1', version: 1, createdAt: env.clock.now, expiresAt: env.clock.now + 86400000, accountId: 'account', grantId: 'grant' };
-  legacy.sessions.other = { ...legacy.sessions.old, userId: 'usr_other', accountId: null, grantId: null };
-  legacy.grants.grant = { clientId: CLIENT, userId: 'usr_1', accountId: 'account', scopes: ['orders:read'], expiresAt: env.clock.now + 86400000, revoked: false, refreshHash: hash('old-account-token'), previousHash: '' };
-  legacy.refreshTokens[hash('old-account-token')] = 'grant';
-  legacy.accessTokens[hash('old-access-token')] = { sessionId: 'old', grantId: 'grant', scopes: ['orders:read'], resource: null, jkt, expiresAt: env.clock.now + 3600000 };
-  legacy.accessTokens[hash('other-old-token')] = { ...legacy.accessTokens[hash('old-access-token')], sessionId: 'other', grantId: null };
-  const raw = new DatabaseSync(path);
-  raw.prepare('INSERT INTO records VALUES (?,?,?,?)').run('upgrade', 'issuer_meta', 'meta', JSON.stringify({ version: 3, generation: legacy.generation, nonces: [] }));
-  for (const kind of ['sessions', 'grants', 'refreshTokens', 'accessTokens'] as const) for (const [id, row] of Object.entries(legacy[kind])) raw.prepare('INSERT INTO records VALUES (?,?,?,?)').run('upgrade', kind, id, JSON.stringify(row));
-  raw.close();
-  const a = new SqliteCompanyDatabase(path), b = new SqliteCompanyDatabase(path); t.after(() => { a.close(); b.close(); });
-  const make = (db: SqliteCompanyDatabase) => createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/oauth/token`, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'], supportedScopes: ['orders:read'], metadata: env.metadata, now: () => env.clock.now, requireDpopNonce: false, coordinator: db, store: db.issuer('upgrade') });
-  const one = make(a), two = make(b), state = await a.issuer('upgrade').read({ kind: 'principal', sessionId: 'old', grantId: 'grant' });
-  assert.equal(state.version, 4); assert.equal(state.sessions.old.accountId, 'account'); assert.equal(state.sessions.old.expiresAt, 0);
-  assert.equal(state.grants.grant.refreshHash, hash('old-account-token'));
-  await assert.rejects(one.authority.introspect('old-access-token'), { code: 'invalid_token' });
-  const send = async (issuer: typeof one, key = env.dpopKey, refresh?: string) => {
-    const body = new URLSearchParams({ client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...(refresh ? { grant_type: 'refresh_token', refresh_token: refresh } : { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: await env.assertion() }) });
-    return issuer.token(new Request(`${ISSUER}/oauth/token`, { method: 'POST', body, headers: { dpop: await env.proof({ key }) } }));
-  };
-  assert.deepEqual(await (await send(one)).json(), { error: 'invalid_grant' });
-  const key = await keyPair(), responses = await Promise.all([send(one, key), send(two, key)]);
-  const principals = await Promise.all(responses.map(async r => { assert.equal(r.status, 200); const token = await r.json(); assert.equal('session_id' in token, false); return (await one.authority.introspect(token.access_token)).principal; }));
-  assert.equal(principals[0].sessionId, principals[1].sessionId);
-  const signed = await send(two, key, 'old-account-token'); assert.equal(signed.status, 200);
-  const token = await signed.json(), principal = (await one.authority.introspect(token.access_token)).principal;
-  assert.deepEqual([principal.userId, principal.accountId, principal.grantId, principal.sessionId], ['usr_1', 'account', 'grant', principals[0].sessionId]);
-  const reopened = new SqliteCompanyDatabase(path); t.after(() => reopened.close());
-  assert.equal((await make(reopened).authority.introspect(token.access_token)).principal.sessionId, principal.sessionId);
-  const snapshot = new DatabaseSync(path); t.after(() => snapshot.close());
-  assert.equal(snapshot.prepare("SELECT count(*) AS n FROM records WHERE ns='upgrade' AND kind='sessionKeys'").get()!.n, 2);
+for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres'] : [])]) for (const version of [3,4] as const) test(`OAuth record v${version} upgrade preserves pending work, authority and recovery references (${engine})`, async t => {
+  const path=await fixture(),namespace=`migration-${version}-${path}`,pool=engine==='Postgres'?testPool():undefined;
+  const bootstrap=pool?new PostgresCompanyDatabase(pool):new SqliteCompanyDatabase(path);await bootstrap.close();
+  const legacy=initialIssuerState();legacy.version=version;
+  legacy.sessions.old={clientId:CLIENT,userId:'pairwise-user',version:1,createdAt:1,expiresAt:9000000,accountId:'account',grantId:'grant'};
+  legacy.sessionKeys['legacy-proof-key']='old';
+  legacy.grants.grant={clientId:CLIENT,userId:'pairwise-user',accountId:'account',scopes:['orders:read'],expiresAt:9000000,revoked:false,refreshHash:'current-hash',previousHash:'ancestor-hash'};
+  legacy.refreshTokens['current-hash']='grant';legacy.refreshTokens['ancestor-hash']='grant';
+  legacy.accessTokens.known={sessionId:'old',grantId:'grant',scopes:['orders:read'],resource:null,jkt:'legacy-proof-key',expiresAt:8000000};
+  legacy.accessTokens.unknown={sessionId:'missing-session',grantId:null,scopes:[],resource:null,jkt:'unknown-key',expiresAt:8000000};
+  legacy.authorizations.pending={sessionKey:'legacy-proof-key',clientId:CLIENT,redirectUri:REDIRECT,state:'callback-state',codeChallenge:'pkce-hash',scopes:['orders:read'],browserHash:'browser-hash',expiresAt:8000000,revision:4,completion:{decisionHash:'decision',callback:'encrypted-callback-reference'}};
+  legacy.codes.pending={sessionKey:'legacy-proof-key',clientId:CLIENT,redirectUri:REDIRECT,codeChallenge:'pkce-hash',accountId:'account',scopes:['orders:read'],expiresAt:8000000,grantId:null,revision:4};
+  legacy.signIns.uncertain={kind:'mediated',clientId:CLIENT,userId:'pairwise-user',sessionId:'old',scopes:['orders:read'],expiresAt:8000000,status:'verifying',attempts:1,executionId:'dispatched-remote-hook',revision:4};
+  legacy.replay['consumed-assertion']=8000000;legacy.nonces=[{value:'retained-nonce',expiresAt:8000000}];
+  const kinds=['sessions','sessionKeys','grants','refreshTokens','authorizations','codes','signIns','accessTokens','replay'] as const;
+  const meta={version,generation:legacy.generation,nonces:legacy.nonces};
+  if(pool){
+    await pool.query('INSERT INTO poppy_server.records(ns,kind,id,body) VALUES($1,$2,$3,$4)',[namespace,'issuer_meta','meta',JSON.stringify(meta)]);
+    for(const kind of kinds)for(const[id,row]of Object.entries(legacy[kind]))await pool.query('INSERT INTO poppy_server.records(ns,kind,id,body) VALUES($1,$2,$3,$4)',[namespace,kind,id,JSON.stringify(row)]);
+  }else{
+    const raw=new DatabaseSync(path);try{
+      const put=raw.prepare('INSERT INTO records(ns,kind,id,body) VALUES(?,?,?,?)');put.run(namespace,'issuer_meta','meta',JSON.stringify(meta));
+      for(const kind of kinds)for(const[id,row]of Object.entries(legacy[kind]))put.run(namespace,kind,id,JSON.stringify(row));
+    }finally{raw.close();}
+  }
+  const open=()=>pool?new PostgresCompanyDatabase(pool):new SqliteCompanyDatabase(path),one=open(),two=open();t.after(async()=>{await one.close();await two.close();await pool?.end();});
+  const results=await Promise.all([one.issuer(namespace).read({kind:'metadata'}),two.issuer(namespace).read({kind:'metadata'})]);
+  assert.ok(results.every(state=>state.version===5));assert.ok(results.every(state=>state.generation===legacy.generation));
+  let rows:{kind:string;id:string;body:string}[];
+  if(pool)rows=(await pool.query('SELECT kind,id,body FROM poppy_server.records WHERE ns=$1',[namespace])).rows;
+  else{const raw=new DatabaseSync(path);try{rows=raw.prepare('SELECT kind,id,body FROM records WHERE ns=?').all(namespace) as unknown as typeof rows;}finally{raw.close();}}
+  const snapshot={...legacy,version:5,accessTokens:{...legacy.accessTokens,known:{...legacy.accessTokens.known,clientId:CLIENT,accountId:'account'}}};
+  assert.equal(rows.length,1+kinds.reduce((count,kind)=>count+Object.keys(legacy[kind]).length,0),'no pending record or recovery fence was deleted');
+  for(const kind of kinds)for(const[id,row]of Object.entries(snapshot[kind]))assert.deepEqual(JSON.parse(rows.find(value=>value.kind===kind&&value.id===id)!.body),row,kind+':'+id);
+  assert.deepEqual(JSON.parse(rows.find(row=>row.kind==='issuer_meta')!.body),{...meta,version:5});
+  const reopened=open();try{assert.equal((await reopened.issuer(namespace).read({kind:'metadata'})).version,5);}finally{await reopened.close();}
 });
 
 interface Packets {accept:{receipt:ConversationState};'after-commit':{receipt:ConversationState};'before-commit':{ready:true};effect:{work:WorkRef};'effect-contract':{work:WorkRef;result:string};rotate:{status:number;error?:string};revoke:{status:number;error?:string}}

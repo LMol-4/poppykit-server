@@ -196,7 +196,7 @@ export class PostgresCompanyDatabase {
                 for (const row of await this.rows(namespace, kind, where, params))
                     (state[kind] as Record<string, unknown>)[row.id] = JSON.parse(row.body);
             };
-            if (state.version === 3) {
+            if (state.version === 3 || state.version === 4) {
                 for (const kind of kinds) await find(kind, '');
                 const before = structuredClone(state);
                 upgradeIssuerState(state);
@@ -204,7 +204,7 @@ export class PostgresCompanyDatabase {
                 await this.put(namespace, 'issuer_meta', 'meta', { version: state.version, generation: state.generation, nonces: state.nonces });
                 for (const kind of kinds) state[kind] = {};
             }
-            if (state.version !== 4) throw new Error('unsupported issuer state version');
+            if (state.version !== 5) throw new Error('unsupported issuer state version');
             if ((selection.kind === 'token' || selection.kind === 'sign_in') && selection.sessionKey) {
                 await get('sessionKeys', selection.sessionKey);
                 await get('sessions', state.sessionKeys[selection.sessionKey]);
