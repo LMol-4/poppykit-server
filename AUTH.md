@@ -1,126 +1,120 @@
 # Company authentication
 
-Integrating an existing issuer uses the core `ExternalAuthorityAdapter` and
-`createRequestAuthenticator`. It does not import, run, or persist the optional
-reference issuer. The host must describe its issuer's revocation visibility and
-order authorization checks with protected work. The reference issuer is a
-separate `/reference-auth` import and uses the shared company database coordinator
-for immediate revocation visibility.
+Resources own Poppy Sessions; OAuth issuers supply account grants. An existing
+issuer implements `ExternalAuthorityAdapter` (introspection and current/accepted
+authority policy) without importing the optional reference issuer. Its introspector
+must validate exact resource audience, expiry, client/account identity, scope and
+DPoP binding, and document revocation visibility and ordering with protected work.
 
-For draft 0.3 discovery configure `protectedResources`, including
-`https://company.example` (host only, no port/path/trailing slash), and
-`supportedScopes`, the company-defined account scopes. This replaces
-`poppyDomains` and `directScopes` in reference issuer options. Direct and Device
-use that same supported list; Device configuration no longer has a `scopes` field.
-Mediated retains its own subset. Publish descriptions in company `auth.scopes` or
-a listed OpenAPI document. Names starting with `poppy:` are reserved. Issuer
-metadata emits the mandatory session/refresh grants and enabled sign-in grants.
-Token exchange for Bearer-only MCP remains a later migration stage.
+Create a separate resource Session authority and use its combined policy:
 
-Reference Direct sign-in uses `beginAuthorization` / `completeAuthorization`.
-The host authenticates the human and protects consent with its own browser
-session/CSRF controls; pass a high-entropy browser binding. Registered callback
-URLs must be HTTPS on the client metadata domain, or RFC 8252 HTTP loopback IP
-callbacks (`127.0.0.1` or `[::1]`). Registration matching permits only the loopback
-port to vary; exchange must repeat the actual authorization redirect exactly.
-Direct requests require `dpop_jkt`; codes retain it and exchange requires that
-Session Key. Missing bindings in old pending authorizations/codes fail closed.
+```ts
+const sessions = createSessionAuthority({
+  companyId, metadata, store: database.sessions(companyId), coordinator: database,
+  accountPolicy: externalAuthority?.policy, now: Date.now,
+  maxSessionsPerClient: 10000, lifetimeSeconds: 86400,
+});
+const authenticator = createRequestAuthenticator({
+  sessions, authority: externalAuthority, now: Date.now,
+  endpoints: [{ origin: 'https://api.company.example', pathPrefix: '/conversations' }],
+});
+// Pass authenticator and sessions.policy to conversation/browser/feedback handlers.
+```
 
-Direct hosts must configure `authorizationResultCipher: { seal, open }` with
-synchronous authenticated encryption and a durable protected key before calling
-`beginAuthorization`. Hosts already using the optional client provider can reuse
-its `createResultCipher` instance. Other hosts supply the same structural contract;
-no client package or database driver is loaded by the reference issuer.
+`companyId` is the verified issuer, or the Company's HTTPS domain without a slash
+when issuerless. Signed-out Sessions require no authorization server or token.
+The authenticator verifies the delegated ES256 Session JWT before using any of its
+identity, audience, method/URL, token hash or continuity claims. Delegations accept
+ES256 and PS384 root signatures, require a public P-256 delegated key and expire
+within 24 hours. A root-signed Session JWT without delegation is rejected.
+Client metadata fetches refuse redirects; hosts keep the supplied safe transport's
+TLS/address and bounded-fetch checks. Operator signatures never replace these checks.
 
-`completeAuthorization(id, browserBinding, decision)` commits one decision and
-an encrypted callback receipt atomically. Repeating the same decision returns
-the same URL after restart; changed browser/account/scopes/decision and stale
-account revocation/reset fail. Approval recovery expires at the earlier of the
-original authorization deadline and code expiry; denial uses the original deadline.
-Recovery never mints a replacement code or extends consent. The host must retain
-its authenticated owner/installation/session binding and chosen decision durably,
-then reconcile delivery outside transactions. Never retry an uncertain code exchange.
+Sessions are keyed by exact client_id plus sid; User and optional Agent IDs cannot
+change. Delegated keys can change on every request. Account grants and proof keys
+do not identify Sessions. The resource remembers a previously used account and
+returns invalid_session on account change. A request without an access token is
+signed out, even when the Session used an account before. One account grant can
+serve many Sessions. Introspection alone never establishes a Poppy User or sid.
 
-`withCurrent` checks token, Session and grant expiry immediately before protected
-actions, including after body reads and long-poll waits. Streams close at token
-expiry and recheck current authority for each emitted frame; reconnect with fresh
-authentication. `withAccepted` intentionally ignores admission-token expiry while
-preserving the accepted scope ceiling, reset generation and configured revocation policy.
+Session lifetime defaults to one day, admission to 10,000 active Sessions per client.
+Bundled stores serialize quota counts and creation across processes; overflow is
+429 with Retry-After until the earliest expiry. Ended/expired Sessions do not occupy
+admission slots. Call bounded database cleanup for expired Session records; the
+Company may forget ended Sessions under core 5.5. Recreated records get a fresh
+instanceId, exposed as Principal.sessionInstanceId, so future ownership contracts
+can distinguish them. Configure this cap on createSessionAuthority: passing the
+old maxSessionsPerClient option to createReferenceIssuer fails with a relocation error.
 
-Account Token rotation retains all issued hashes through the fixed grant lifetime.
-Replaying any ancestor revokes its entire lineage and signs its Sessions out;
-rotation never extends the grant. Client authentication remains mandatory, while
-Account Tokens can start Sessions with new keys; a Session never changes its key. Shared provider
-signing does not bind a copied refresh token to one provider enrollment. Keep
-tokens secret and serialize rotation; never retry a lost token response blindly.
-Bounded database cleanup removes hashes only after their lineage is expired,
-revoked or absent. No plaintext callback code is persisted.
+`withCurrent` checks current Session instance/generation, validity, accepted scopes
+and live account policy immediately before protected work. `withAccepted` preserves
+the accepted scope ceiling and explicit work-revocation policy while allowing an
+admission token to expire. A database coordinator orders authorization with writes;
+a process mutex alone is insufficient across replicas. External effects still need
+host idempotency and reconciliation. Operations v2 is not yet implemented or advertised.
 
-Pre-version-3 upgrade prerequisite: older issuers discarded ancestors beyond the previous hash.
-Those missing hashes cannot be reconstructed by this update. Before public
-enablement, revoke every pre-upgrade live lineage through the issuer's normal
-revocation/disconnect flow and require fresh consent, or prove it has expired.
-Until then, the full-ancestor guarantee applies only to newly created lineages.
-This update does not reset stored data or silently revoke legacy grants.
+Authority errors expose response(): invalid_session is JSON/400; missing account
+authority is an errorless Bearer/DPoP challenge/401 with scope; insufficient_scope
+is 403, invalid_token is 401. Rate limits are JSON/429 with Retry-After. MCP helpers
+include resource_metadata in OAuth challenges; see [INTEGRATIONS.md](INTEGRATIONS.md).
 
-Enable reference Device sign-in with `device: { endpoint, verificationUri,
-}`. Route the configured device endpoint to `deviceAuthorization`.
-On the human page call `beginDeviceAuthorization(userCode, browserBinding)` and
-show the client identity and requested scopes. After an authenticated explicit
-approve/decline action call `completeDeviceAuthorization`. Opening a link must
-never approve it. The token endpoint handles durable polling intervals, slowdown,
-denial, expiry, partial consent, one-use codes and the Session's sticky account.
-The first authenticated poll atomically binds the device code to its live Session
-Key, including pending/slow-down polls. Other keys receive `invalid_grant`.
-Old device records without the new binding slot require a fresh flow. Prefer
-Direct whenever viable; enable Device only for appropriate device constraints
-under RFC 10027. Verification links remain HTTPS on issuer/protected-resource hosts.
+## Optional reference issuer
 
-Hosted consent can resolve `sessionForKey({ clientId, userId, sessionKey })` to the
-current company Session without treating a client's local Session ID as a server
-ID. It validates live client/User ownership and returns current account/scopes.
+Configure protectedResources with the Company domain identifier (no path, port or
+slash) and supportedScopes. The issuer publishes refresh_token plus enabled
+Direct/Device/Mediated grants; it does not issue signed-out Session tokens or
+advertise token exchange. Scope names, including poppy-prefixed ones, are Company
+policy; publish descriptions and optional hints. Resource-specific tokens use normal
+sign-in/refresh with resource. Configure exact MCP resources and their DPoP policy.
+The reference issuer chooses DPoP for its other account resources; an external issuer
+can also supply Bearer grants through the core authenticator.
 
-Enable Mediated sign-in with `mediated: { endpoint, scopes, fields,
-authenticate, verifyCode }` and route that endpoint and its sign-in-ID children
-to `mediatedSignIn`. The SDK authenticates the Session Token and DPoP proof,
-validates declared fields, counts attempts before calling the host backend,
-and binds challenges to the initiating client, UserID and Session. The host
-verifies credentials in `authenticate` and may return an account plus a narrower
-scope list. It may instead return a challenge handle and safe delivery hint,
-then verify codes using `verifyCode`. Host hooks must not log or retain credentials
-and must enforce their own backend security and OTP delivery/verification.
+Direct uses beginAuthorization/completeAuthorization. The host authenticates the
+human, protects consent/CSRF and supplies a high-entropy browser binding. Registered
+redirects must be HTTPS on the client metadata domain or RFC 8252 loopback IP URLs;
+only a loopback port can vary. PKCE and exact issuer response validation remain
+required. OAuth dpop_jkt optionally binds the code to a proof key; it is not a Session.
+Missing binding fields in legacy pending codes fail closed.
 
-Credentials and codes exist only during the trusted handler call; the SDK clears
-input objects on exit, stores no passwords/codes and never includes them in
-responses. Backend errors return a safe unavailable code. Pending remote hooks
-are not automatically repeated after interruption. An operation left verifying
-expires; the user can explicitly start another sign-in subject to attempt limits.
+Direct also requires a synchronous authenticated authorizationResultCipher with a
+durable protected key. Complete consent and an encrypted callback receipt commit
+atomically. An identical decision recovers the same URL through its original validity
+window; changed decisions, owners, revocation or expiry fail. Recovery never issues
+a replacement code, extends consent or retries an uncertain token exchange.
 
-Defaults are five credential attempts per Session per minute, 100 per client per
-minute, five code attempts per challenge, and ten-minute sign-in expiry. Configure
-limits for your service and apply network-level limits before authentication.
-SQLite persists attempt windows and bounded tombstones; `cleanup` removes sign-in
-records only after their original expiry plus 30 seconds. A failed/expired code
-continues returning the same terminal status through that retained window.
+Device configuration supplies endpoint and verificationUri. Serve deviceAuthorization
+at that endpoint. The human page uses beginDeviceAuthorization then an explicit,
+authenticated completeDeviceAuthorization decision. Opening a link does not approve.
+Polling enforces pending/slowdown/denial/expiry and one-use codes, bound to client_id
+rather than a Session or first polling key. Apply RFC 10027 risk controls in the host;
+prefer Direct when it fits the device. Keep device codes private.
 
-Each pending request captures a client revision. Account disconnect increments
-the revision and records that account's fence; later credential/consent results
-for that account cannot undo disconnect. Requests for other accounts sharing the
-same personal-agent client continue. A fresh explicit sign-in captures the new
-revision. Revision and per-account fence records remain until explicit issuer
-reset and never count as pending requests. Terminal method tombstones also do
-not consume pending quota.
+Mediated configuration supplies fields, scopes, authenticate and verifyCode. Advertise
+`mediated-sign-in` version 1 and route the form grant at the normal token endpoint.
+The credentials/code never arrive with a Session JWT or account token. Client-bound
+continuations preserve the original scopes/resource/expiry. A code challenge is
+HTTP400 code_required with sign_in_id, sent_to and expires_in; continuation uses
+one_time_code without repeating credentials/scope. Hooks receive {issuer,clientId},
+not Session identity, and must enforce backend/account/network throttles. Input
+objects are cleared on exit; never log or retain credentials or OTPs.
 
-Issuer state is version 4. SQLite/PostgreSQL upgrade normalized version 3 under
-their writer lock; grant lineage survives. Earlier unsupported development versions
-still fail closed. See [STORAGE.md](STORAGE.md) for the exact upgrade behavior.
+An interrupted/throwing remote hook remains verifying, is never automatically
+repeated and survives expiry/cleanup for host reconciliation. It continues counting
+toward pending limits. No expiry timer proves a remote action failed. Defaults are
+five credential attempts per client per minute, five code attempts per challenge,
+1000 pending requests globally and 100 per client; apply network limits before auth.
+Client/account revision fences prevent late consent from undoing disconnect.
 
-Token admission selects an internal Session ID atomically by the DPoP thumbprint.
-It checks the client, User and optional assertion `agent_id` against the existing
-Session. Known ended keys return `invalid_grant`; key mappings/tombstones are
-retained indefinitely in this reference implementation. Token requests reject the
-old `session_id` parameter; responses omit `session_id` and `signed_in`.
+Refresh grants have a fixed lifetime; rotation never extends it. Retain every
+ancestor hash through that lifetime so replay revokes the lineage. Client assertions
+remain mandatory, independently of Sessions and proof-key rotation. Revocation
+signs resources out according to live account policy without deleting Sessions.
 
-Advertise only configured methods in your `poppy.json`; `authorizationMetadata()`
-adds the device endpoint only when enabled. There is no login/consent UI, identity
-provider, CLI or application workflow in this package.
+Issuer record versions 3/4 upgrade to 5 under their writer lock, retaining generation,
+Sessions/maps, grants/ancestor hashes, pending consent, uncertain hooks, replay,
+nonces and encrypted recovery receipts. Only proven client/account associations
+are backfilled. Unknown/conflicting legacy records are not reinterpreted. The retired browserSessions/sessionForKey and separate mediatedSignIn entry points
+are removed. Browser joining uses resource Sessions and fixed approval snapshots;
+mediated grants use token(). Retained legacy records remain available through
+explicit storage reads for reconciliation.
+See [STORAGE.md](STORAGE.md). Earlier unsupported versions fail closed.

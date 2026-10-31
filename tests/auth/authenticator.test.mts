@@ -1,4 +1,4 @@
-import type {ResourceEndpoint,ExternalAuthorityAdapter} from '../../dist/auth/authority.js';
+import type {Principal,ResourceEndpoint,ExternalAuthorityAdapter} from '../../dist/auth/authority.js';
 import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,17 +7,19 @@ import { createRequestAuthenticator, AuthorityError } from '../../dist/index.js'
 import { NOW, keyPair, proof } from './support.mjs';
 
 const ENDPOINT = 'https://api.shop.test/poppy/conversations';
-const TOKEN = 'opaque-session-token';
-const principal = { issuer: 'https://auth.shop.test', clientId: 'https://agent.test/agent.json', userId: 'usr_1', sessionId: 'ses_1', scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1 };
+const TOKEN = 'opaque-account-token';
+const principal: Principal = { issuer: 'https://auth.shop.test', clientId: 'https://agent.test/agent.json', userId: 'usr_1', sessionId: 'ses_1', accountId: 'account', grantId: 'grant', scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1 };
 
 async function setup({ endpoints = [{ origin: 'https://api.shop.test', pathPrefix: '/poppy' }], expiresAt = principal.tokenExpiresAt }:{endpoints?:ResourceEndpoint[];expiresAt?:number} = {}) {
   const key = await keyPair(); const jkt = await calculateJwkThumbprint(key.jwk); const calls:{token:string;resource?:string}[] = [];
   const authority:Pick<ExternalAuthorityAdapter,'introspect'> = { async introspect(token, resource) { calls.push({ token, resource }); if (token !== TOKEN) throw new AuthorityError('invalid_token'); return { principal: { ...principal, tokenExpiresAt: expiresAt }, dpopJkt: jkt }; } };
-  return { key, calls, authenticator: createRequestAuthenticator({ authority, endpoints, now: () => NOW }) };
+  // This unit fixture isolates OAuth/DPoP; delegated Session verification is covered by session.test.mts.
+  const sessions = { async authenticate(_request: Request, account?: { principal: Principal }) { if (!account) throw new AuthorityError('invalid_session'); return account.principal; }, async end() {}, policy: { async withCurrent<T>(_principal: Principal, _scopes: readonly string[], action: () => Promise<T>) { return action(); }, async withAccepted<T>(_accepted: unknown, _scopes: readonly string[], action: () => Promise<T>) { return action(); } } };
+  return { key, calls, authenticator: createRequestAuthenticator({ authority, sessions, endpoints, now: () => NOW }) };
 }
 const request = (url:string,headers:HeadersInit, method = 'POST') => new Request(url, { method, headers });
-async function rejects(promise:Promise<unknown>,code:string) {
-  await assert.rejects(promise, error => error instanceof AuthorityError && error.code === code && expectValue(error.headers.get('www-authenticate')).startsWith(`DPoP error="${code}"`) && !expectValue(error.headers.get('www-authenticate')).includes(TOKEN));
+async function rejects(promise: Promise<unknown>, code: string) {
+  await assert.rejects(promise, error => error instanceof AuthorityError && error.code === code && (code === 'invalid_session' ? error.status === 400 : expectValue(error.headers.get('www-authenticate')).startsWith(`DPoP error="${code}"`) && !expectValue(error.headers.get('www-authenticate')).includes(TOKEN)));
 }
 
 test('accepts a DPoP-bound token at a configured endpoint and passes the endpoint resource', async () => {
@@ -31,13 +33,13 @@ test('accepts a DPoP-bound token at a configured endpoint and passes the endpoin
 
 test('rejects missing, Bearer, query and duplicated credentials as invalid_token', async () => {
   const { key, authenticator, calls } = await setup(); const dpop = await proof(key, { htu: ENDPOINT, token: TOKEN });
-  await rejects(authenticator.authenticate(request(ENDPOINT, { dpop })), 'invalid_token');
+  await rejects(authenticator.authenticate(request(ENDPOINT, { dpop })), 'invalid_session');
   await rejects(authenticator.authenticate(request(ENDPOINT, { authorization: `Bearer ${TOKEN}`, dpop })), 'invalid_token');
-  await rejects(authenticator.authenticate(request(`${ENDPOINT}?access_token=${TOKEN}`, { dpop, cookie: `token=${TOKEN}` })), 'invalid_token');
+  await rejects(authenticator.authenticate(request(`${ENDPOINT}?access_token=${TOKEN}`, { dpop, cookie: `token=${TOKEN}` })), 'invalid_session');
   const twice = new Headers({ dpop }); twice.append('authorization', `DPoP ${TOKEN}`); twice.append('authorization', `DPoP ${TOKEN}`);
   await rejects(authenticator.authenticate(new Request(ENDPOINT, { method: 'POST', headers: twice })), 'invalid_token');
-  assert.equal(calls.length, 0);
-  const error = await authenticator.authenticate(request(ENDPOINT, {})).catch(e => e); assert.equal(error.status, 401);
+  assert.equal(calls.length, 1, 'Bearer proof-bound tokens are rejected after introspection');
+  const error = await authenticator.authenticate(request(ENDPOINT, {})).catch(e => e); assert.equal(error.status, 400);
 });
 
 test('rejects unknown or expired tokens from the authority', async () => {
@@ -89,7 +91,8 @@ test('each DPoP proof defect is rejected as invalid_dpop_proof', async () => {
 
 test('AuthorityError maps codes to status and quoted challenge', () => {
   const error = new AuthorityError('insufficient_scope', { scope: 'orders:read orders:write' });
-  assert.equal(error.status, 403); assert.equal(error.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256"');
-  assert.equal(new AuthorityError('sign_in_required').status, 403);
+  assert.equal(error.status, 403); assert.equal(error.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256", Bearer error="insufficient_scope", scope="orders:read orders:write"');
+  assert.equal(new AuthorityError('account_required').status, 401);
+  assert.equal(new AuthorityError('account_required', { scope: 'read' }).headers.get('www-authenticate'), 'Bearer scope="read", DPoP scope="read"');
   assert.throws(() => new AuthorityError('insufficient_scope', { scope: 'a" b' }));
 });

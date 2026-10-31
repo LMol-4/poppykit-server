@@ -96,3 +96,15 @@ coverage/
 /scripts/postgres-ci.mjs.map
 /test-support/result-cipher.mjs
 /test-support/result-cipher.mjs.map
+
+/tests/auth/session.test.mjs
+/tests/auth/session.test.mjs.map
+
+/tests/auth/account-grants.test.mjs
+/tests/auth/account-grants.test.mjs.map
+
+/tests/browser.test.mjs
+/tests/browser.test.mjs.map
+
+/tests/session-adapter-contract.test.mjs
+/tests/session-adapter-contract.test.mjs.map

@@ -37,7 +37,7 @@ test('draft 0.3 refuses old conversation namespaces until an explicit data reset
   assert.equal((await db.conversations('fresh').read({})).version,2);
 });
 
-test('Session Key upgrade preserves grant lineage and internal IDs; independent writers create one Session', async t => {
+test('OAuth upgrade preserves active lineage and independent writers serialize refresh rotation', async t => {
   const path = await fixture(), namespace = path + ':upgrade';
   const env = await issuerSetup({ requireDpopNonce: false });
   const jkt = await calculateJwkThumbprint(env.dpopKey.jwk), hash = (s: string) => createHash('sha256').update(s).digest('base64url');
@@ -53,23 +53,25 @@ test('Session Key upgrade preserves grant lineage and internal IDs; independent 
   const a = database(path), b = database(path); t.after(() => { a.close(); b.close(); });
   const make = (db: ReturnType<typeof database>) => createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/oauth/token`, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'], supportedScopes: ['orders:read'], metadata: env.metadata, now: () => env.clock.now, requireDpopNonce: false, coordinator: db, store: db.issuer('upgrade') });
   const one = make(a), two = make(b), state = await a.issuer('upgrade').read({ kind: 'principal', sessionId: 'old', grantId: 'grant' });
-  assert.equal(state.version, 4); assert.equal(state.sessions.old.accountId, 'account'); assert.equal(state.sessions.old.expiresAt, 0);
+  assert.equal(state.version, 5); assert.equal(state.sessions.old.accountId, 'account'); assert.equal(state.sessions.old.expiresAt, legacy.sessions.old.expiresAt);
   assert.equal(state.grants.grant.refreshHash, hash('old-account-token'));
-  await assert.rejects(one.authority.introspect('old-access-token'), { code: 'invalid_token' });
+  assert.equal((await one.authority.introspect('old-access-token')).principal.accountId, 'account');
+  await assert.rejects(one.authority.introspect('other-old-token'), {code:'invalid_token'});
   const send = async (issuer: typeof one, key = env.dpopKey, refresh?: string) => {
-    const body = new URLSearchParams({ client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...(refresh ? { grant_type: 'refresh_token', refresh_token: refresh } : { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: await env.assertion() }) });
+    const body = new URLSearchParams({ client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), grant_type: 'refresh_token', refresh_token: expectValue(refresh) });
     return issuer.token(new Request(`${ISSUER}/oauth/token`, { method: 'POST', body, headers: { dpop: await env.proof({ key }) } }));
   };
-  assert.deepEqual(await (await send(one)).json(), { error: 'invalid_grant' });
-  const key = await keyPair(), responses = await Promise.all([send(one, key), send(two, key)]);
-  const principals = await Promise.all(responses.map(async r => { assert.equal(r.status, 200); const token = await r.json(); assert.equal('session_id' in token, false); return (await one.authority.introspect(token.access_token)).principal; }));
-  assert.equal(principals[0].sessionId, principals[1].sessionId);
-  const signed = await send(two, key, 'old-account-token'); assert.equal(signed.status, 200);
-  const token = await signed.json(), principal = (await one.authority.introspect(token.access_token)).principal;
-  assert.deepEqual([principal.userId, principal.accountId, principal.grantId, principal.sessionId], ['usr_1', 'account', 'grant', principals[0].sessionId]);
-  const reopened = database(path); t.after(() => reopened.close());
-  assert.equal((await make(reopened).authority.introspect(token.access_token)).principal.sessionId, principal.sessionId);
-  assert.equal(Number((await pool!.query("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='sessionKeys'", [namespace])).rows[0].n), 2);
+  const key=await keyPair(),signed=await send(two,key,'old-account-token');assert.equal(signed.status,200);
+  const token=await signed.json(),principal=(await one.authority.introspect(token.access_token)).principal;
+  assert.deepEqual([principal.userId,principal.accountId,principal.grantId,principal.sessionId],['','account','grant','']);
+  const reopened=database(path);t.after(()=>reopened.close());
+  assert.deepEqual((await make(reopened).authority.introspect(token.access_token)).principal,principal);
+  const responses=await Promise.all([send(one,key,token.refresh_token),send(two,key,token.refresh_token)]);
+  assert.deepEqual(responses.map(r=>r.status).sort(),[200,400]);
+  const winner=expectValue(responses.find(r=>r.status===200)),credential=await winner.json();
+  await assert.rejects(one.authority.introspect(credential.access_token),{code:'invalid_token'});
+  assert.equal(Number((await pool!.query("SELECT count(*) AS n FROM poppy_server.records WHERE ns=$1 AND kind='sessionKeys'",[namespace])).rows[0].n),0);
+
 });
 
 interface Packets {accept:{receipt:ConversationState};'after-commit':{receipt:ConversationState};'before-commit':{ready:true};effect:{work:WorkRef};'effect-contract':{work:WorkRef;result:string};rotate:{status:number;error?:string};revoke:{status:number;error?:string}}
@@ -209,7 +211,6 @@ test('bounded Postgres cleanup isolates namespaces and retains grants, work, rec
 test('durable issuer rotates and revokes atomically; authority and conversation mutation share one transaction', async t => {
   const path = await fixture(), db = database(path); t.after(() => db.close());
   const env = await issuerSetup({ store: db.issuer(ISSUER), coordinator: db, requireDpopNonce: false });
-  const start = await env.send(); assert.equal(start.status, 200);
   const verifier = 'v'.repeat(43), url = new URL(ISSUER + '/authorize');
   const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: 'state', code_challenge_method: 'S256', dpop_jkt: await calculateJwkThumbprint(env.dpopKey.jwk), code_challenge: createHash('sha256').update(verifier).digest('base64url') };
   for (const [name, value] of Object.entries(fields)) url.searchParams.set(name, value);
@@ -219,7 +220,7 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   assert.equal(signed.status, 200, JSON.stringify(signed.body));
   const { principal } = await env.issuer.authority.introspect(expectValue(signed.body.access_token));
   const rotation = worker(t, 'rotate', path), revocation = worker(t, 'revoke', path);
-  const input = { refreshToken: signed.body.refresh_token, sessionId:expectValue(start.sessionId) };
+  const input = { refreshToken: signed.body.refresh_token };
   rotation.child.send(input); revocation.child.send(input);
   const [rotatedResult, revokedResult] = await Promise.all([rotation.message, revocation.message]);
   await Promise.all([rotation.exited, revocation.exited]);
@@ -242,5 +243,5 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   await assert.rejects(env.issuer.authority.policy.withCurrent(currentPrincipal, [], async () => { throw new Error('must not run'); }), { code: 'invalid_token' });
   const rotated = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: signed.body.refresh_token });
   assert.equal(rotated.body.error, 'invalid_grant');
-  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:expectValue(start.sessionId) })).sessions, {});
+  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:'' })).sessions, {});
 });

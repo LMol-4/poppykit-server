@@ -72,7 +72,8 @@ test('Direct Conversation: parent must exist, belong to the caller and be open',
   for (const as of ['bob', 'otherClient']) assert.deepEqual((await t.direct(parent, human('msg_x'), { as })).body, { error: 'conversation_not_found' });
   assert.deepEqual((await t.direct('cnv_unknown', human('msg_x'))).body, { error: 'conversation_not_found' });
   t.store.set(state => { state.bindings[parent].accountId = 'acct_1'; });
-  assert.deepEqual((await t.direct(parent, human('msg_x'))).body, { error: 'insufficient_scope' });
+  const signedOut = await t.direct(parent, human('msg_x'));
+  assert.deepEqual([signedOut.status, signedOut.body], [401, {}]);
   assert.equal((await t.direct(parent, human('msg_x'), { as: 'carolSameAccount' })).status, 201, 'bound: same account through the same client is the owner');
   const closedParent = (await t.start({ ...hello, id: 'msg_2' })).body.conversation_id;
   await t.close(closedParent);
@@ -123,7 +124,8 @@ test('handoff and close routes check ownership like every other route', async ()
   }
   t.store.set(state => { state.bindings[id].accountId = 'acct_1'; });
   for (const action of ['handoff', 'close'] as const) {
-    assert.deepEqual((await t[action](id)).body, { error: 'insufficient_scope' });
+    const signedOut = await t[action](id);
+    assert.deepEqual([signedOut.status, signedOut.body], [401, {}]);
     assert.deepEqual((await t[action](id, { as: 'bobOtherAccount' })).body, { error: 'conversation_not_found' });
   }
   assert.equal((await t.store.read()).conversations[id].status, 'working', 'nothing changed');

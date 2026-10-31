@@ -15,7 +15,7 @@ const store = db.conversations(prefix + 'test');
 const t = setup({ store, leaseMs: 1 });
 const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 if (mode === 'rotate' || mode === 'revoke') {
-  const input:unknown=await new Promise(resolve=>process.once('message',resolve));assert.ok(input&&typeof input==='object'&&'refreshToken' in input&&typeof input.refreshToken==='string'&&'sessionId' in input&&typeof input.sessionId==='string');
+  const input:unknown=await new Promise(resolve=>process.once('message',resolve));assert.ok(input&&typeof input==='object'&&'refreshToken' in input&&typeof input.refreshToken==='string');
   const env = await issuerSetup({ store: db.issuer(prefix + ISSUER), coordinator: db, requireDpopNonce: false });
   if (mode === 'rotate') {
     const result = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: input.refreshToken });

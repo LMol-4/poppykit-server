@@ -1,32 +1,33 @@
 # Contributing
 
-Follow the pinned draft 0.3 [specification](https://personalagentprotocol.org/docs/0.3/spec)
+Follow the live draft 0.3 [specification](https://personalagentprotocol.org/docs/0.3/spec)
 and [guides](https://personalagentprotocol.org/docs/0.3/guides). Tests/snapshots are
-supporting evidence. This unreleased checkout has completed only the discovery
-stage of migration; auth, wire/storage and integrations still need their stages.
-Demo/business workflows and individual extensions are excluded.
+supporting evidence. Core protocol and Mediated Sign-In v1 are in scope. Operations v2
+is required in the next migration block and is not implemented or advertised here.
+Application business workflows remain host responsibilities. Source fingerprints and
+recommendation boundaries are in [CONFORMANCE.md](CONFORMANCE.md).
 Code is [MIT](LICENSE); confirm rights for third-party contributions.
 
 Use Node 24.21.0, TypeScript 5.9.3 and @types/node 24.10.0.
 Install the packageManager-pinned pnpm and run pnpm install --frozen-lockfile --ignore-scripts.
 
 ```sh
-npm run typecheck
-npm run build
-npm run typecheck:tests
-npm test
-npm run check:docs
+pnpm run typecheck
+pnpm run build
+pnpm run typecheck:tests
+pnpm test
+pnpm run check:docs
 ```
 
 First-party tests/workers/verification helpers are canonical `.mts`. The existing
 compiler checks the whole strict program before emitting ignored adjacent `.mjs`.
 Failed builds remove stale outputs; no loader/type stripping substitutes for checking.
-Run `npm run build:tests` before `node scripts/run-checks.mjs GROUP` (unit, contracts,
+Run `pnpm run build:tests` before `node scripts/run-checks.mjs GROUP` (unit, contracts,
 integration, validation). Groups are exhaustive/disjoint. LF source bytes are enforced
 by Git attributes. Generated test code is outside the npm allowlist; production tests
 import built/installed JavaScript. Release/build tools and examples may remain JS.
 
-`npm run coverage` builds production and checked tests, then writes native Node
+`pnpm run coverage` builds production and checked tests, then writes native Node
 line/branch/function reports under `coverage/` (summary.txt, lcov.info, report.json,
 raw/). Metrics cover loaded first-party dist JS: no production source maps or TS
 remapping; node_modules excluded, unloaded modules listed. Raw subprocess reports

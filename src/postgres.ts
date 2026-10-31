@@ -1,3 +1,6 @@
+import type { BrowserBinding, BrowserCookieStore, BrowserJoin } from './browser.js';
+import { randomUUID } from 'node:crypto';
+import type { SessionRecord, SessionState, SessionAdmission, SessionStore } from './auth/session.js';
 import type { Pool } from 'pg';
 import { initialConversationState } from './conversation/service.js';
 import type { ConversationStoreState, ConversationRecord } from './conversation/service.js';
@@ -180,7 +183,50 @@ export class PostgresCompanyDatabase {
             })),
         };
     }
-    issuer(namespace: string): IssuerStore {
+
+
+  browserCookies(namespace: string): BrowserCookieStore {
+    const lock=(hash:string)=>this.db.lock(JSON.stringify([namespace,'browser_join',hash]));
+    return {
+      put: (hash,binding) => this.run(() => this.put(namespace,'browser_cookies',hash,binding)),
+      get: hash => this.run(async () => await this.one<BrowserBinding & {expiresAt:number}>(namespace,'browser_cookies',hash) ?? null),
+      remove: hash => this.run(async () => { await this.sqlRun('DELETE FROM poppy_server.records WHERE ns=$1 AND kind=$2 AND id=$3',[namespace,'browser_cookies',hash]); }),
+      putJoin: (hash,binding) => this.run(async () => { await lock(hash);await this.put(namespace,'browser_joins',hash,binding); }),
+      authorizeJoin: (hash,principal,at) => this.run(async () => {
+        await lock(hash);const row=await this.one<BrowserJoin>(namespace,'browser_joins',hash);
+        if(!row||row.expiresAt<=at||row.principal)return false;
+        row.principal=structuredClone(principal);await this.put(namespace,'browser_joins',hash,row);return true;
+      }),
+      consumeJoin: hash => this.run(async () => {
+        await lock(hash);const row=await this.one<BrowserJoin>(namespace,'browser_joins',hash);
+        if(row)await this.sqlRun('DELETE FROM poppy_server.records WHERE ns=$1 AND kind=$2 AND id=$3',[namespace,'browser_joins',hash]);
+        return row ?? null;
+      }),
+    };
+  }
+  sessions(namespace: string): SessionStore {
+    const load = async (clientId: string, sid: string): Promise<SessionState> => {
+      await this.db.lock(JSON.stringify([namespace, 'resource_session_client', clientId]));
+      await this.db.lock(JSON.stringify([namespace, 'resource_session', clientId, sid]));
+      const meta = await this.meta(namespace, 'session_meta', () => ({ version: 1 as const, generation: randomUUID() }));
+      if (meta.version !== 1) throw new Error('unsupported Session state version');
+      return { ...meta, record: await this.one<SessionRecord>(namespace, 'resource_sessions', JSON.stringify([clientId, sid])) ?? null };
+    };
+    return {
+      read: (clientId, sid) => this.run(() => load(clientId, sid)),
+      transaction: (clientId, sid, at, change) => this.run(async () => this.atomic(async () => {
+        if (!Number.isFinite(at)) throw new TypeError('Session clock');
+        const snapshot = await load(clientId, sid);
+        const counts = (await this.sqlGet("SELECT count(*) AS n,min((body::jsonb->>'expiresAt')::double precision) AS expiry FROM poppy_server.records WHERE ns=$1 AND kind='resource_sessions' AND body::jsonb->>'clientId'=$2 AND body::jsonb->>'ended'='false' AND (body::jsonb->>'expiresAt')::double precision>$3", [namespace, clientId, at]))!;
+        const state: SessionAdmission = { ...snapshot, activeCount: Number(counts.n), earliestExpiry: counts.expiry === null ? null : Number(counts.expiry) }, generation = state.generation, result = change(state);
+        if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('async Session transaction');
+        if (state.version !== 1 || state.generation !== generation || (state.record && (state.record.clientId !== clientId || state.record.sid !== sid))) throw new TypeError('Session state binding');
+        if (state.record) await this.put(namespace, 'resource_sessions', JSON.stringify([clientId, sid]), state.record);
+        return structuredClone(result);
+      })),
+    };
+  }
+  issuer(namespace: string): IssuerStore {
         const kinds = ['sessions', 'sessionKeys', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
         const load = async (selection: IssuerSelection): Promise<IssuerState> => {
             await this.db.lock(JSON.stringify([namespace, 'issuer']));
@@ -218,7 +264,7 @@ export class PostgresCompanyDatabase {
                 await get('accessTokens', selection.accessHash);
                 for (const key of selection.replayKeys)
                     await get('replay', key);
-                const counts = (await this.sqlGet("SELECT count(*) AS n, sum(CASE WHEN (body::jsonb#>>'{clientId}')=$1 THEN 1 ELSE 0 END) AS client FROM poppy_server.records WHERE ns=$2 AND kind='signIns' AND (body::jsonb#>>'{status}') IN ('pending','approved','verifying') AND ((body::jsonb#>>'{expiresAt}')::double precision)>$3", [selection.clientId ?? '', namespace, selection.at]))!;
+                const counts = (await this.sqlGet("SELECT count(*) AS n, sum(CASE WHEN (body::jsonb#>>'{clientId}')=$1 THEN 1 ELSE 0 END) AS client FROM poppy_server.records WHERE ns=$2 AND kind='signIns' AND (body::jsonb#>>'{status}') IN ('pending','approved','verifying') AND ((body::jsonb#>>'{status}')='verifying' OR ((body::jsonb#>>'{expiresAt}')::double precision)>$3)", [selection.clientId ?? '', namespace, selection.at]))!;
                 state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(counts.n), pendingForClient: Number(counts.client ?? 0) };
             }
             if (selection.kind === 'principal') {
@@ -303,7 +349,7 @@ export class PostgresCompanyDatabase {
         return this.run(async () => {
             await this.db.lock(JSON.stringify([namespace, 'issuer']));
             const rows = await this.sqlAll(`SELECT kind,id FROM poppy_server.records AS retained WHERE ns=$1 AND
-        ((kind IN ('authorizations','codes','accessTokens') AND ((body::jsonb#>>'{expiresAt}')::double precision)<=$2) OR (kind='signIns' AND ((body::jsonb#>>'{expiresAt}')::double precision)+30000<$3) OR (kind='replay' AND (body::jsonb#>>'{}')::double precision<$4)
+        ((kind IN ('authorizations','codes','accessTokens','browser_cookies','browser_joins','resource_sessions') AND ((body::jsonb#>>'{expiresAt}')::double precision)<=$2) OR (kind='signIns' AND coalesce(body::jsonb->>'status','')!='verifying' AND ((body::jsonb#>>'{expiresAt}')::double precision)+30000<$3) OR (kind='replay' AND (body::jsonb#>>'{}')::double precision<$4)
         OR (kind='refreshTokens' AND NOT EXISTS (SELECT 1 FROM poppy_server.records AS lineage WHERE lineage.ns=retained.ns AND lineage.kind='grants' AND lineage.id=retained.body::jsonb#>>'{}' AND (lineage.body::jsonb->>'expiresAt')::double precision>$5 AND lineage.body::jsonb->>'revoked'='false'))) LIMIT $6`, [namespace, now, now, now, now, limit]);
             for (const row of rows)
                 await this.sqlRun("DELETE FROM poppy_server.records WHERE ns=$1 AND kind=$2 AND id=$3", [namespace, row.kind, row.id]);

@@ -3,7 +3,7 @@ import { calculateJwkThumbprint, compactVerify, createLocalJWKSet, errors } from
 import type { JSONWebKeySet } from 'jose';
 import { ValidationError, parseAssertionClaims, parseJson } from '../protocol/wire.js';
 import type { AssertionClaims } from '../protocol/wire.js';
-import { companyScopes } from '../network/discovery.js';
+import { companyScopes, MEDIATED_GRANT, parseMediatedSignIn } from '../network/discovery.js';
 import type { MetadataResolver } from '../network/discovery.js';
 import { registeredRedirect } from '../network/redirect.js';
 import { secureUrl } from '../network/transport.js';
@@ -13,7 +13,6 @@ import { clientRevisionKey, accountRevisionKey } from './store.js';
 import { AuthorityError } from '../auth/authority.js';
 import type { AuthorityCoordinator, AuthorityPolicy, ExternalAuthorityAdapter, Principal } from '../auth/authority.js';
 import { CLOCK_SKEW_SECONDS, PROOF_WINDOW_SECONDS, assertUniqueJwtMembers, verifyDpopProof } from '../auth/dpop.js';
-import type { BrowserBinding, BrowserSession, BrowserSessionAuthority } from '../browser.js';
 
 export type { IssuerStore, IssuerSelection };
 export { createMetadataResolver } from '../network/discovery.js';
@@ -24,17 +23,17 @@ interface SessionRecord { clientId: string; userId: string; agentId?: string; ve
 // Stable lineage of one account sign-in; the ID survives Account Token rotation and expiresAt never moves.
 interface GrantRecord { clientId: string; userId: string; accountId: string; scopes: string[]; expiresAt: number; revoked: boolean; refreshHash: string; previousHash: string }
 interface AccessTokenRecord { clientId?: string; accountId?: string; sessionId: string; grantId: string | null; scopes: string[]; resource: string | null; jkt: string; expiresAt: number }
-interface AuthorizationRecord { sessionKey: string; clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
+interface AuthorizationRecord { sessionKey: string | null; clientId: string; redirectUri: string; state: string; codeChallenge: string; scopes: string[]; browserHash: string; expiresAt: number; revision: number; completion?: { decisionHash: string; callback: string } }
 // grantId is set once the code is exchanged, so a second use can revoke what the first produced (RFC 6749 4.1.2).
-interface CodeRecord { sessionKey: string; clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
+interface CodeRecord { sessionKey: string | null; clientId: string; redirectUri: string; codeChallenge: string; accountId: string; scopes: string[]; expiresAt: number; grantId: string | null; revision: number }
 export type SignInRecord =
   | { kind: 'device'; sessionKey: string | null; clientId: string; scopes: string[]; expiresAt: number; deviceHash: string; status: 'pending' | 'approved' | 'denied' | 'consumed'; nextPollAt: number; intervalMs: number; revision: number; browserHash?: string; accountId?: string }
-  | { kind: 'mediated'; clientId: string; userId: string; sessionId: string; scopes: string[]; expiresAt: number; status: 'verifying' | 'pending' | 'failed' | 'expired' | 'complete'; attempts: number; executionId: string; revision: number; accountId?: string; challengeId?: string; sentTo?: string }
+  | { kind: 'mediated'; resource?: string | null; grantId?: string; clientId: string; userId?: string; sessionId?: string; scopes: string[]; expiresAt: number; status: 'verifying' | 'pending' | 'failed' | 'expired' | 'complete'; attempts: number; executionId: string; revision: number; accountId?: string; challengeId?: string; sentTo?: string }
   | { kind: 'attempts'; clientId: string; sessionId?: string; expiresAt: number; count: number }
   | { kind: 'revision'; clientId: string; accountId?: string; expiresAt: number; revision: number };
-export interface MediatedContext { clientId: string; userId: string; sessionId: string; issuer: string }
+export interface MediatedContext { clientId: string; issuer: string }
 export interface MediatedOptions {
-  endpoint: string; scopes: string[]; fields: { name: string; label: string; secret: boolean }[];
+  endpoint?: string; scopes: string[]; fields: { name: string; label: string; secret: boolean }[];
   authenticate(credentials: Readonly<Record<string, string>>, context: MediatedContext): Promise<{ accountId: string; scopes?: string[]; challenge?: { id: string; sentTo: string } } | null>;
   verifyCode(input: { challengeId: string; code: string }, context: MediatedContext): Promise<boolean>;
   maxCodeAttempts?: number; maxAttemptsPerMinute?: number; maxClientAttemptsPerMinute?: number;
@@ -71,15 +70,13 @@ export interface ReferenceIssuerOptions {
   requireDpopNonce?: boolean; // default true at token endpoint
   maxPendingAuthorizations?: number; // default 1000; begin refuses more with temporarily_unavailable
   maxPendingAuthorizationsPerClient?: number; // default 100, so one client cannot use up the global cap
-  maxSessionsPerClient?: number; // default 10000 live Sessions (one client serves all its users); new ones are refused with rate_limited
+  maxSessionsPerClient?: number; // Removed: configure this on createSessionAuthority; passing it here fails explicitly.
   device?: { endpoint: string; verificationUri: string; intervalSeconds?: number };
   mediated?: MediatedOptions;
 }
 export interface AuthorizationView { id: string; clientId: string; clientName: string; scopes: string[]; expiresAt: number }
 export type AuthorizationDecision = { accountId: string; scopes: string[] } | { denied: true };
 export interface ReferenceIssuer {
-  browserSessions: BrowserSessionAuthority;
-  sessionForKey(binding: { clientId: string; userId: string; sessionKey: string }): Promise<BrowserSession>;
   token(request: Request): Promise<Response>;
   revoke(request: Request): Promise<Response>;
   beginAuthorization(request: Request, browserBinding: string): Promise<AuthorizationView>;
@@ -87,7 +84,6 @@ export interface ReferenceIssuer {
   deviceAuthorization(request: Request): Promise<Response>;
   beginDeviceAuthorization(userCode: string, browserBinding: string): Promise<AuthorizationView>;
   completeDeviceAuthorization(userCode: string, browserBinding: string, decision: AuthorizationDecision): Promise<void>;
-  mediatedSignIn(request: Request): Promise<Response>;
   authorizationMetadata(): Record<string, unknown>;
   authority: ExternalAuthorityAdapter;
   disconnect(clientId: string, accountId: string): Promise<void>;
@@ -98,16 +94,14 @@ export class AuthorizationError extends Error {
   constructor(readonly code: string, readonly redirectTo?: URL) { super(`Authorization failed: ${code}`); this.name = 'AuthorizationError'; }
 }
 
-const JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 const CLIENT_ASSERTION_TYPE = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer';
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
-const ASSERTION_ALGORITHMS = ['ES256', 'RS256'];
+const ASSERTION_ALGORITHMS = ['ES256', 'RS256', 'PS384'];
 const NONCE_SECONDS = 300;
 const MAX_FORM_BYTES = 65536;
 const AUTHORIZATION_MS = 600_000;
 const CODE_MS = 60_000;
 // A Session ends a day after the last token issued for it (spec 4.2: the Company decides how long a Session lasts).
-const SESSION_IDLE_SECONDS = 86_400;
 
 const random = (bytes: number) => randomBytes(bytes).toString('base64url');
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('base64url');
@@ -196,33 +190,22 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const accountLifetimeMs = positive(options.accountLifetimeSeconds, 2_592_000, 'accountLifetimeSeconds') * 1000;
   const maxPending = positive(options.maxPendingAuthorizations, 1000, 'maxPendingAuthorizations');
   const maxPendingPerClient = positive(options.maxPendingAuthorizationsPerClient, 100, 'maxPendingAuthorizationsPerClient');
-  const maxSessionsPerClient = positive(options.maxSessionsPerClient, 10_000, 'maxSessionsPerClient');
-  const sessionMs = Math.max(SESSION_IDLE_SECONDS, lifetimeSeconds) * 1000;
+  if (options.maxSessionsPerClient !== undefined) throw new TypeError('maxSessionsPerClient moved to createSessionAuthority');
   const requireNonce = options.requireDpopNonce ?? true;
   if (options.device) { secureUrl(options.device.endpoint); const url = secureUrl(options.device.verificationUri); const hosts = [new URL(issuer).hostname, ...options.protectedResources.map(resource => new URL(resource).hostname)];
     if (!hosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) throw new TypeError('verificationUri'); }
-  if (options.mediated) { secureUrl(options.mediated.endpoint); if (!options.mediated.fields.length || new Set(options.mediated.fields.map(field => field.name)).size !== options.mediated.fields.length) throw new TypeError('mediated.fields'); }
+  if (options.mediated) parseMediatedSignIn({version:'1',fields:options.mediated.fields,scopes:options.mediated.scopes});
   const deviceIntervalMs = positive(options.device?.intervalSeconds, 5, 'intervalSeconds') * 1000;
   const maxCodeAttempts = positive(options.mediated?.maxCodeAttempts, 5, 'maxCodeAttempts');
   const maxAttempts = positive(options.mediated?.maxAttemptsPerMinute, 5, 'maxAttemptsPerMinute');
   const maxClientAttempts = positive(options.mediated?.maxClientAttemptsPerMinute, 100, 'maxClientAttemptsPerMinute');
   const mcpResources = options.mcpResources ?? [];
-  for (const entry of mcpResources) { const url = secureUrl(entry.url); if (url.search || typeof entry.dpop !== 'boolean' || mcpResources.filter(item => item.url === entry.url).length !== 1) throw new TypeError('mcpResources'); }
+  for (const entry of mcpResources) { const url = secureUrl(entry.url); if (typeof entry.dpop !== 'boolean' || mcpResources.filter(item => item.url === entry.url).length !== 1) throw new TypeError('mcpResources'); }
   const resources = [...new Set([...(options.resources ?? []), ...mcpResources.map(entry => entry.url)])];
   const isBearerResource = (resource: string | undefined) => mcpResources.some(entry => entry.url === resource && !entry.dpop);
   // Every issuer mutation is ordered with conversation work by the shared coordinator.
   const read = async (selection: IssuerSelection = { kind: 'metadata' }) => checked(await store.read(selection));
   const commit = <T>(selection: IssuerSelection, change: (draft: IssuerState) => T) => options.coordinator.run(() => store.transaction(selection, draft => change(checked(draft))));
-
-  function browserSession(state: IssuerState, binding: BrowserBinding): BrowserSession {
-    const session = own(state.sessions, binding.sessionId), at = now();
-    if (!session || session.expiresAt <= at || session.clientId !== binding.clientId || session.userId !== binding.userId || (binding.issuerGeneration !== undefined && binding.issuerGeneration !== state.generation)) throw new AuthorityError('invalid_token');
-    const grant = session.grantId === null ? undefined : own(state.grants, session.grantId);
-    const signedIn = grantLive(grant, at);
-    return { clientId: session.clientId, userId: session.userId, sessionId: binding.sessionId, issuerGeneration: state.generation, expiresAt: session.expiresAt,
-      principal: { issuer, clientId: session.clientId, userId: session.userId, sessionId: binding.sessionId, issuerGeneration: state.generation, sessionVersion: session.version, tokenExpiresAt: session.expiresAt,
-        scopes: signedIn ? [...grant!.scopes] : [], ...(signedIn ? { accountId: grant!.accountId, grantId: session.grantId! } : {}) } };
-  }
 
   // Reuse the current nonce while it has more than half its life left, so challenges cannot grow state.
   async function currentNonce(state: IssuerState): Promise<string> {
@@ -284,7 +267,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     for (const [key, grantId] of Object.entries(draft.refreshTokens)) if (!Object.hasOwn(draft.grants, grantId)) delete draft.refreshTokens[key];
     for (const [key, record] of Object.entries(draft.codes)) if (record.expiresAt <= at) delete draft.codes[key];
     for (const [key, record] of Object.entries(draft.authorizations)) if (record.expiresAt <= at) delete draft.authorizations[key];
-    for (const [key, record] of Object.entries(draft.signIns)) if (record.expiresAt + CLOCK_SKEW_SECONDS * 1000 < at) delete draft.signIns[key];
+    for (const [key, record] of Object.entries(draft.signIns)) if (!(record.kind === 'mediated' && record.status === 'verifying') && record.expiresAt + CLOCK_SKEW_SECONDS * 1000 < at) delete draft.signIns[key];
   }
   // Revoking a grant signs out every Session using it; they continue signed out and stay bound to the account (spec 4.9).
   function revokeGrant(draft: IssuerState, grantId: string): void {
@@ -293,14 +276,12 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     grant.revoked = true;
     for (const session of Object.values(draft.sessions)) if (session.grantId === grantId) session.grantId = null;
   }
-  function issueSignIn(draft: IssuerState, sessionId: string, target: SessionRecord, accountId: string, scopes: string[], jkt: string, resource?: string): { grantId: string; body: Record<string, unknown> } {
-    if (target.accountId !== null && target.accountId !== accountId) throw new TokenError('account_mismatch');
-    const grantId = `grt_${random(16)}`, refreshToken = random(32), accessToken = random(32), at = now();
-    const refreshHash = tokenHash(refreshToken);
-    draft.grants[grantId] = { clientId: target.clientId, userId: target.userId, accountId, scopes: [...scopes], expiresAt: at + accountLifetimeMs, revoked: false, refreshHash, previousHash: '' };
-    draft.refreshTokens[refreshHash] = grantId; target.accountId = accountId; target.grantId = grantId; target.expiresAt = at + sessionMs;
-    draft.accessTokens[tokenHash(accessToken)] = { sessionId, grantId, scopes: [...scopes], resource: resource ?? null, jkt, expiresAt: at + lifetimeMs };
-    return { grantId, body: { access_token: accessToken, token_type: 'DPoP', expires_in: lifetimeSeconds, refresh_token: refreshToken, refresh_token_expires_in: Math.floor(accountLifetimeMs / 1000), scope: scopes.join(' ') } };
+  function issueSignIn(draft: IssuerState, clientId: string, accountId: string, scopes: string[], jkt: string, resource?: string): { grantId: string; body: Record<string, unknown> } {
+    const grantId = 'grt_' + random(16), refreshToken = random(32), accessToken = random(32), at = now(), refreshHash = tokenHash(refreshToken);
+    draft.grants[grantId] = {clientId,userId:'',accountId,scopes:[...scopes],expiresAt:at+accountLifetimeMs,revoked:false,refreshHash,previousHash:''};
+    draft.refreshTokens[refreshHash] = grantId;
+    draft.accessTokens[tokenHash(accessToken)] = {clientId,accountId,sessionId:'',grantId,scopes:[...scopes],resource:resource ?? null,jkt,expiresAt:at+lifetimeMs};
+    return {grantId,body:{access_token:accessToken,token_type:jkt ? 'DPoP' : 'Bearer',expires_in:lifetimeSeconds,refresh_token:refreshToken,refresh_token_expires_in:Math.floor(accountLifetimeMs/1000),scope:scopes.join(' ')}};
   }
   function signInScopes(scope: string | undefined, allowed: readonly string[]): string[] {
     const scopes = scope?.split(' ') ?? [];
@@ -325,7 +306,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     const replayKey = `assertion ${clientId} ${client.jti}`;
     await commit({ kind: 'sign_in', ids: [id, clientRevisionKey(clientId)], clientId, replayKeys: [replayKey], at: now() }, draft => {
       if (draft.generation !== generation || !current(client)) throw new TokenError('invalid_client');
-      const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
+      const pending = Object.values(draft.signIns).filter(row => (row.kind === 'mediated' && row.status === 'verifying') || row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
       if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
       consumeReplay(draft, replayKey, client.exp * 1000);
       draft.signIns[id] = { kind: 'device', sessionKey: null, clientId, scopes, expiresAt: now() + AUTHORIZATION_MS, deviceHash: tokenHash(deviceCode), status: 'pending', nextPollAt: now() + deviceIntervalMs, intervalMs: deviceIntervalMs, revision: revision(draft, clientRevisionKey(clientId)) };
@@ -335,294 +316,160 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   }
   async function pollDevice(request: Request, params: Map<string, string>): Promise<Response> {
     if (!options.device) throw new TokenError('unsupported_grant_type');
-    const { clientId, clientAssertion } = clientCredentials(params), code = params.get('device_code'), resource = params.get('resource');
+    const {clientId,clientAssertion} = clientCredentials(params), code = params.get('device_code'), resource = params.get('resource');
     if (!code || params.has('session_id') || params.has('assertion')) throw new TokenError('invalid_request');
-    if (resource !== undefined && (!resources.includes(resource) || isBearerResource(resource))) throw new TokenError('invalid_target');
+    if (resource !== undefined && !resources.includes(resource)) throw new TokenError('invalid_target');
     const state = await read();
-    const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
-    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
-    const { client, keys } = await authenticateClient(clientId, clientAssertion);
-    for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
-    const id = tokenHash(code.split('.')[0]!), replayKey = `assertion ${clientId} ${client.jti}`, proofKey = `proof ${proof.jkt} ${proof.claims.jti}`;
-    const body = await commit({ kind: 'sign_in', ids: [id], sessionKey: proof.jkt, clientId, replayKeys: [replayKey, proofKey], at: now() }, draft => {
-      if (draft.generation !== state.generation || !current(client)) throw new TokenError('invalid_client');
-      consumeReplay(draft, replayKey, client.exp * 1000); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
-      const record = own(draft.signIns, id);
-      if (!record || record.kind !== 'device' || record.clientId !== clientId || record.deviceHash !== tokenHash(code)) return { error: 'invalid_grant' };
-      if (record.sessionKey === undefined || (record.sessionKey !== null && record.sessionKey !== proof.jkt)) return { error: 'invalid_grant' };
-      const sessionId = own(draft.sessionKeys, proof.jkt), session = sessionId ? own(draft.sessions, sessionId) : undefined;
-      if (!session || session.clientId !== clientId || session.expiresAt <= now()) return { error: 'invalid_grant' };
-      record.sessionKey ??= proof.jkt;
-      if (record.expiresAt <= now()) return { error: 'expired_token' };
-      if (record.status === 'denied') return { error: 'access_denied' };
-      if (record.status === 'consumed') return { error: 'invalid_grant' };
-      if (record.nextPollAt > now()) { record.intervalMs += 5000; record.nextPollAt = now() + record.intervalMs; return { error: 'slow_down' }; }
-      record.nextPollAt = now() + record.intervalMs;
-      if (record.status === 'pending') return { error: 'authorization_pending' };
-      if (session.accountId !== null && session.accountId !== record.accountId) return { error: 'account_mismatch' };
-      const granted = issueSignIn(draft, sessionId!, session, record.accountId!, record.scopes, proof.jkt, resource);
-      record.status = 'consumed'; return granted.body;
+    const proof = isBearerResource(resource) ? null : await verifyDpopProof(request.headers.get('dpop'),{method:'POST',url:options.tokenEndpoint,nowMs:now()});
+    if (proof && requireNonce && !state.nonces.some(nonce=>nonce.value===proof.claims.nonce&&nonce.expiresAt>now())) throw new TokenError('use_dpop_nonce',{'DPoP-Nonce':await currentNonce(state)});
+    const {client,keys} = await authenticateClient(clientId,clientAssertion);
+    if (proof) for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(()=>null)===proof.jkt) throw new TokenError('invalid_dpop_proof');
+    const id=tokenHash(code.split('.')[0]!),replayKey=`assertion ${clientId} ${client.jti}`,proofKey=proof?`proof ${proof.jkt} ${proof.claims.jti}`:null;
+    const body=await commit({kind:'sign_in',ids:[id],clientId,replayKeys:[replayKey,...(proofKey?[proofKey]:[])],at:now()},draft=>{
+      if(draft.generation!==state.generation||!current(client))throw new TokenError('invalid_client');
+      consumeReplay(draft,replayKey,client.exp*1000);
+      if(proof&&proofKey)consumeReplay(draft,proofKey,(proof.claims.iat+PROOF_WINDOW_SECONDS)*1000);
+      const record=own(draft.signIns,id);
+      if(!record||record.kind!=='device'||record.clientId!==clientId||record.deviceHash!==tokenHash(code))return {error:'invalid_grant'};
+      if(record.expiresAt<=now())return {error:'expired_token'};
+      if(record.status==='denied')return {error:'access_denied'};
+      if(record.status==='consumed')return {error:'invalid_grant'};
+      if(record.nextPollAt>now()){record.intervalMs+=5000;record.nextPollAt=now()+record.intervalMs;return {error:'slow_down'};}
+      record.nextPollAt=now()+record.intervalMs;
+      if(record.status==='pending')return {error:'authorization_pending'};
+      if(!consentCurrent(draft,clientId,record.accountId!,record.revision))return {error:'invalid_grant'};
+      const result=issueSignIn(draft,clientId,record.accountId!,record.scopes,proof?.jkt??'',resource);
+      record.status='consumed';return result.body;
     });
-    return json('error' in body ? 400 : 200, body);
+    return json('error' in body?400:200,body);
   }
-  function mediatedToken(draft: IssuerState, accessHash: string, jkt: string): { token: AccessTokenRecord; session: SessionRecord } {
-    const token = own(draft.accessTokens, accessHash), session = token && own(draft.sessions, token.sessionId);
-    if (!token || !session || token.expiresAt <= now() || session.expiresAt <= now() || token.jkt !== jkt || (token.grantId !== null && !grantLive(own(draft.grants, token.grantId), now()))) throw new TokenError('invalid_token');
-    return { token, session };
-  }
-  async function mediatedSignIn(request: Request): Promise<Response> {
-    const config = options.mediated;
-    if (!config) throw new TokenError('unsupported_grant_type');
-    const endpoint = new URL(config.endpoint), url = new URL(request.url);
-    if (request.method !== 'POST' || url.origin !== endpoint.origin || url.search || url.hash ||
-      (url.pathname !== endpoint.pathname && !url.pathname.startsWith(`${endpoint.pathname.replace(/\/$/, '')}/`))) throw new TokenError('invalid_request');
-    const id = url.pathname === endpoint.pathname ? random(32) : url.pathname.slice(endpoint.pathname.replace(/\/$/, '').length + 1);
-    if (!/^[A-Za-z0-9_-]{1,256}$/.test(id)) throw new TokenError('sign_in_not_found');
-    const challenge = url.pathname !== endpoint.pathname;
-    if (!/^application\/json(?:;|$)/i.test(request.headers.get('content-type') ?? '')) throw new TokenError('invalid_request');
-    let input: Record<string, unknown>;
-    try { const parsed: unknown = parseJson(await readForm(request)); if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw 0; input = parsed as Record<string, unknown>; }
-    catch { throw new TokenError('invalid_request'); }
-    let credentials: Record<string, string> = {}, code = '';
+  async function mediatedSignIn(request: Request, supplied?: Map<string,string>): Promise<Response> {
+    const config=options.mediated;
+    if(!config)throw new TokenError('unsupported_grant_type');
+    if(request.url!==options.tokenEndpoint)throw new TokenError('invalid_request');
+    const params=supplied??await readParams(request),{clientId,clientAssertion}=clientCredentials(params);
+    if(params.get('grant_type')!==MEDIATED_GRANT)throw new TokenError('invalid_request');
+    const {client,keys}=await authenticateClient(clientId,clientAssertion),state=await read();
+    const challenge=params.has('sign_in_id'),id=challenge?params.get('sign_in_id')!:random(32);
+    if(!/^[A-Za-z0-9_-]{1,256}$/.test(id))throw new TokenError('invalid_grant');
+    const key=tokenHash(id),existing=challenge?own((await read({kind:'sign_in',ids:[key],replayKeys:[],at:now()})).signIns,key):undefined;
+    if(challenge&&(!existing||existing.kind!=='mediated'||existing.clientId!==clientId||!Object.hasOwn(existing,'resource')))throw new TokenError('invalid_grant');
+    const resource=challenge&&existing?.kind==='mediated'?existing.resource??undefined:params.get('resource');
+    if(resource!==undefined&&!resources.includes(resource))throw new TokenError('invalid_target');
+    if(challenge&&params.has('resource')&&params.get('resource')!==resource)throw new TokenError('invalid_target');
+    const proof=isBearerResource(resource)?null:await verifyDpopProof(request.headers.get('dpop'),{method:'POST',url:options.tokenEndpoint,nowMs:now()});
+    if(proof&&requireNonce&&!state.nonces.some(nonce=>nonce.value===proof.claims.nonce&&nonce.expiresAt>now()))throw new TokenError('use_dpop_nonce',{'DPoP-Nonce':await currentNonce(state)});
+    if(proof)for(const key of keys().keys)if(await calculateJwkThumbprint(key).catch(()=>null)===proof.jkt)throw new TokenError('invalid_dpop_proof');
+    const credentials:Record<string,string>=Object.create(null);let oneTimeCode='';
     try {
-      let scopes: string[] = [];
-      if (challenge) { if (Object.keys(input).length !== 1 || typeof input.code !== 'string' || !input.code || input.code.length > 4096) throw new TokenError('invalid_request'); code = input.code; }
-      else {
-        scopes = signInScopes(typeof input.scope === 'string' ? input.scope : undefined, config.scopes);
-        const fields = input.credentials;
-        if (!fields || typeof fields !== 'object' || Array.isArray(fields) || Object.keys(fields).length !== config.fields.length ||
-          !config.fields.every(field => Object.hasOwn(fields, field.name) && typeof (fields as Record<string, unknown>)[field.name] === 'string' && ((fields as Record<string, string>)[field.name].length > 0) && (fields as Record<string, string>)[field.name].length <= 4096)) throw new TokenError('invalid_request');
-        credentials = fields as Record<string, string>;
+      if(challenge){
+        if(params.has('scope')||config.fields.some(field=>params.has(field.name)))throw new TokenError('invalid_request');
+        oneTimeCode=params.get('one_time_code')??'';if(!oneTimeCode||oneTimeCode.length>4096)throw new TokenError('invalid_request');
+      }else{
+        if(params.has('one_time_code'))throw new TokenError('invalid_request');
+        for(const field of config.fields){const value=params.get(field.name);if(!value||value.length>4096)throw new TokenError('invalid_request');credentials[field.name]=value;}
       }
-      const access = /^DPoP (\S+)$/i.exec(request.headers.get('authorization') ?? '')?.[1];
-      if (!access || access.length > 4096) throw new TokenError('invalid_token');
-      const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: request.url, nowMs: now(), accessToken: access });
-      const accessHash = tokenHash(access), proofKey = `proof ${proof.jkt} ${proof.claims.jti}`, state = await read({ kind: 'access', hash: accessHash });
-      const authenticated = mediatedToken(state, accessHash, proof.jkt), context: MediatedContext = { issuer, clientId: authenticated.session.clientId, userId: authenticated.session.userId, sessionId: authenticated.token.sessionId };
-      const key = tokenHash(id), limitId = tokenHash(`attempts session ${context.clientId} ${context.sessionId}`), clientLimitId = tokenHash(`attempts client ${context.clientId}`), executionId = random(16);
-      const selection: IssuerSelection = { kind: 'sign_in', ids: [key, limitId, clientLimitId, clientRevisionKey(context.clientId)], clientId: context.clientId, accessHash, replayKeys: [proofKey], at: now() };
-      const claim = await commit(selection, draft => {
-        if (draft.generation !== state.generation) throw new TokenError('invalid_token');
-        mediatedToken(draft, accessHash, proof.jkt); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
-        let record = own(draft.signIns, key);
-        if (challenge) {
-          if (!record || record.kind !== 'mediated' || record.sessionId !== context.sessionId || record.clientId !== context.clientId || record.userId !== context.userId) throw new TokenError('sign_in_not_found');
-          if (record.status === 'complete') throw new TokenError('sign_in_not_found');
-          if (record.status === 'failed' || record.status === 'expired') return { status: record.status };
-          if (record.expiresAt <= now()) { record.status = 'expired'; return { status: 'expired' }; }
-          if (record.status === 'verifying') throw new TokenError('rate_limited', { 'Retry-After': '5' });
-          if (record.attempts >= maxCodeAttempts) { record.status = 'failed'; return { status: 'failed' }; }
-          record.attempts++; record.status = 'verifying'; record.executionId = executionId;
-          return { record };
+      const scopes=challenge?[]:signInScopes(params.get('scope'),config.scopes),context:MediatedContext={issuer,clientId};
+      const replayKey=`assertion ${clientId} ${client.jti}`,proofKey=proof?`proof ${proof.jkt} ${proof.claims.jti}`:null,limitId=tokenHash('credential attempts '+clientId),executionId=random(16);
+      const selection:IssuerSelection={kind:'sign_in',ids:[key,limitId,clientRevisionKey(clientId)],clientId,replayKeys:[replayKey,...(proofKey?[proofKey]:[])],at:now()};
+      const claim=await commit(selection,draft=>{
+        if(draft.generation!==state.generation||!current(client))throw new TokenError('invalid_client');
+        consumeReplay(draft,replayKey,client.exp*1000);if(proof&&proofKey)consumeReplay(draft,proofKey,(proof.claims.iat+PROOF_WINDOW_SECONDS)*1000);
+        let row=own(draft.signIns,key);
+        if(challenge){
+          if(!row||row.kind!=='mediated'||row.clientId!==clientId||!Object.hasOwn(row,'resource'))throw new TokenError('invalid_grant');
+          if(row.status==='complete'||row.status==='failed')return {error:'invalid_grant'};
+          if(row.status==='verifying')throw new TokenError('temporarily_unavailable',{'Retry-After':'5'});
+          if(row.expiresAt<=now()||row.status==='expired'){row.status='expired';return {error:'expired_token'};}
+          if(row.attempts>=maxCodeAttempts){row.status='failed';return {error:'invalid_grant'};}
+          row.attempts++;row.status='verifying';row.executionId=executionId;return {record:row};
         }
-        // Count attempts before calling the host's credential backend, including failures.
-        for (const [limitKey, maximum, sessionId] of [[limitId, maxAttempts, context.sessionId], [clientLimitId, maxClientAttempts, undefined]] as const) {
-          const old = own(draft.signIns, limitKey);
-          const window = old?.kind === 'attempts' && old.expiresAt > now() ? old : { kind: 'attempts' as const, clientId: context.clientId, ...(sessionId ? { sessionId } : {}), count: 0, expiresAt: now() + 60_000 };
-          if (window.count >= maximum) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil((window.expiresAt - now()) / 1000)) });
-          window.count++; draft.signIns[limitKey] = window;
-        }
-        const pending = Object.values(draft.signIns).filter(row => row.expiresAt > now() && (row.kind === 'device' ? row.status === 'pending' || row.status === 'approved' : row.kind === 'mediated' && (row.status === 'pending' || row.status === 'verifying')));
-        if ((draft.limits?.pending ?? pending.length) >= maxPending || (draft.limits?.pendingForClient ?? pending.filter(row => row.clientId === context.clientId).length) >= maxPendingPerClient) throw new TokenError('rate_limited', { 'Retry-After': '60' });
-        record = { kind: 'mediated', clientId: context.clientId, userId: context.userId, sessionId: context.sessionId, scopes, expiresAt: now() + AUTHORIZATION_MS, status: 'verifying', attempts: 0, executionId, revision: revision(draft, clientRevisionKey(context.clientId)) };
-        draft.signIns[key] = record; return { record };
+        const old=own(draft.signIns,limitId),window=old?.kind==='attempts'&&old.expiresAt>now()?old:{kind:'attempts' as const,clientId,count:0,expiresAt:now()+60000};
+        if(window.count>=Math.min(maxAttempts,maxClientAttempts))throw new TokenError('rate_limited',{'Retry-After':String(Math.ceil((window.expiresAt-now())/1000))});
+        window.count++;draft.signIns[limitId]=window;
+        const pending=Object.values(draft.signIns).filter(row=>(row.kind==='mediated'&&row.status==='verifying')||row.expiresAt>now()&&((row.kind==='device'&&(row.status==='pending'||row.status==='approved'))||(row.kind==='mediated'&&(row.status==='pending'||row.status==='verifying'))));
+        if((draft.limits?.pending??pending.length)>=maxPending||(draft.limits?.pendingForClient??pending.filter(row=>row.clientId===clientId).length)>=maxPendingPerClient)throw new TokenError('rate_limited',{'Retry-After':'60'});
+        const record:Extract<SignInRecord,{kind:'mediated'}>={kind:'mediated',clientId,resource:resource??null,scopes,expiresAt:now()+AUTHORIZATION_MS,status:'verifying',attempts:0,executionId,revision:revision(draft,clientRevisionKey(clientId))};
+        draft.signIns[key]=record;return {record};
       });
-      if ('status' in claim) return json(200, claim);
-      const record = claim.record;
-      let decision: { accountId: string; scopes?: string[]; challenge?: { id: string; sentTo: string } } | null = null, correct = false;
-      try {
-        if (challenge) { correct = await config.verifyCode({ challengeId: record.challengeId!, code }, context); if (typeof correct !== 'boolean') throw 0; }
-        else decision = await config.authenticate(credentials, context);
-      } catch { throw new TokenError('temporarily_unavailable'); }
-      const credentialValues = Object.values(credentials);
-      if (decision && (typeof decision.accountId !== 'string' || !decision.accountId || decision.accountId.length > 256 || (decision.challenge && (typeof decision.challenge.id !== 'string' || !decision.challenge.id || typeof decision.challenge.sentTo !== 'string' || decision.challenge.sentTo.length > 512)))) throw new TokenError('temporarily_unavailable');
-      if (decision?.scopes !== undefined && (!Array.isArray(decision.scopes) || !decision.scopes.length || !decision.scopes.every(scope => record.scopes.includes(scope)))) throw new TokenError('temporarily_unavailable');
-      const accountId = decision?.accountId ?? record.accountId;
-      const completionSelection: IssuerSelection = { ...selection, ids: [...selection.ids, ...(accountId ? [accountRevisionKey(context.clientId, accountId)] : [])] };
-      const body = await commit(completionSelection, draft => {
-        if (draft.generation !== state.generation) throw new TokenError('invalid_token');
-        const current = own(draft.signIns, key), { token, session } = mediatedToken(draft, accessHash, proof.jkt);
-        if (!current || current.kind !== 'mediated' || current.executionId !== executionId || current.status !== 'verifying') throw new TokenError('sign_in_not_found');
-        if (accountId && !consentCurrent(draft, context.clientId, accountId, current.revision)) { current.accountId = accountId; current.status = 'failed'; return { error: 'invalid_grant' }; }
-        if (current.expiresAt <= now()) { current.status = 'expired'; return { status: 'expired' }; }
-        if ((!challenge && !decision) || (challenge && !correct && current.attempts >= maxCodeAttempts)) { current.status = 'failed'; return { status: 'failed' }; }
-        if (decision) current.accountId = decision.accountId;
-        if (decision?.scopes) current.scopes = [...new Set(decision.scopes)];
-        if (decision?.challenge) {
-          current.accountId = decision.accountId; current.challengeId = decision.challenge.id;
-          current.sentTo = credentialValues.some(value => decision!.challenge!.sentTo.includes(value)) ? 'The company sent a one-time code.' : decision.challenge.sentTo;
-        }
-        if ((!challenge && decision?.challenge) || (challenge && !correct)) {
-          current.status = 'pending'; return { status: 'code_required', sign_in_id: id, code: { sent_to: current.sentTo }, expires_at: new Date(current.expiresAt).toISOString() };
-        }
-        const result = issueSignIn(draft, token.sessionId, session, decision?.accountId ?? current.accountId!, current.scopes, proof.jkt, token.resource ?? undefined);
-        current.status = 'complete'; return { status: 'complete', ...result.body };
+      if('error' in claim)return json(400,claim);
+      const row=claim.record;
+      let decision:Awaited<ReturnType<MediatedOptions['authenticate']>>=null,correct=false;
+      try{if(challenge)correct=await config.verifyCode({challengeId:row.challengeId!,code:oneTimeCode},context);else decision=await config.authenticate(credentials,context);}catch{throw new TokenError('temporarily_unavailable',{'Retry-After':'5'});}
+      if(challenge&&typeof correct!=='boolean')throw new TokenError('temporarily_unavailable');
+      if(decision&&(typeof decision.accountId!=='string'||!decision.accountId||decision.accountId.length>256||(decision.scopes!==undefined&&(!Array.isArray(decision.scopes)||!decision.scopes.length||!decision.scopes.every(scope=>row.scopes.includes(scope))))||(decision.challenge&&(typeof decision.challenge.id!=='string'||!decision.challenge.id||typeof decision.challenge.sentTo!=='string'||decision.challenge.sentTo.length>512))))throw new TokenError('temporarily_unavailable');
+      const accountId=decision?.accountId??row.accountId;
+      const body=await commit({...selection,ids:[...selection.ids,...(accountId?[accountRevisionKey(clientId,accountId)]:[])]},draft=>{
+        if(draft.generation!==state.generation||!current(client))throw new TokenError('invalid_client');
+        const completed=own(draft.signIns,key);
+        if(!completed||completed.kind!=='mediated'||completed.executionId!==executionId||completed.status!=='verifying')throw new TokenError('invalid_grant');
+        if(accountId)completed.accountId=accountId;
+        if(accountId&&!consentCurrent(draft,clientId,accountId,completed.revision)){completed.status='failed';return {error:'invalid_grant'};}
+        if(completed.expiresAt<=now()){completed.status='expired';return {error:'expired_token'};}
+        if((!challenge&&!decision)||(challenge&&!correct&&completed.attempts>=maxCodeAttempts)){completed.status='failed';return {error:'invalid_grant'};}
+        if(decision?.scopes)completed.scopes=[...new Set(decision.scopes)];
+        if(decision?.challenge){completed.challengeId=decision.challenge.id;completed.sentTo=Object.values(credentials).some(value=>decision!.challenge!.sentTo.includes(value))?'The company sent a one-time code.':decision.challenge.sentTo;}
+        if((!challenge&&decision?.challenge)||(challenge&&!correct)){completed.status='pending';return {error:'code_required',sign_in_id:id,sent_to:completed.sentTo,expires_in:Math.ceil((completed.expiresAt-now())/1000)};}
+        const result=issueSignIn(draft,clientId,completed.accountId!,completed.scopes,proof?.jkt??'',completed.resource??undefined);completed.status='complete';completed.grantId=result.grantId;return result.body;
       });
-      return json('error' in body ? 400 : 200, body);
-    } finally {
-      for (const key of Object.keys(credentials)) delete credentials[key];
-      for (const key of Object.keys(input)) delete input[key]; code = '';
-    }
+      return json('error' in body?400:200,body);
+    } finally {for(const name of Object.keys(credentials))delete credentials[name];for(const name of config.fields.map(field=>field.name))params.delete(name);params.delete('one_time_code');oneTimeCode='';}
   }
 
-  async function exchangeToken(request: Request, params: Map<string, string>): Promise<Response> {
+  async function accountToken(request: Request, params: Map<string, string>): Promise<Response> {
     const { clientId, clientAssertion } = clientCredentials(params);
-    const subject = params.get('subject_token'), resource = params.get('resource');
-    if (!subject || params.get('subject_token_type') !== 'urn:ietf:params:oauth:token-type:access_token' || ['assertion', 'session_id', 'refresh_token', 'code', 'actor_token', 'actor_token_type'].some(key => params.has(key)) || (params.has('requested_token_type') && params.get('requested_token_type') !== 'urn:ietf:params:oauth:token-type:access_token')) throw new TokenError('invalid_request');
-    if (!resource || !isBearerResource(resource)) throw new TokenError('invalid_target');
+    const grantType = params.get('grant_type'), code = params.get('code'), refresh = params.get('refresh_token');
+    const verifier = params.get('code_verifier'), redirect = params.get('redirect_uri'), resource = params.get('resource');
+    if (params.has('session_id') || params.has('assertion')) throw new TokenError('invalid_request');
+    if (resource !== undefined && !resources.includes(resource)) throw new TokenError('invalid_target');
+    if (grantType === 'authorization_code' && (!code || !verifier || !redirect || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier))) throw new TokenError('invalid_request');
+    if (grantType === 'refresh_token' && !refresh) throw new TokenError('invalid_request');
     const state = await read();
-    const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
-    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
+    const proof = isBearerResource(resource) ? null : await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
+    if (proof && requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
     const { client, keys } = await authenticateClient(clientId, clientAssertion);
-    for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
-    const replayKey = 'assertion ' + clientId + ' ' + client.jti, proofKey = 'proof ' + proof.jkt + ' ' + proof.claims.jti;
-    const body = await commit({ kind: 'sign_in', ids: [], sessionKey: proof.jkt, clientId, accessHash: tokenHash(subject), replayKeys: [replayKey, proofKey], at: now() }, draft => {
-      const at = now(), token = own(draft.accessTokens, tokenHash(subject)), session = token && own(draft.sessions, token.sessionId);
+    if (proof) for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
+    const replayKey = `assertion ${clientId} ${client.jti}`, proofKey = proof ? `proof ${proof.jkt} ${proof.claims.jti}` : null;
+    const body = await commit({kind:'token',clientId,sessionKey:'',...(code ? {codeHash:tokenHash(code)} : {}),...(refresh ? {refreshHash:tokenHash(refresh)} : {}),replayKeys:[replayKey,...(proofKey ? [proofKey] : [])],at:now()}, draft => {
+      const at = now();
       if (draft.generation !== state.generation || !current(client)) throw new TokenError('invalid_client');
-      if ((proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000 <= at) throw new TokenError('invalid_dpop_proof');
-      if (!token || !session || !token.jkt || token.jkt !== proof.jkt || own(draft.sessionKeys, proof.jkt) !== token.sessionId || session.clientId !== clientId || token.expiresAt <= at || session.expiresAt <= at || session.grantId !== token.grantId || (token.grantId !== null && !grantLive(own(draft.grants, token.grantId), at))) throw new TokenError('invalid_grant');
-      const scopes = params.has('scope') ? signInScopes(params.get('scope'), token.scopes) : [...token.scopes];
-      if ((own(draft.replay, proofKey) ?? 0) > at) throw new TokenError('invalid_dpop_proof');
-      consumeReplay(draft, replayKey, client.exp * 1000); consumeReplay(draft, proofKey, (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000);
-      const access = random(32), expiresAt = Math.min(at + lifetimeMs, session.expiresAt);
-      draft.accessTokens[tokenHash(access)] = { sessionId: token.sessionId, grantId: token.grantId, scopes, resource, jkt: '', expiresAt };
-      return { access_token: access, issued_token_type: 'urn:ietf:params:oauth:token-type:access_token', token_type: 'Bearer', expires_in: Math.floor((expiresAt - at) / 1000), scope: scopes.join(' ') };
+      if ((own(draft.replay,replayKey) ?? 0) > at) throw new TokenError('invalid_client');
+      consumeReplay(draft,replayKey,client.exp*1000);
+      if (proof && proofKey) {
+        if ((proof.claims.iat + PROOF_WINDOW_SECONDS)*1000 <= at || (own(draft.replay,proofKey) ?? 0) > at) throw new TokenError('invalid_dpop_proof');
+        consumeReplay(draft,proofKey,(proof.claims.iat+PROOF_WINDOW_SECONDS)*1000);
+      }
+      if (grantType === 'authorization_code') {
+        const row = own(draft.codes,tokenHash(code!));
+        if (!row || row.sessionKey === undefined || row.clientId !== clientId || row.expiresAt <= at || (row.sessionKey !== null && row.sessionKey !== proof?.jkt)) throw new TokenError('invalid_grant');
+        if (row.grantId !== null) { revokeGrant(draft,row.grantId); return null; }
+        if (row.redirectUri !== redirect || tokenHash(verifier!) !== row.codeChallenge || !consentCurrent(draft,clientId,row.accountId,row.revision)) throw new TokenError('invalid_grant');
+        const issued=issueSignIn(draft,clientId,row.accountId,row.scopes,proof?.jkt??'',resource);row.grantId=issued.grantId;return issued.body;
+      }
+      const hash=tokenHash(refresh!),grantId=own(draft.refreshTokens,hash),grant=grantId?own(draft.grants,grantId):undefined;
+      if(grant&&grant.clientId===clientId&&grant.refreshHash!==hash){revokeGrant(draft,grantId!);return null;}
+      if(!grant||!grantLive(grant,at)||grant.clientId!==clientId)throw new TokenError('invalid_grant');
+      const token=random(32);
+      if(params.has('scope'))signInScopes(params.get('scope'),grant.scopes);
+      grant.previousHash=grant.refreshHash;grant.refreshHash=tokenHash(token);
+      const scopes = grantType === 'refresh_token' && params.has('scope') ? signInScopes(params.get('scope'),grant.scopes) : [...grant.scopes];
+      draft.refreshTokens[grant.refreshHash] = grantId!;
+      const access = random(32);
+      draft.accessTokens[tokenHash(access)] = {clientId,accountId:grant.accountId,sessionId:'',grantId:grantId!,scopes,resource:resource ?? null,jkt:proof?.jkt ?? '',expiresAt:at+lifetimeMs};
+      return {access_token:access,token_type:proof ? 'DPoP' : 'Bearer',expires_in:lifetimeSeconds,refresh_token:token,refresh_token_expires_in:Math.floor((grant.expiresAt-at)/1000),scope:scopes.join(' ')};
     });
-    return json(200, body);
+    if (body === null) throw new TokenError('invalid_grant');
+    return json(200,body);
   }
 
   async function issue(request: Request): Promise<Response> {
     const params = await readParams(request);
     const grantType = params.get('grant_type');
     if (!grantType) throw new TokenError('invalid_request');
-    if (grantType === 'urn:ietf:params:oauth:grant-type:token-exchange') return exchangeToken(request, params);
     if (grantType === DEVICE_GRANT) return pollDevice(request, params);
-    if (grantType !== JWT_BEARER && grantType !== 'authorization_code' && grantType !== 'refresh_token') throw new TokenError('unsupported_grant_type');
-    const { clientId, clientAssertion } = clientCredentials(params);
-    const assertion = params.get('assertion'); const code = params.get('code'); const redirectUri = params.get('redirect_uri');
-    const codeVerifier = params.get('code_verifier'); const refreshToken = params.get('refresh_token');
-    const resource = params.get('resource'); const scope = params.get('scope');
-    if (params.has('session_id')) throw new TokenError('invalid_request');
-    // Each grant takes only its own credential, so a stray assertion can never stand in for a code or Account Token.
-    if (grantType !== JWT_BEARER && assertion !== undefined) throw new TokenError('invalid_request');
-    if (grantType === JWT_BEARER) {
-      // A missing assertion is invalid_grant (spec 4.2 error table).
-      if (!assertion) throw new TokenError('invalid_grant');
-      // Signed-out sessions hold no account scopes.
-      if (scope?.trim()) throw new TokenError('invalid_scope');
-    } else if (grantType === 'authorization_code') {
-      if (!code || !redirectUri || !codeVerifier) throw new TokenError('invalid_request');
-      // RFC 7636 4.1: 43-128 unreserved characters.
-      if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) throw new TokenError('invalid_request');
-    } else if (!refreshToken) throw new TokenError('invalid_request');
-    // scope narrows only (spec 4.3, 4.8); an empty request asks for nothing and is refused.
-    const requested = scope === undefined || grantType === JWT_BEARER ? undefined : [...new Set(scope.split(' ').filter(Boolean))];
-    if (requested?.length === 0) throw new TokenError('invalid_scope');
-    // Resources are exact configured identifiers, chosen per token request; grants are never narrowed to one.
-    if (resource !== undefined && (!resources.includes(resource) || isBearerResource(resource))) throw new TokenError('invalid_target');
-
-    const state = await read(); const generation = state.generation;
-    // htu is checked against the configured token endpoint, never the incoming Request URL.
-    const proof = await verifyDpopProof(request.headers.get('dpop'), { method: 'POST', url: options.tokenEndpoint, nowMs: now() });
-    // Nonce challenge precedes any network fetch and any replay consumption.
-    if (requireNonce && !state.nonces.some(nonce => nonce.value === proof.claims.nonce && nonce.expiresAt > now())) throw new TokenError('use_dpop_nonce', { 'DPoP-Nonce': await currentNonce(state) });
-
-    const { client, verify, keys } = await authenticateClient(clientId, clientAssertion);
-    let session: AssertionClaims | undefined;
-    if (grantType === JWT_BEARER) {
-      try { session = await verify(assertion!); } catch (error) { throw error instanceof TokenError ? error : new TokenError('invalid_grant'); }
-      if (session.iss !== clientId || session.aud !== issuer || session.sub.length > 256 || !current(session) || session.jti === client.jti) throw new TokenError('invalid_grant');
-    }
-    // Identity keys and DPoP keys must differ (spec 4.1).
-    for (const key of keys().keys) if (await calculateJwkThumbprint(key).catch(() => null) === proof.jkt) throw new TokenError('invalid_dpop_proof');
-
-    const body = await commit({ kind: 'token', clientId, sessionKey: proof.jkt, ...(code ? { codeHash: tokenHash(code) } : {}), ...(refreshToken ? { refreshHash: tokenHash(refreshToken) } : {}), replayKeys: [...(session ? [client, session] : [client]).map(claims => `assertion ${clientId} ${claims.jti}`), `proof ${proof.jkt} ${proof.claims.jti}`], at: now() }, draft => {
-      // A reset between verification and commit must not recreate state from a stale verification.
-      if (draft.generation !== generation) throw new TokenError('invalid_grant');
-      // Re-check freshness at commit time with the same clock used to prune, so a slow fetch cannot outlive its replay entry.
-      const at = now();
-      if ((proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000 < at) throw new TokenError('invalid_dpop_proof');
-      if (client.exp * 1000 <= at) throw new TokenError('invalid_client');
-      if (session && session.exp * 1000 <= at) throw new TokenError('invalid_grant');
-      prune(draft, at);
-      // Client and session assertions share one jti namespace per client.
-      const assertions = session ? [client, session] : [client];
-      const assertionKeys = assertions.map(claims => `assertion ${clientId} ${claims.jti}`);
-      const proofKey = `proof ${proof.jkt} ${proof.claims.jti}`;
-      if (assertionKeys.some(key => own(draft.replay, key) !== undefined)) throw new TokenError('invalid_grant');
-      if (own(draft.replay, proofKey) !== undefined) throw new TokenError('invalid_dpop_proof');
-      assertions.forEach((claims, index) => { draft.replay[assertionKeys[index]] = claims.exp * 1000; });
-      draft.replay[proofKey] = (proof.claims.iat + PROOF_WINDOW_SECONDS) * 1000;
-
-      const sessionId = own(draft.sessionKeys, proof.jkt);
-      const existing = (userId?: string) => {
-        const found = sessionId === undefined ? undefined : own(draft.sessions, sessionId);
-        if (!found || !(found.expiresAt > at) || found.clientId !== clientId || (userId !== undefined && found.userId !== userId)) throw new TokenError('invalid_grant');
-        return found;
-      };
-      const create = (userId: string): [string, SessionRecord] => {
-        // Pruned above, so these are live; a slot frees when the soonest of them ends (spec 4.2 rate_limited).
-        const live = Object.values(draft.sessions).filter(record => record.clientId === clientId);
-        if ((draft.limits?.sessions ?? live.length) >= maxSessionsPerClient) throw new TokenError('rate_limited', { 'Retry-After': String(Math.ceil(((draft.limits?.earliestSessionExpiry ?? Math.min(...live.map(record => record.expiresAt))) - at) / 1000)) });
-        const id = `ses_${random(16)}`;
-        draft.sessionKeys[proof.jkt] = id;
-        return [id, draft.sessions[id] = { clientId, userId, ...(session?.agent_id === undefined ? {} : { agentId: session.agent_id as string }), version: 1, createdAt: at, expiresAt: at, accountId: null, grantId: null }];
-      };
-      const accessToken = random(32);
-      const grant = (id: string, record: SessionRecord, grantId: string | null, scopes: string[]) => {
-        record.expiresAt = at + sessionMs;
-        draft.accessTokens[tokenHash(accessToken)] = { sessionId: id, grantId, scopes, resource: resource ?? null, jkt: proof.jkt, expiresAt: at + lifetimeMs };
-        return { access_token: accessToken, token_type: 'DPoP', expires_in: lifetimeSeconds, ...(grantId === null ? {} : { scope: scopes.join(' ') }) };
-      };
-      // Signs the Session in to the lineage and rotates its Account Token: consume, successor and session update in this one commit.
-      const signIn = (id: string, record: SessionRecord, grantId: string) => {
-        const lineage = draft.grants[grantId];
-        // Sticky account (spec 4.4): a Session once signed in to another account never switches, and no tokens are issued.
-        if (record.accountId !== null && record.accountId !== lineage.accountId) throw new TokenError('account_mismatch');
-        const scopes = requested ?? lineage.scopes;
-        if (!scopes.every(item => lineage.scopes.includes(item))) throw new TokenError('invalid_scope');
-        const successor = random(32);
-        // Retain ancestors until the fixed grant expiry so every replay can revoke its descendants.
-        lineage.previousHash = lineage.refreshHash; lineage.refreshHash = tokenHash(successor); draft.refreshTokens[lineage.refreshHash] = grantId;
-        record.accountId = lineage.accountId; record.grantId = grantId;
-        return { ...grant(id, record, grantId, scopes), refresh_token: successor, refresh_token_expires_in: Math.floor((lineage.expiresAt - at) / 1000) };
-      };
-
-      if (grantType === JWT_BEARER) {
-        if (!session) throw new TokenError('invalid_grant');
-        if (sessionId === undefined) return grant(...create(session.sub), null, []);
-        const record = existing(session.sub);
-        if (record.agentId !== session.agent_id) throw new TokenError('invalid_grant');
-        // A signed-in Session is renewed with its Account Token instead (spec 4.2).
-        if (record.grantId !== null && grantLive(own(draft.grants, record.grantId), at)) throw new TokenError('invalid_grant');
-        record.grantId = null;
-        return grant(sessionId!, record, null, []);
-      }
-      if (grantType === 'authorization_code') {
-        const record = own(draft.codes, tokenHash(code!));
-        if (!record || record.expiresAt <= at || record.clientId !== clientId || record.sessionKey !== proof.jkt) throw new TokenError('invalid_grant');
-        if (record.grantId !== null) { revokeGrant(draft, record.grantId); return null; }
-        if (record.redirectUri !== redirectUri || tokenHash(codeVerifier!) !== record.codeChallenge) throw new TokenError('invalid_grant');
-        if (!consentCurrent(draft, record.clientId, record.accountId, record.revision)) throw new TokenError('invalid_grant');
-        const target = existing();
-        const grantId = `grt_${random(16)}`;
-        draft.grants[grantId] = { clientId, userId: target.userId, accountId: record.accountId, scopes: record.scopes, expiresAt: at + accountLifetimeMs, revoked: false, refreshHash: '', previousHash: '' };
-        record.grantId = grantId;
-        return signIn(sessionId!, target, grantId);
-      }
-      const presented = tokenHash(refreshToken!);
-      const grantId = own(draft.refreshTokens, presented);
-      const lineage = grantId === undefined ? undefined : own(draft.grants, grantId);
-      // Reuse of any ancestor Account Token (e.g. a retry after a lost response) revokes the lineage, so its Sessions
-      // continue signed out instead of staying bound to a successor nobody holds (RFC 9700 4.14.2).
-      if (lineage && lineage.clientId === clientId && presented !== lineage.refreshHash) { revokeGrant(draft, grantId!); return null; }
-      // A rotated Account Token never issues another successor.
-      if (!lineage || !grantLive(lineage, at) || lineage.clientId !== clientId || lineage.refreshHash !== presented) throw new TokenError('invalid_grant');
-      return sessionId === undefined ? signIn(...create(lineage.userId), grantId!) : signIn(sessionId, existing(lineage.userId), grantId!);
-    });
-    // A reused code or previous Account Token revoked its lineage in the commit above.
-    if (body === null) throw new TokenError('invalid_grant');
-    return json(200, body);
+    if (grantType === MEDIATED_GRANT) return mediatedSignIn(request, params);
+    if (grantType === 'authorization_code' || grantType === 'refresh_token') return accountToken(request, params);
+    throw new TokenError('unsupported_grant_type');
   }
 
   // RFC 7009 with private_key_jwt client authentication; unknown and foreign tokens succeed without changing any grant.
@@ -655,7 +502,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const code = error instanceof TokenError || error instanceof AuthorityError ? error.code : undefined;
       if (!code) throw error;
       const status = code === 'invalid_client' || code === 'invalid_token' ? 401 : code === 'rate_limited' ? 429 : code === 'sign_in_not_found' ? 404 : code === 'temporarily_unavailable' ? 503 : 400;
-      return json(status, { error: code }, error instanceof TokenError ? error.headers : {});
+      return json(status,{error:code==='rate_limited'?'temporarily_unavailable':code},{...(code==='rate_limited'?{'Retry-After':'60'}:code==='temporarily_unavailable'?{'Retry-After':'5'}:{}),...(error instanceof TokenError?error.headers:{})});
     }
   }
 
@@ -672,9 +519,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   const policy: AuthorityPolicy = {
     withCurrent: (principal, scopes, action) => options.coordinator.run(async () => {
       const state = await read({ kind: 'principal', sessionId: principal.sessionId, ...(principal.grantId ? { grantId: principal.grantId } : {}) });
-      const session = own(state.sessions, principal.sessionId);
-      if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || !session || session.clientId !== principal.clientId
-        || principal.tokenExpiresAt <= now() || session.expiresAt <= now() || session.userId !== principal.userId || !liveGrant(state, principal)) throw new AuthorityError('invalid_token');
+      if (principal.issuer !== issuer || principal.issuerGeneration !== state.generation || principal.tokenExpiresAt <= now() || !liveGrant(state,principal)) throw new AuthorityError('invalid_token');
       requireScopes(principal.scopes, scopes);
       return action();
     }),
@@ -691,25 +536,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   };
 
   return {
-    browserSessions: {
-      async current(binding) { return browserSession(await read({ kind: 'browser', sessionId: binding.sessionId }), binding); },
-      async join(sessionKey) {
-        const state = await read({ kind: 'sign_in', ids: [], sessionKey, replayKeys: [], at: now() });
-        const id = own(state.sessionKeys, sessionKey), session = id && own(state.sessions, id);
-        if (!id || !session) throw new AuthorityError('invalid_token');
-        return browserSession(state, { clientId: session.clientId, userId: session.userId, sessionId: id });
-      },
-    },
     token: request => respond(request, issue),
     revoke: request => respond(request, revokeToken),
-    async sessionForKey(binding) {
-      const state = await read({ kind: 'sign_in', ids: [], sessionKey: binding.sessionKey, replayKeys: [], at: now() });
-      const sessionId = own(state.sessionKeys, binding.sessionKey);
-      if (!sessionId) throw new AuthorityError('invalid_token');
-      return browserSession(state, { clientId: binding.clientId, userId: binding.userId, sessionId });
-    },
     deviceAuthorization: request => respond(request, startDevice),
-    mediatedSignIn: request => respond(request, mediatedSignIn),
     async beginDeviceAuthorization(userCode, browserBinding) {
       if (!options.device || typeof userCode !== 'string' || typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthorizationError('invalid_request');
       const id = tokenHash(userCode), selection: IssuerSelection = { kind: 'sign_in', ids: [id], replayKeys: [], at: now() };
@@ -758,8 +587,8 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       if (!state || state.length > 512) throw fail('invalid_request');
       const codeChallenge = params.get('code_challenge') ?? '';
       if (params.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw fail('invalid_request');
-      const sessionKey = params.get('dpop_jkt');
-      if (!sessionKey || !/^[A-Za-z0-9_-]{43}$/.test(sessionKey)) throw fail('invalid_request');
+      const sessionKey = params.get('dpop_jkt') ?? null;
+      if (sessionKey !== null && !/^[A-Za-z0-9_-]{43}$/.test(sessionKey)) throw fail('invalid_request');
       const scopes = [...new Set((params.get('scope') ?? '').split(' ').filter(Boolean))];
       if (!scopes.length || !scopes.every(scope => options.supportedScopes.includes(scope))) throw fail('invalid_scope');
       // resource is accepted and ignored here: grants cover every resource, and each token request selects one (spec 4.3).
@@ -786,7 +615,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const accountId = 'accountId' in decision && typeof decision.accountId === 'string' ? decision.accountId : undefined;
       const href = await commit({ kind: 'authorization', id, ...(snapshot && accountId ? { revocationKey: accountRevisionKey(snapshot.clientId, accountId) } : {}) }, draft => {
         const record = own(draft.authorizations, id);
-        if (!record || !record.sessionKey || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
+        if (!record || record.sessionKey === undefined || record.expiresAt <= now() || record.browserHash !== tokenHash(browserBinding)) throw new AuthorizationError('invalid_request');
         const denied = 'denied' in decision && decision.denied === true;
         const { accountId, scopes } = decision as { accountId: unknown; scopes: unknown };
         // Partial consent narrows; the host may never grant more than was requested.
@@ -817,9 +646,9 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
         issuer, token_endpoint: options.tokenEndpoint, revocation_endpoint: options.revocationEndpoint,
         ...(options.authorizationEndpoint ? { authorization_endpoint: options.authorizationEndpoint, response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] } : {}),
         ...(options.device ? { device_authorization_endpoint: options.device.endpoint } : {}),
-        dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true,
+        dpop_signing_alg_values_supported: ['ES256'], token_endpoint_auth_signing_alg_values_supported: [...ASSERTION_ALGORITHMS], client_id_metadata_document_supported: true,
         protected_resources: [...options.protectedResources],
-        grant_types_supported: [JWT_BEARER, 'refresh_token', ...(mcpResources.some(entry => !entry.dpop) ? ['urn:ietf:params:oauth:grant-type:token-exchange'] : []), ...(options.authorizationEndpoint ? ['authorization_code'] : []), ...(options.device ? [DEVICE_GRANT] : [])],
+        grant_types_supported: ['refresh_token', ...(options.mediated?[MEDIATED_GRANT]:[]), ...(options.authorizationEndpoint ? ['authorization_code'] : []), ...(options.device ? [DEVICE_GRANT] : [])],
         scopes_supported: [...options.supportedScopes],
       };
     },
@@ -827,21 +656,11 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       issuer,
       revocationVisibility: 'immediate: every introspection and policy check reads the shared issuer store; policy checks are ordered by the shared coordinator',
       async introspect(token, resource) {
-        const state = await read({ kind: 'access', hash: tokenHash(token) }); const at = now();
-        const record = own(state.accessTokens, tokenHash(token));
-        const session = record && own(state.sessions, record.sessionId);
-        if (!record || !session || !(session.expiresAt > at) || record.expiresAt <= at || record.resource !== (resource ?? null)) throw new AuthorityError('invalid_token');
-        // A signed-in token stops working once its sign-in is revoked or expires; a signed-out one stays signed out.
-        const grant = record.grantId === null ? undefined : own(state.grants, record.grantId);
-        if (record.grantId !== null && !grantLive(grant, at)) throw new AuthorityError('invalid_token');
-        return {
-          principal: {
-            issuer, clientId: session.clientId, userId: session.userId, sessionId: record.sessionId,
-            ...(grant ? { accountId: grant.accountId, grantId: record.grantId! } : {}),
-            scopes: [...record.scopes], tokenExpiresAt: record.expiresAt, sessionVersion: session.version, issuerGeneration: state.generation,
-          },
-          dpopJkt: record.jkt || null,
-        };
+        const state = await read({kind:'access',hash:tokenHash(token)}), record = own(state.accessTokens,tokenHash(token));
+        if (!record || !record.grantId || record.expiresAt <= now() || record.resource !== (resource ?? null)) throw new AuthorityError('invalid_token');
+        const grant = own(state.grants,record.grantId);
+        if (!grantLive(grant,now()) || (record.clientId !== undefined && record.clientId !== grant!.clientId) || (record.accountId !== undefined && record.accountId !== grant!.accountId)) throw new AuthorityError('invalid_token');
+        return {principal:{issuer,clientId:grant!.clientId,userId:'',sessionId:'',accountId:grant!.accountId,grantId:record.grantId,scopes:[...record.scopes],tokenExpiresAt:record.expiresAt,sessionVersion:0,issuerGeneration:state.generation},dpopJkt:record.jkt || null};
       },
       policy,
     },

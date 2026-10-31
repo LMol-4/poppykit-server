@@ -17,7 +17,7 @@ in production. The reference issuer is optional; [existing issuers](AUTH.md) use
 an ExternalAuthorityAdapter instead.
 
 ```js
-import { createRequestAuthenticator, createConversationService } from '@poppykit/server';
+import { createRequestAuthenticator, createConversationService, createSessionAuthority } from '@poppykit/server';
 import { createMetadataResolver, createNodeTransport, createReferenceIssuer } from '@poppykit/server/reference-auth';
 import { SqliteCompanyDatabase } from '@poppykit/server/sqlite';
 
@@ -26,21 +26,24 @@ const transport = createNodeTransport();
 try {
   const issuer = 'https://company.example/issuer';
   const endpoint = 'https://company.example/conversations';
+  const metadata = createMetadataResolver(transport);
   const auth = createReferenceIssuer({
     issuer, tokenEndpoint: issuer + '/token', revocationEndpoint: issuer + '/revoke',
     protectedResources: ['https://company.example'], supportedScopes: [], resources: [endpoint],
-    metadata: createMetadataResolver(transport), store: database.issuer(issuer),
+    metadata, store: database.issuer(issuer),
     coordinator: database, now: Date.now,
   });
+  const sessions = createSessionAuthority({companyId:issuer,metadata,store:database.sessions(issuer),
+    coordinator:database,accountPolicy:auth.authority.policy,now:Date.now});
   const service = createConversationService({
     historyScopes: ['orders:read'],
-    endpoint, store: database.conversations(issuer), policy: auth.authority.policy,
-    authenticator: createRequestAuthenticator({ authority: auth.authority,
+    endpoint, store: database.conversations(issuer), policy: sessions.policy,
+    authenticator: createRequestAuthenticator({ sessions, authority: auth.authority,
       endpoints: [{ origin: 'https://company.example', pathPrefix: '/conversations', resource: endpoint }],
       now: Date.now }), clock: { now: Date.now },
   });
   console.log((await service.handle(new Request(endpoint, { method: 'POST',
-    headers: { 'content-type': 'application/json' }, body: '{}' }))).status); // 401
+    headers: { 'content-type': 'application/json' }, body: '{}' }))).status); // 400
 } finally {
   transport.close?.();
   database.close();

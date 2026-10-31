@@ -80,7 +80,7 @@ function assertPacket<M extends keyof Packets>(mode:M,value:unknown):asserts val
 }
 
 function worker<M extends keyof Packets>(t:test.TestContext,mode:M,path:string) {
-  const options:SpawnOptions={windowsHide:true,stdio:['ignore','ignore','pipe','ipc']};const child=fork(new URL('../test-support/storage-worker.mjs',import.meta.url),[mode,path],options);
+  const options:SpawnOptions={windowsHide:true,stdio:['ignore','ignore','pipe','ipc'],env:{...process.env,D1_POSTGRES:'0'}};const child=fork(new URL('../test-support/storage-worker.mjs',import.meta.url),[mode,path],options);
   const exited = once(child, 'exit'); let errors = ''; expectValue(child.stderr).on('data', b => { errors += b; });
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) { child.kill(); await exited; } });
   const message = new Promise<Packets[M]>((resolve,reject)=>{child.once('message',value=>{try{assertPacket(mode,value);resolve(value);}catch(error){reject(error);}}); child.once('error', reject); child.once('exit', code => { if (code) reject(new Error(errors)); }); });
@@ -212,7 +212,6 @@ test('bounded SQLite cleanup isolates namespaces and retains grants, work, recei
 test('durable issuer rotates and revokes atomically; authority and conversation mutation share one transaction', async t => {
   const path = await fixture(), db = new SqliteCompanyDatabase(path); t.after(() => db.close());
   const env = await issuerSetup({ store: db.issuer(ISSUER), coordinator: db, requireDpopNonce: false });
-  const start = await env.send(); assert.equal(start.status, 200);
   const verifier = 'v'.repeat(43), url = new URL(ISSUER + '/authorize');
   const fields = { response_type: 'code', client_id: CLIENT, redirect_uri: REDIRECT, scope: 'orders:read', state: 'state', code_challenge_method: 'S256', dpop_jkt: await calculateJwkThumbprint(env.dpopKey.jwk), code_challenge: createHash('sha256').update(verifier).digest('base64url') };
   for (const [name, value] of Object.entries(fields)) url.searchParams.set(name, value);
@@ -222,7 +221,7 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   assert.equal(signed.status, 200, JSON.stringify(signed.body));
   const { principal } = await env.issuer.authority.introspect(expectValue(signed.body.access_token));
   const rotation = worker(t, 'rotate', path), revocation = worker(t, 'revoke', path);
-  const input = { refreshToken: signed.body.refresh_token, sessionId:expectValue(start.sessionId) };
+  const input = { refreshToken: signed.body.refresh_token };
   rotation.child.send(input); revocation.child.send(input);
   const [rotatedResult, revokedResult] = await Promise.all([rotation.message, revocation.message]);
   await Promise.all([rotation.exited, revocation.exited]);
@@ -245,5 +244,5 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   await assert.rejects(env.issuer.authority.policy.withCurrent(currentPrincipal, [], async () => { throw new Error('must not run'); }), { code: 'invalid_token' });
   const rotated = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: signed.body.refresh_token });
   assert.equal(rotated.body.error, 'invalid_grant');
-  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:expectValue(start.sessionId) })).sessions, {});
+  assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:'' })).sessions, {});
 });

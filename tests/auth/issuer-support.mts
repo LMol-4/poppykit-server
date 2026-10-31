@@ -4,8 +4,8 @@ import type {IssuerSelection} from '../../dist/reference-auth/store.js';
 import type {MetadataResolver} from '../../dist/network/discovery.js';
 import type {JWTPayload,ProtectedHeaderParameters,JSONWebKeySet} from 'jose';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
-import { SignJWT } from 'jose';
+import { createHash, randomUUID } from 'node:crypto';
+import { calculateJwkThumbprint, decodeProtectedHeader, SignJWT } from 'jose';
 import { createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
 import { memoryCoordinator } from '../conversation/support.mjs';
@@ -35,7 +35,7 @@ export function memoryStore(initial:IssuerState) {
 type KeyPair=Awaited<ReturnType<typeof keyPair>>;
 type AssertionOptions={key?:KeyPair;header?:ProtectedHeaderParameters};
 type ProofOptions=NonNullable<Parameters<typeof proof>[1]>&{key?:KeyPair};
-export interface Reply {sessionId?:string;signedIn?:boolean;status:number;headers:Headers;body:Record<string,unknown> & {access_token?:string;refresh_token?:string;session_id?:string;scope?:string;error?:string}}
+export interface Reply {sessionId?:string;signedIn?:boolean;status:number;headers:Headers;body:Record<string,unknown> & {access_token?:string;refresh_token?:string;session_id?:string;scope?:string;error?:string;sign_in_id?:string}}
 export interface Environment {
  identity:KeyPair;dpopKey:KeyPair;clock:{now:number};store:ReturnType<typeof memoryStore>;calls:{client:number;jwks:number;refresh:number};
  jwks:{keys:({kty:string}&ReturnType<typeof jsonObject>)[]};refreshedJwks:{keys:({kty:string}&ReturnType<typeof jsonObject>)[]};metadata:MetadataResolver;issuer:ReturnType<typeof createReferenceIssuer>;
@@ -64,9 +64,18 @@ export async function setup(overrides:Partial<ReferenceIssuerOptions> = {}) {
   };
   env.clientAssertion = (claims = {}, options) => env.assertion({ sub: CLIENT, ...claims }, options);
   env.proof = (options = {}) => proof(options.key ?? dpopKey, { htu: TOKEN_ENDPOINT, iat: Math.floor(clock.now / 1000), nonce: env.nonce, ...options });
-  // Sends a token request; fields override the defaults, undefined deletes one.
+  // Default requests redeem a synthetic, explicitly consented OAuth code; no resource Session is minted.
   env.send = async (fields = {}, { dpop, url = TOKEN_ENDPOINT, headers = {} } = {}) => {
-    const form = { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: await env.assertion(), client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...fields };
+    const defaultFields: Record<string, string> = {};
+    if (!Object.hasOwn(fields, 'grant_type')) {
+      const code = randomUUID(), verifier = 'v'.repeat(43), hash = (value: string) => createHash('sha256').update(value).digest('base64url');
+      const sessionKey = dpop === null ? null : await calculateJwkThumbprint(dpop ? decodeProtectedHeader(dpop).jwk! : env.dpopKey.jwk);
+      await (overrides.store ?? env.store).transaction({ kind: 'token', clientId: CLIENT, sessionKey: sessionKey ?? '', codeHash: hash(code), replayKeys: [], at: clock.now }, state => {
+        state.codes[hash(code)] = { sessionKey, clientId: CLIENT, redirectUri: REDIRECT, codeChallenge: hash(verifier), accountId: 'fixture-account', scopes: ['orders:read', 'orders:write'], expiresAt: clock.now + 60000, grantId: null, revision: 0 };
+      });
+      Object.assign(defaultFields, { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: REDIRECT });
+    }
+    const form = { ...defaultFields, client_id: CLIENT, client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: await env.clientAssertion(), ...fields };
     const body = new URLSearchParams(Object.entries(form).filter((entry):entry is [string,string]=>entry[1]!==undefined));
     const response = await env.issuer.token(new Request(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...(dpop === null ? {} : { dpop: dpop ?? await env.proof() }), ...headers }, body }));
     const result = { status: response.status, headers: response.headers, body: await response.json() };

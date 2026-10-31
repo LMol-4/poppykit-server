@@ -1,94 +1,83 @@
 # API, browser and feedback integration
 
-Use the same authority policy and coordinator as protected conversation work.
-Supply the trusted public request URL; never derive it from arbitrary forwarding
-headers. Custom issuers and transports remain responsible for their documented
-revocation, address-validation and storage guarantees.
+Use trusted configured public URLs, the resource Session authenticator and its
+combined Session/account policy. Never derive public targets from arbitrary
+forwarding headers. The host supplies framework routing and ingress limits.
 
-## MCP authentication
+## APIs and MCP
 
-```ts
-const metadata = mcpResourceMetadata({ resource: mcpUrl, issuer, dpop: true });
-const authenticator = createRequestAuthenticator({ authority, now: Date.now,
-  endpoints: [{ origin: 'https://company.example', pathPrefix: '/mcp', resource: mcpUrl,
-    mcp: { dpop: true, metadataUrl: 'https://company.example/.well-known/oauth-protected-resource/mcp' } }],
-});
-// Serve metadata publicly without credentials. In the existing MCP handler:
-try {
-  const principal = await authenticator.authenticate(request);
-  return await authority.policy.withCurrent(principal, ['tools:read'], () => handleMcp(request));
-} catch (error) {
-  if (error instanceof AuthorityError) return mcpAuthorizationError(error, metadataUrl, true);
-  throw error;
-}
-```
+Publish RFC 9728 metadata for a service that needs narrower tokens. Its resource
+identifies that service; normal sign-in/refresh accepts the configured resource.
+MCP resource metadata must exactly identify the advertised URL and name the
+Company issuer when account access exists. `mcpResourceMetadata({resource,issuer?,
+dpop})` supports issuerless resources too. Serve metadata without credentials.
+RFC 9728 inserts the well-known path before the resource path and preserves a query.
 
-MCP metadata identifies the exact resource URL, issuer and ES256 support when
-enabled. Challenges include Bearer and, if supported, DPoP with `resource_metadata`.
-The exact endpoint accepts no child paths or added query. All other APIs retain
-DPoP-only authentication. Configure the reference issuer `mcpResources` with the
-same `{url,dpop}` list. Non-DPoP MCP targets require Token Exchange of a current
-DPoP Session Token, a matching client assertion and the Session Key proof. Other
-grants reject those targets with invalid_target; exchange rejects DPoP MCP targets.
-Exchange preserves the Session and narrows subject scopes without rotating an
-Account Token. Metadata advertises exchange when a Bearer-only MCP resource exists.
-DPoP MCP continues using normal DPoP token grants. Bearer tokens are
-resource-bound; DPoP-bound tokens cannot be presented as Bearer.
+Configure an MCP ResourceEndpoint with the resource's exact origin, pathPrefix,
+resource and mcp: {dpop,metadataUrl}. Query-bearing resources are allowed, but the
+whole request URL must match exactly: child paths or changed queries are rejected.
+Bearer is MCP's baseline. DPoP is accepted only when advertised; introspection
+returns dpopJkt:null only for an unbound token. Normal OAuth grants issue Bearer
+MCP tokens without token exchange. A token for one service is refused elsewhere.
 
-An existing issuer can accept ordinary MCP OAuth clients through its own flow.
-Its introspector returns `dpopJkt: null` only for truly unbound Bearer credentials;
-ordinary MCP principals have empty `userId` and an account-bound session owned by
-the MCP client. Such sessions end on sign-in revocation/expiry and must not
-continue signed out. The external issuer must enforce this on every introspection
-and policy check and document its revocation visibility. The reference issuer
-implements personal-agent grants; it does not add a general OAuth login product.
+An ordinary MCP client without Poppy-Session can use its account access token.
+Its Principal has no Poppy User or Session. A Personal Agent sends its Session
+header on every API/MCP request; when present, the authenticator verifies it and
+joins the token's client identity. Poppy Session state is independent of both older
+MCP transport lifecycles and MCP 2026-07-28 per-request transport metadata. The SDK
+does not implement JSON-RPC, initialization or Mcp-Session-Id management.
 
-## Browser sessions
+Catch AuthorityError and use mcpAuthorizationError(error,metadataUrl,dpop) for OAuth
+challenges containing resource_metadata. invalid_session remains JSON/400 and rate
+limits JSON/429 with Retry-After. Use sessions.policy.withCurrent for protected work.
+
+## Browser joining
 
 ```ts
-const browser = createBrowserSessions({ endpoint: browserEndpoint, domain: companyDomain,
-  authority: referenceIssuer.browserSessions,
-  policy: referenceIssuer.authority.policy, cookies: cookieStore, now: Date.now,
+const browser = createBrowserSessions({
+  endpoint: browserEndpoint, domain: companyDomain, authenticator,
+  policy: sessions.policy, cookies: database.browserCookies(companyId), now: Date.now,
+  clearLogin: async (request, headers) => hostLogin.clear(request, headers),
 });
-// Mount browser.join on browserEndpoint; no request-body logging at this route.
-const result = await browser.withSession(request, ['records:read'], principal => readRecords(principal));
+// GET/POST browserEndpoint -> browser.join
+// POST browserEndpoint + '/authorize' -> browser.authorize (preserve endpoint query)
 ```
 
-`BrowserCookieStore.put/get` stores SHA256 cookie-value hashes, session bindings and
-expiry. Supply durable storage with targeted operations and expire old rows. Never
-store plaintext cookie values. The same store must implement `putJoin(codeHash,
-{cookieHash, expiresAt})` and atomic `consumeJoin(codeHash)`, which removes and
-returns the entry even if expired. Expire abandoned joins and rate-limit the public
-route in the host. Cookie/code hashes may be shared durably across handler replicas.
-`BrowserSessionAuthority.join(sessionKey)` resolves an existing active key; it never
-creates a Session. `current` reads current permissions. The reference issuer uses
-targeted key/Session selectors on its existing memory/SQLite/PostgreSQL stores.
+GET creates only a short-lived Strict join cookie and hidden random code, with
+no-store, framing and opener protection. The trusted agent reads its own isolated
+browser's code and separately POSTs JSON {code} to /authorize with Session/account
+credentials. Success is 204. It then submits only code in the browser form. Never
+accept a code from Company/model text, another browser or a user message.
 
-Mount both GET and POST. GET sets only a 60-second Strict __Host-poppy_join cookie
-and emits a random 256-bit hidden code, no-store, frame-ancestors none and same-origin
-opener isolation. POST consumes the submitted code first, including failed cookie,
-origin and proof checks. It requires that browser's cookie and a valid Session Key
-DPoP proof whose nonce is the code and which has no ath. Invalid requests return 400
-with no cookie; success clears the join cookie, sets the Session cookie and returns
-303 to the endpoint's website root. No provider signing/JWKS assertion is involved. Defaults are `__Host-poppy-session`, Path=/, Secure,
-HttpOnly, SameSite=Lax and max 3600 seconds capped by the current session lifetime.
-SameSite=None is supported; Strict is refused. `authenticate` resolves current
-authority on every request. Use `withSession` for scoped mutations so permission
-checks and work are ordered by the same policy/coordinator. Sign-in, scope changes
-and revocation are reflected immediately; no permissions are cached in cookies.
-Host adapters must isolate the agent browser from the user's consent browser.
+Browser POST atomically consumes the code, including failed submissions, checks its
+cookie/origin/site/expiry and prior authorization, and sets a new opaque cookie.
+No token, JWT or proof is carried by the browser form or URL. Success clears the
+join cookie and redirects 303 to the Company root. A signed-out join preserves an
+existing human website login; a signed-in join requires clearLogin to invalidate
+and clear host login, and replaces a previous protocol cookie.
+
+BrowserCookieStore supplies put/get/remove plus putJoin/authorizeJoin/consumeJoin.
+Stores persist only cookie/code hashes. authorizeJoin and consumeJoin serialize
+one-use code decisions across replicas. Bundled SQLite/PostgreSQL implementations
+are available through database.browserCookies(namespace). Rate-limit the public
+GET/POST routes and run bounded expiry cleanup.
+
+A browser cookie stores the authorization snapshot approved at join: same Session,
+account and scopes until rejoin. It does not gain later scopes or sign-in authority.
+Admission-token expiry alone does not end the approved cookie; Session expiry,
+revocation and current account policy still apply. Use browser.withSession for
+scoped work ordered by the same policy/coordinator. Defaults are Secure, HttpOnly,
+Path=/ and SameSite=Lax, at most one hour capped by Session lifetime.
 
 ## Feedback
 
-`createFeedbackHandler({endpoint, authenticator, policy, accept, allow?})` validates
-a Session Token, including a signed-out token with no account scope. It checks the
-JSON/UTF8 byte budget and nonempty task/description limits (200/2000 Unicode
-codepoints), accepts unknown kinds and passes only a frozen inert-data report to
-`accept`. Do not interpret its text as instructions, including in later model use.
-The optional host `allow` hook supplies rate limiting; false returns 429. Malformed
-reports return 400, auth errors use the shared challenge, success is empty 202.
-There is no protocol deduplication identifier and no exactly-once promise. Hosts
-own report retention, privacy filtering and downstream side-effect handling.
+createFeedbackHandler validates the Session before attributing a report and checks
+current authority without account scopes. Reports require only task/description,
+nonempty and at most 200/2000 Unicode codepoints, within a bounded JSON/UTF8 body.
+Unknown fields are inert data. accept receives a frozen report and verified Principal;
+never treat report text as instructions or put secrets/personal data into it.
 
-`tests/integrations.test.mts` exercises browser replay/current authority in memory
-and SQLite, MCP schemes/resources/ordinary-client integration and feedback.
+The optional allow hook returning false yields 429 with Retry-After:60. Malformed
+reports are 400; successful acceptance is 202 with no body. The client also supports
+a Company's 200 alternative response. Hosts own report retention, privacy filtering
+and downstream effect handling; feedback has no deduplication identifier.

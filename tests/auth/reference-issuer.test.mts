@@ -4,7 +4,7 @@ import { expectValue } from '../../test-support/assertions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { CompactSign, SignJWT } from 'jose';
+import { CompactSign, SignJWT, decodeJwt } from 'jose';
 import { ValidationError } from '../../dist/protocol/wire.js';
 import { createMetadataResolver, createReferenceIssuer, initialIssuerState } from '../../dist/reference-auth/index.js';
 import { createRequestAuthenticator } from '../../dist/index.js';
@@ -12,62 +12,45 @@ import { NOW, keyPair, proof } from './support.mjs';
 import { memoryCoordinator } from '../conversation/support.mjs';
 import { API, CLIENT, ISSUER, JWKS_URI, RESOURCE, TOKEN_ENDPOINT, expectError, setup } from './issuer-support.mjs';
 
-test('issues and renews a signed-out DPoP session after a nonce challenge', async () => {
-  const env = await setup();
-  const challenge = await env.challenge();
+test('issues independent OAuth account credentials after a nonce challenge', async () => {
+  const env = await setup(), challenge = await env.challenge();
   assert.equal(challenge.status, 400); assert.equal(challenge.headers.get('cache-control'), 'no-store'); assert.ok(expectValue(env.nonce).length >= 16);
-  const first = await env.send();
-  assert.equal(first.status, 200); assert.equal(first.headers.get('cache-control'), 'no-store');
-  assert.deepEqual(Object.keys(first.body).sort(), ['access_token', 'expires_in', 'token_type']);
-  assert.equal(first.body.token_type, 'DPoP'); assert.equal(first.body.expires_in, 3600);
+  const first = await env.send(); assert.equal(first.status, 200); assert.equal(first.body.token_type, 'DPoP'); assert.equal(first.body.expires_in, 3600);
+  assert.deepEqual(Object.keys(first.body).sort(), ['access_token','expires_in','refresh_token','refresh_token_expires_in','scope','token_type']);
   assert.ok(Buffer.from(expectValue(first.body.access_token), 'base64url').length >= 32);
-  assert.ok(!JSON.stringify(env.store.state).includes(expectValue(first.body.access_token)), 'plaintext token is not persisted');
-  const sessionId = (await env.issuer.authority.introspect(expectValue(first.body.access_token))).principal.sessionId;
-  const renewed = await env.send();
-  assert.equal(renewed.status, 200); assert.notEqual(renewed.body.access_token, first.body.access_token);
-
-  const authenticator = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://api.shop.test', pathPrefix: '/poppy' }], now: () => env.clock.now });
-  const resourceProof = await proof(env.dpopKey, { htu: API, iat: NOW / 1000, token: renewed.body.access_token });
-  const principal = await authenticator.authenticate(new Request(API, { method: 'POST', headers: { authorization: `DPoP ${renewed.body.access_token}`, dpop: resourceProof } }));
-  assert.deepEqual(principal, { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId, scopes: [], tokenExpiresAt: NOW + 3600_000, sessionVersion: 1, issuerGeneration: env.store.state.generation });
-  assert.deepEqual(env.issuer.authorizationMetadata(), { issuer: ISSUER, token_endpoint: TOKEN_ENDPOINT, revocation_endpoint: `${ISSUER}/oauth/revoke`, dpop_signing_alg_values_supported: ['ES256'], client_id_metadata_document_supported: true, protected_resources: ['https://shop.test'], grant_types_supported: ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token'], scopes_supported: ['orders:read','orders:write'] });
+  assert.ok(!JSON.stringify(env.store.state).includes(expectValue(first.body.access_token)));
+  const renewed = await env.send({grant_type:'refresh_token',refresh_token:first.body.refresh_token}); assert.equal(renewed.status, 200);
+  const principal = (await env.issuer.authority.introspect(expectValue(renewed.body.access_token))).principal;
+  assert.deepEqual([principal.userId,principal.sessionId,principal.accountId],['','','fixture-account']);
+  assert.deepEqual(env.store.state.sessions, {}); assert.deepEqual(env.store.state.sessionKeys, {});
+  assert.deepEqual(env.issuer.authorizationMetadata().grant_types_supported, ['refresh_token']);
 });
 
-test('Session Keys atomically name one owned Session and retain ended-key rejection and agent identity', async () => {
-  const env = await setup({ requireDpopNonce: false });
-  const responses = await Promise.all([env.send(), env.send()]);
-  assert.deepEqual(responses.map(r => r.status), [200, 200]);
-  assert.equal(Object.keys(env.store.state.sessions).length, 1);
-  const [id] = Object.keys(env.store.state.sessions);
-  expectError(await env.send({ assertion: await env.assertion({ sub: 'foreign-user' }) }), 'invalid_grant');
-  expectError(await env.send({ client_id: 'https://agent.test/other.json', client_assertion: await env.clientAssertion({ iss: 'https://agent.test/other.json', sub: 'https://agent.test/other.json' }), assertion: await env.assertion({ iss: 'https://agent.test/other.json' }) }), 'invalid_grant');
-  expectError(await env.send({ session_id: id }), 'invalid_request');
-  env.clock.now += 86_400_001;
-  expectError(await env.send(), 'invalid_grant');
-  const key = await keyPair();
-  assert.equal((await env.send({ assertion: await env.assertion({ agent_id: 'opaque-agent' }) }, { dpop: await env.proof({ key }) })).status, 200);
-  expectError(await env.send({}, { dpop: await env.proof({ key }) }), 'invalid_grant');
-  assert.equal((await env.send({ assertion: await env.assertion({ agent_id: 'opaque-agent' }) }, { dpop: await env.proof({ key }) })).status, 200);
+test('OAuth proof-key reuse does not identify or create resource Sessions', async () => {
+  const env = await setup({requireDpopNonce:false});
+  const responses = await Promise.all([env.send(),env.send()]); assert.deepEqual(responses.map(r=>r.status),[200,200]);
+  assert.equal(Object.keys(env.store.state.grants).length,2); assert.deepEqual(env.store.state.sessions,{}); assert.deepEqual(env.store.state.sessionKeys,{});
+  expectError(await env.send({session_id:'not-an-oauth-parameter'}),'invalid_request');
+  expectError(await env.send({assertion:await env.assertion({agent_id:'obsolete'})}),'invalid_request');
+  env.clock.now += 86400001; assert.equal((await env.send()).status,200,'OAuth is independent of resource Session lifetime');
 });
 
-test('key-selected Bearer acquisition remains unbound at the exact MCP resource', async () => {
-  const resource = 'https://mcp.shop.test/mcp', env = await setup({ requireDpopNonce: false, mcpResources: [{ url: resource, dpop: false }] });
-  expectError(await env.send({ resource }), 'invalid_target');
-  const subject = await env.send();
-  const issued = await env.send({ grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange', assertion: undefined, subject_token: subject.body.access_token, subject_token_type: 'urn:ietf:params:oauth:token-type:access_token', requested_token_type: 'urn:ietf:params:oauth:token-type:access_token', resource }); assert.equal(issued.status, 200); assert.equal(issued.body.token_type, 'Bearer');
-  const auth = createRequestAuthenticator({ authority: env.issuer.authority, endpoints: [{ origin: 'https://mcp.shop.test', pathPrefix: '/mcp', resource, mcp: { dpop: false, metadataUrl: 'https://mcp.shop.test/.well-known/oauth-protected-resource/mcp' } }], now: () => env.clock.now });
-  const principal = await auth.authenticate(new Request(resource, { method: 'POST', headers: { authorization: `Bearer ${issued.body.access_token}` } }));
-  assert.equal(principal.userId, 'usr_1'); assert.equal(Object.keys(env.store.state.sessionKeys).length, 1);
-  await assert.rejects(auth.authenticate(new Request(resource + '/other', { headers: { authorization: `Bearer ${issued.body.access_token}` } })), { code: 'invalid_token' });
+test('ordinary Bearer account acquisition stays unbound at the exact MCP resource', async () => {
+  const resource='https://mcp.shop.test/mcp',env=await setup({requireDpopNonce:false,mcpResources:[{url:resource,dpop:false}]});
+  const issued=await env.send({resource},{dpop:null});assert.equal(issued.status,200);assert.equal(issued.body.token_type,'Bearer');
+  const auth=createRequestAuthenticator({authority:env.issuer.authority,endpoints:[{origin:'https://mcp.shop.test',pathPrefix:'/mcp',resource,mcp:{dpop:false,metadataUrl:'https://mcp.shop.test/.well-known/oauth-protected-resource/mcp'}}],now:()=>env.clock.now});
+  const principal=await auth.authenticate(new Request(resource,{method:'POST',headers:{authorization: 'Bearer '+issued.body.access_token}}));assert.equal(principal.userId,'');assert.equal(principal.sessionId,'');assert.equal(principal.accountId,'fixture-account');
+  await assert.rejects(auth.authenticate(new Request(resource+'/other',{headers:{authorization:'Bearer '+issued.body.access_token}})),{code:'invalid_token'});
+  assert.deepEqual(env.store.state.sessionKeys,{});
 });
 
 test('nonce challenge precedes network fetches and replay consumption, and nonce state stays bounded', async () => {
   const env = await setup();
-  const assertion = await env.assertion(); const clientAssertion = await env.clientAssertion();
-  const missing = await env.send({ assertion, client_assertion: clientAssertion });
+  const clientAssertion = await env.clientAssertion();
+  const missing = await env.send({ client_assertion: clientAssertion });
   expectError(missing, 'use_dpop_nonce'); env.nonce = missing.headers.get('dpop-nonce');
   assert.deepEqual(env.calls, { client: 0, jwks: 0, refresh: 0 }); assert.deepEqual(env.store.state.replay, {});
-  assert.equal((await env.send({ assertion, client_assertion: clientAssertion })).status, 200, 'same assertions usable after the challenge');
+  assert.equal((await env.send({ client_assertion: clientAssertion })).status, 200, 'same assertions usable after the challenge');
   const wrong = await env.send({}, { dpop: await env.proof({ nonce: 'not-issued-by-us-0000' }) });
   expectError(wrong, 'use_dpop_nonce'); assert.equal(wrong.headers.get('dpop-nonce'), env.nonce, 'current nonce is reused');
   env.clock.now += 301_000;
@@ -100,46 +83,26 @@ test('client assertion defects are invalid_client', async () => {
   expectError(await env.send({ client_assertion: undefined }), 'invalid_client');
 });
 
-test('session assertion defects, reuse and cross-role jti reuse are invalid_grant', async () => {
-  const env = await setup(); await env.challenge(); const other = await keyPair(); const now = Math.floor(NOW / 1000);
-  const cases = {
-    signature: await env.assertion({}, { key: other }),
-    audience: await env.assertion({ aud: TOKEN_ENDPOINT }),
-    issuer: await env.assertion({ iss: 'https://agent.test/other.json' }),
-    expired: await env.assertion({ iat: now - 120, exp: now - 1 }),
-    lifetimeTooLong: await env.assertion({ iat: now, exp: now + 301 }),
-    longSubject: await env.assertion({ sub: 'u'.repeat(257) }),
-  };
-  for (const [name, assertion] of Object.entries(cases)) await assert.doesNotReject(async () => expectError(await env.send({ assertion }), 'invalid_grant'), name);
-  expectError(await env.send({ assertion: undefined }), 'invalid_grant');
-  expectError(await env.send({ assertion: await env.assertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_grant');
-  expectError(await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'poppy-browser+jwt' } }) }), 'invalid_client');
-  for (const typ of ['application/poppy-browser+jwt', 'Poppy-Browser+JWT', 'APPLICATION/poppy-browser+jwt']) {
-    expectError(await env.send({ assertion: await env.assertion({}, { header: { typ } }) }), 'invalid_grant');
-  }
-  assert.equal((await env.send({ client_assertion: await env.clientAssertion({}, { header: { typ: 'client-authentication+jwt' } }) })).status, 200);
-  const sameJti = randomUUID();
-  expectError(await env.send({ assertion: await env.assertion({ jti: sameJti }), client_assertion: await env.clientAssertion({ jti: sameJti }) }), 'invalid_grant');
-  const assertion = await env.assertion(); const clientJti = randomUUID();
-  assert.equal((await env.send({ assertion, client_assertion: await env.clientAssertion({ jti: clientJti }) })).status, 200);
-  expectError(await env.send({ assertion }), 'invalid_grant');
-  expectError(await env.send({ assertion: await env.assertion({ jti: clientJti }) }), 'invalid_grant');
-  const reusedClient = await env.clientAssertion();
-  assert.equal((await env.send({ client_assertion: reusedClient })).status, 200);
-  expectError(await env.send({ client_assertion: reusedClient }), 'invalid_grant');
-  assert.equal(Object.keys(env.store.state.sessions).length, 1);
+test('retired Session assertions are refused and client assertion type/replay checks remain enforced', async () => {
+  const env=await setup();await env.challenge();
+  for(const typ of ['JWT','poppy-browser+jwt','application/poppy-browser+jwt','Poppy-Browser+JWT'])expectError(await env.send({assertion:await env.assertion({}, {header:{typ}})}),'invalid_request');
+  expectError(await env.send({client_assertion:await env.clientAssertion({}, {header:{typ:'poppy-browser+jwt'}})}),'invalid_client');
+  const client_assertion=await env.clientAssertion({}, {header:{typ:'client-authentication+jwt'}});
+  assert.equal((await env.send({client_assertion})).status,200);
+  expectError(await env.send({client_assertion}),'invalid_client');
+  assert.deepEqual(env.store.state.sessions,{});
 });
 
 test('replay retention survives a restart and expires with the assertion', async () => {
   const env = await setup(); await env.challenge();
-  const assertion = await env.assertion();
-  assert.equal((await env.send({ assertion })).status, 200);
+  const client_assertion = await env.clientAssertion();
+  assert.equal((await env.send({ client_assertion })).status, 200);
   const restarted = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: TOKEN_ENDPOINT, revocationEndpoint: `${ISSUER}/oauth/revoke`, protectedResources: ['https://shop.test'],supportedScopes:[],metadata: env.metadata, store: env.store, coordinator: memoryCoordinator(), now: () => env.clock.now });
   env.issuer = restarted;
-  expectError(await env.send({ assertion }), 'invalid_grant');
+  expectError(await env.send({ client_assertion }), 'invalid_client');
   env.clock.now += 61_000; env.nonce = undefined; await env.challenge();
   assert.equal((await env.send()).status, 200);
-  assert.ok(Object.values(env.store.state.replay).every(until => until >= env.clock.now), 'expired replay entries are pruned');
+  assert.equal((await env.send({client_assertion: await env.clientAssertion({jti:decodeJwt(client_assertion).jti})})).status, 200, 'expired replay entries cannot block a fresh assertion; durable cleanup bounds retained rows');
 });
 
 test('freshness is rechecked at commit when the clock advances during the JWKS fetch', async () => {
@@ -148,12 +111,10 @@ test('freshness is rechecked at commit when the clock advances during the JWKS f
   const replayed = await env.proof();
   assert.equal((await env.send({}, { dpop: replayed })).status, 200);
   env.clock.now = NOW + 59_000; env.onJwks = () => { env.clock.now += 2_000; };
-  expectError(await env.send({ assertion: await env.assertion(long), client_assertion: await env.clientAssertion(long) }, { dpop: replayed }), 'invalid_dpop_proof');
+  expectError(await env.send({ client_assertion: await env.clientAssertion(long) }, { dpop: replayed }), 'invalid_dpop_proof');
   env.clock.now = NOW + 59_000;
-  expectError(await env.send({ assertion: await env.assertion(long), client_assertion: await env.clientAssertion({ iat: t0, exp: t0 + 60 }) }), 'invalid_client');
-  env.clock.now = NOW + 59_000;
-  expectError(await env.send({ assertion: await env.assertion({ iat: t0, exp: t0 + 60 }), client_assertion: await env.clientAssertion(long) }), 'invalid_grant');
-  assert.equal(Object.keys(env.store.state.sessions).length, 1);
+  expectError(await env.send({ client_assertion: await env.clientAssertion({ iat: t0, exp: t0 + 60 }) }), 'invalid_client');
+  assert.deepEqual(env.store.state.sessions, {});
 });
 
 test('token-endpoint DPoP proofs are verified against the configured URL with replay and key separation', async () => {
@@ -181,7 +142,7 @@ test('unknown kid triggers exactly one JWKS refresh', async () => {
   const env = await setup(); await env.challenge();
   const rotated = await keyPair(); env.refreshedJwks = { keys: [{ ...rotated.jwk, kid: 'k2', alg: 'ES256' }] };
   const signed = async (sub: string) => env.assertion({ sub }, { key: rotated, header: { kid: 'k2' } });
-  assert.equal((await env.send({ assertion: await signed('usr_1'), client_assertion: await signed(CLIENT) })).status, 200);
+  assert.equal((await env.send({ client_assertion: await signed(CLIENT) })).status, 200);
   assert.equal(env.calls.refresh, 1);
   expectError(await env.send({ client_assertion: await env.clientAssertion({}, { key: rotated, header: { kid: 'k9' } }) }), 'invalid_client');
   assert.equal(env.calls.refresh, 2, 'one refresh per request, and the resolver bounds repeats');
@@ -190,10 +151,10 @@ test('unknown kid triggers exactly one JWKS refresh', async () => {
 test('session, scope, resource and request shape checks', async () => {
   const env = await setup(); await env.challenge();
   const first = await env.send();
-  expectError(await env.send({ assertion: await env.assertion({ sub: 'usr_2' }) }), 'invalid_grant');
+  expectError(await env.send({ assertion: await env.assertion({ sub: 'usr_2' }) }), 'invalid_request');
   expectError(await env.send({ session_id: 'ses_missing' }), 'invalid_request');
   expectError(await env.send({ session_id: '__proto__' }), 'invalid_request');
-  expectError(await env.send({ scope: 'orders:read' }), 'invalid_scope');
+  assert.equal((await env.send({ scope: 'unapproved' })).body.scope, 'orders:read orders:write', 'an extra code-exchange field cannot widen consent');
   expectError(await env.send({ resource: 'https://api.shop.test/other' }), 'invalid_target');
   expectError(await env.send({ grant_type: 'password' }), 'unsupported_grant_type');
   expectError(await env.send({ grant_type: undefined }), 'invalid_request');
@@ -232,7 +193,7 @@ test('session, scope, resource and request shape checks', async () => {
 test('a reset between verification and commit fails issuance without recreating state', async () => {
   const env = await setup(); await env.challenge();
   env.onJwks = () => { env.store.state = initialIssuerState(); };
-  expectError(await env.send(), 'invalid_grant');
+  expectError(await env.send(), 'invalid_client');
   assert.deepEqual(env.store.state.sessions, {}); assert.deepEqual(env.store.state.replay, {});
 });
 
@@ -267,7 +228,7 @@ test('a metadata resolver rate limit is rate_limited with Retry-After; other fet
   const env = await setup(); await env.challenge();
   env.onClient = () => { throw new ValidationError('metadata.rate_limited'); };
   const limited = await env.send();
-  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
+  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'temporarily_unavailable' }, '60']);
   env.onClient = () => { throw new ValidationError('metadata.status'); };
   expectError(await env.send(), 'invalid_client');
   env.onClient = undefined;
@@ -303,11 +264,20 @@ test('the real metadata resolver limits map to rate_limited, not invalid_client'
   // Cap of one fetch per minute: the client document uses it, so the JWKS fetch is refused.
   const capped = await build({ maxFetchesPerMinute: 1 });
   const limited = await capped.send();
-  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
+  assert.deepEqual([limited.status, limited.body, limited.headers.get('retry-after')], [429, { error: 'temporarily_unavailable' }, '60']);
   // An unknown kid forces a JWKS refresh; a second one inside a minute is jwks.refresh_limited.
   const refreshing = await build({ maxFetchesPerMinute: 100 });
   const unknownKid = await refreshing.clientAssertion({}, { header: { kid: 'k9' } });
   expectError(await refreshing.send({ client_assertion: unknownKid }), 'invalid_client');
   const again = await refreshing.send({ client_assertion: unknownKid });
-  assert.deepEqual([again.status, again.body, again.headers.get('retry-after')], [429, { error: 'rate_limited' }, '60']);
+  assert.deepEqual([again.status, again.body, again.headers.get('retry-after')], [429, { error: 'temporarily_unavailable' }, '60']);
+});
+
+test('PS384 root client assertions authenticate independent OAuth grants',async()=>{
+  const env=await setup({requireDpopNonce:false}),root=await keyPair('PS384');
+  env.jwks={keys:[{...root.jwk,kid:'rsa-root',alg:'PS384'}]};
+  const client_assertion=await env.clientAssertion({}, {key:root,header:{alg:'PS384',kid:'rsa-root',typ:'client-authentication+jwt'}});
+  const issued=await env.send({client_assertion});assert.equal(issued.status,200);
+  assert.equal((await env.issuer.authority.introspect(expectValue(issued.body.access_token))).principal.clientId,CLIENT);
+  expectError(await env.send({client_assertion}),'invalid_client');
 });

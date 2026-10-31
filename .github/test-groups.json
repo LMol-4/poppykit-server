@@ -19,7 +19,11 @@
     "tests/postgres-storage.test.mts",
     "tests/postgres-lifecycle.test.mts",
     "tests/issuer-contract.test.mts",
-    "tests/conversation/postgres-adapter-contract.test.mts"
+    "tests/conversation/postgres-adapter-contract.test.mts",
+    "tests/auth/session.test.mts",
+    "tests/auth/account-grants.test.mts",
+    "tests/browser.test.mts",
+    "tests/session-adapter-contract.test.mts"
   ],
   "integration": [
     "tests/integrations.test.mts",

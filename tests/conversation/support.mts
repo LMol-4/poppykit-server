@@ -107,7 +107,12 @@ export function setup(options:Partial<ConversationOptions> = {}) {
       method, signal, headers: { authorization: `DPoP ${as}`, 'content-type': 'application/json' },
       body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
     }));
-    return { status: response.status, headers: response.headers, body: await response.json() };
+    const text = await response.text();
+    if (!text) {
+      assert.equal(response.status, 401);
+      assert.equal(response.headers.get('www-authenticate'), 'Bearer scope="orders:read", DPoP scope="orders:read"');
+    }
+    return { status: response.status, headers: response.headers, body: text ? JSON.parse(text) : {} };
   }
   const start = (message:unknown,opts?:CallOptions) => call('POST', '', { ...opts, body: { message } });
   const send = (id:string,message:unknown,opts?:CallOptions) => call('POST', `/${id}/messages`, { ...opts, body: { message } });

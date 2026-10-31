@@ -15,7 +15,7 @@ export type KnownEvent =
   | (ConversationEvent & { type: 'user_requested'; reason: string })
   | (ConversationEvent & { type: 'direct_opened' | 'direct_closed'; conversation_id: string });
 export interface EventPage extends ConversationState { events: ConversationEvent[]; cursor: string | null; has_more: boolean }
-export interface TokenResponse { access_token: string; token_type: 'DPoP' | 'Bearer'; expires_in: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number; [key: string]: unknown }
+export interface TokenResponse { access_token: string; token_type: 'DPoP' | 'Bearer'; expires_in?: number; scope?: string; refresh_token?: string; refresh_token_expires_in?: number; [key: string]: unknown }
 export interface ProtocolErrorBody { error: string; error_description?: string; error_uri?: string; extension?: string; conversation_id?: string; [key: string]: unknown }
 
 export class ValidationError extends Error {
@@ -93,7 +93,9 @@ export function parseConversationRequest(value: unknown): ConversationRequest {
 }
 export function parseConversationState(value: unknown): ConversationState {
   const state = object(value); id(state.conversation_id, 'conversation_id');
-  member(state.status, ['working', 'idle', 'queued', 'closed'], 'status'); member(state.responder, ['agent', 'human'], 'responder');
+  string(state.status, 'status'); string(state.responder, 'responder');
+  if (!['working', 'idle', 'queued', 'closed'].includes(state.status as string)) state.status = 'working';
+  if (!['agent', 'human'].includes(state.responder as string)) state.responder = 'human';
   return state as ConversationState;
 }
 export function parseEvent(value: unknown): ConversationEvent {
@@ -106,7 +108,10 @@ export function parseEvent(value: unknown): ConversationEvent {
   if (+month < 1 || +month > 12 || +day < 1 || +day > days.getUTCDate() || +hour > 23 || +minute > 59 || +second > 60 || +offsetHour > 23 || +offsetMinute > 59) throw new ValidationError('event.created_at');
   switch (event.type) {
     case 'message': parseMessage(event.message, { recorded: true }); break;
-    case 'state': member(event.status, ['working', 'idle', 'queued', 'closed'], 'event.status'); member(event.responder, ['agent', 'human'], 'event.responder'); break;
+    case 'state': {
+      const state = parseConversationState({ conversation_id: 'state', status: event.status, responder: event.responder });
+      event.status = state.status; event.responder = state.responder; break;
+    }
     case 'authorization':
       member(event.error, ['insufficient_scope'], 'event.error');
       if (!/^[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*$/.test(string(event.scope, 'event.scope'))) throw new ValidationError('event.scope');
@@ -125,7 +130,7 @@ export function parseEventPage(value: unknown, requestCursor?: string): EventPag
   } else {
     string(page.cursor, 'cursor');
     const expected = page.events.length ? page.events.at(-1).id : requestCursor;
-    if (expected !== undefined && page.cursor !== expected) throw new ValidationError('cursor');
+    if (expected === undefined || page.cursor !== expected) throw new ValidationError('cursor');
   }
   return page as EventPage;
 }
@@ -135,7 +140,10 @@ export function parseTokenResponse(value: unknown): TokenResponse {
     const scope = string(token.scope, 'scope', false);
     if (scope !== '' && (!/^[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*$/.test(scope) || new Set(scope.split(' ')).size !== scope.split(' ').length)) throw new ValidationError('scope');
   }
-  member(token.token_type, ['DPoP', 'Bearer'], 'token_type'); positive(token.expires_in, 'expires_in');
+  const type = string(token.token_type, 'token_type').toLowerCase();
+  if (type !== 'bearer' && type !== 'dpop') throw new ValidationError('token_type');
+  token.token_type = type === 'bearer' ? 'Bearer' : 'DPoP';
+  if ('expires_in' in token && (!Number.isSafeInteger(token.expires_in) || (token.expires_in as number) < 0)) throw new ValidationError('expires_in');
   if ('refresh_token' in token) string(token.refresh_token, 'refresh_token');
   if ('refresh_token_expires_in' in token) positive(token.refresh_token_expires_in, 'refresh_token_expires_in');
   return token as TokenResponse;

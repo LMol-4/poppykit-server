@@ -1,0 +1,61 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { CompactSign, generateKeyPair, exportJWK, calculateJwkThumbprint } from 'jose';
+import { createBrowserSessions, createRequestAuthenticator, createSessionAuthority, AuthorityError } from '../dist/index.js';
+import type { AuthorityPolicy, Principal } from '../dist/index.js';
+import { SqliteCompanyDatabase } from '../dist/sqlite.js';
+import { PostgresCompanyDatabase } from '../dist/postgres.js';
+import { testPool } from '../test-support/postgres.mjs';
+
+for(const engine of ['SQLite',...(process.env.D1_POSTGRES==='1'?['Postgres']:[])])test(`browser authorization snapshots, one-use codes and revocation survive handles (${engine})`,async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'browser-core-')),path=join(dir,'browser.db'),pool=engine==='Postgres'?testPool():undefined,namespace='https://'+randomUUID()+'.example';
+  const first=pool?new PostgresCompanyDatabase(pool):new SqliteCompanyDatabase(path),second=pool?new PostgresCompanyDatabase(pool):new SqliteCompanyDatabase(path);
+  t.after(async()=>{await first.close();await second.close();await pool?.end();await rm(dir,{recursive:true,force:true});});
+  const endpoint='https://shop.example/browser',clientId='https://peer.example/client.json',root=await generateKeyPair('ES256'),rootJwk={...await exportJWK(root.publicKey),kid:'root'};
+  let at=1790900000000,revoked=false,cleared=0;
+  const metadata={async resolveCompany():Promise<never>{throw new Error('not needed');},async resolveClient(id:string){assert.equal(id,clientId);return {client_id:clientId,client_name:'Independent',jwks_uri:'https://peer.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt' as const};},async resolveJwks(){return {keys:[rootJwk]};}};
+  const accountPolicy:AuthorityPolicy={async withCurrent(principal,scopes,action){if(revoked)throw new AuthorityError('invalid_token');if(!scopes.every(scope=>principal.scopes.includes(scope)))throw new AuthorityError('insufficient_scope');return action();},async withAccepted(_authority,_scopes,action){return action();}};
+  const make=(db:typeof first)=>{
+    const sessions=createSessionAuthority({companyId:namespace,metadata,store:db.sessions(namespace),coordinator:db,now:()=>at,accountPolicy});
+    const authenticator=createRequestAuthenticator({sessions,authority:{async introspect(token){if(revoked)throw new AuthorityError('invalid_token');const principal:Principal={issuer:namespace,clientId,userId:'',sessionId:'',sessionVersion:0,accountId:'account-a',grantId:'grant-a',scopes:token==='read-token'?['orders:read']:['orders:read','orders:write'],tokenExpiresAt:at+5000};return {principal,dpopJkt:null};}},endpoints:[{origin:'https://shop.example',pathPrefix:'/browser'}],now:()=>at});
+    return {sessions,browser:createBrowserSessions({endpoint,domain:'shop.example',authenticator,cookies:db.browserCookies(namespace),policy:sessions.policy,now:()=>at,cookieLifetimeSeconds:120,async clearLogin(_request,headers){cleared++;headers.append('Set-Cookie','__Host-login=; Path=/; Secure; HttpOnly; Max-Age=0');}})};
+  };
+  const one=make(first),two=make(second);
+  const form=async()=>{
+    const response=await one.browser.join(new Request(endpoint));assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');assert.match(response.headers.get('content-security-policy')!,/frame-ancestors 'none'/);assert.equal(response.headers.get('cross-origin-opener-policy'),'same-origin');
+    const html=await response.text();assert.equal(html.includes('name="proof"'),false);const code=/name="code" value="([^"]+)"/.exec(html)![1]!;
+    return {code,cookie:response.headers.getSetCookie()[0]!.split(';')[0]!};
+  };
+  const authorization=async(code:string,token?:string)=>{
+    const delegated=await generateKeyPair('ES256'),jwk=await exportJWK(delegated.publicKey),iat=Math.floor(at/1000);
+    const delegation=await new CompactSign(new TextEncoder().encode(JSON.stringify({iss:clientId,cnf:{jwk},iat,exp:iat+3600,jti:randomUUID()}))).setProtectedHeader({alg:'ES256',typ:'pap-delegation+jwt',kid:'root'}).sign(root.privateKey);
+    const jwt=await new CompactSign(new TextEncoder().encode(JSON.stringify({iss:clientId,aud:namespace,sid:'browser_session',sub:'pairwise-user',htm:'POST',htu:endpoint+'/authorize',iat,jti:randomUUID(),...(token?{ath:createHash('sha256').update(token).digest('base64url')}: {})}))).setProtectedHeader({alg:'ES256',typ:'poppy-session+jwt',kid:await calculateJwkThumbprint(jwk),pap_dlg:delegation}).sign(delegated.privateKey);
+    return new Request(endpoint+'/authorize',{method:'POST',headers:{'content-type':'application/json','poppy-session':jwt,...(token?{authorization:'Bearer '+token}: {})},body:JSON.stringify({code})});
+  };
+  const post=(value:{code:string;cookie:string},previous='')=>one.browser.join(new Request(endpoint,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded',cookie:value.cookie+(previous?'; '+previous:'')},body:new URLSearchParams({code:value.code})}));
+  const cookie=(response:Response)=>response.headers.getSetCookie().find(value=>value.startsWith('__Host-poppy-session='))!.split(';')[0]!;
+  const page=(value:string)=>new Request('https://shop.example/orders',{headers:{cookie:value}});
+  const untouched=await form();assert.equal((await first.sessions(namespace).read(clientId,'browser_session')).record,null,'GET does not create a Session');
+  assert.equal((await post(untouched)).status,400);assert.equal((await one.browser.authorize(await authorization(untouched.code))).status,400,'an unauthorized submission consumed its code');
+  const wrong=await form(),other=await form();assert.equal((await one.browser.authorize(await authorization(wrong.code))).status,204);assert.equal((await post({...wrong,cookie:other.cookie})).status,400);assert.equal((await post(wrong)).status,400);
+  const signedOut=await form();assert.equal((await one.browser.authorize(await authorization(signedOut.code))).status,204);assert.equal((await one.browser.authorize(await authorization(signedOut.code))).status,400);
+  const out=await post(signedOut,'__Host-login=existing');assert.equal(out.status,303);assert.equal(cleared,0,'signed-out join preserves ordinary login');
+  const outCookie=cookie(out);assert.equal((await two.browser.authenticate(page(outCookie))).accountId,undefined);
+  const signedIn=await form();const results=await Promise.all([one.browser.authorize(await authorization(signedIn.code,'read-token')),two.browser.authorize(await authorization(signedIn.code,'read-token'))]);assert.deepEqual(results.map(value=>value.status).sort(),[204,400]);
+  at+=6000;const joined=await post(signedIn,outCookie);assert.equal(joined.status,303,'valid authorized cookie is independent of access-token expiry');assert.equal(cleared,1);const oldCookie=cookie(joined);
+  await assert.rejects(two.browser.authenticate(page(outCookie)));assert.deepEqual((await two.browser.authenticate(page(oldCookie))).scopes,['orders:read']);
+  const broader=await form();assert.equal((await one.browser.authorize(await authorization(broader.code,'write-token'))).status,204);
+  assert.deepEqual((await two.browser.authenticate(page(oldCookie))).scopes,['orders:read'],'later token authority does not broaden a cookie');
+  await assert.rejects(two.browser.withSession(page(oldCookie),['orders:write'],async()=>assert.fail('scope escalation')),{code:'insufficient_scope'});
+  const replaced=await post(broader,oldCookie);assert.equal(replaced.status,303);await assert.rejects(two.browser.authenticate(page(oldCookie)));const currentCookie=cookie(replaced);
+  assert.deepEqual((await two.browser.authenticate(page(currentCookie))).scopes,['orders:read','orders:write']);
+  revoked=true;await assert.rejects(two.browser.authenticate(page(currentCookie)),{code:'invalid_token'});revoked=false;
+  const backOut=await form();assert.equal((await one.browser.authorize(await authorization(backOut.code))).status,204);const clearedBefore=cleared;
+  const reset=await post(backOut,currentCookie);assert.equal(reset.status,303);assert.equal(cleared,clearedBefore);await assert.rejects(two.browser.authenticate(page(currentCookie)));assert.equal((await two.browser.authenticate(page(cookie(reset)))).accountId,undefined);
+  const expired=await form();at+=60001;assert.equal((await one.browser.authorize(await authorization(expired.code))).status,400);assert.equal((await post(expired)).status,400);
+  await one.sessions.end(clientId,'browser_session');await assert.rejects(two.browser.authenticate(page(cookie(reset))),{code:'invalid_session'});
+});

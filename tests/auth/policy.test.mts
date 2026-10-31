@@ -12,7 +12,7 @@ const ISSUER = 'https://auth.shop.test';
 const CLIENT = 'https://agent.test/agent.json';
 const DAY = 86_400_000;
 
-// Grants are seeded as J10 sign-in will store them.
+// OAuth policy checks account grants; resource Session identity is checked separately.
 function setup() {
   const clock = { now: NOW };
   const initial = initialIssuerState();
@@ -21,7 +21,7 @@ function setup() {
   const store = memoryStore(initial);
   const coordinator = memoryCoordinator();
   const issuer = createReferenceIssuer({ issuer: ISSUER, tokenEndpoint: `${ISSUER}/token`, revocationEndpoint: `${ISSUER}/revoke`, protectedResources: ['https://shop.test'], metadata:createMetadataResolver({async fetch(){throw new Error('unexpected policy metadata fetch');}}),supportedScopes:[], store, coordinator, now: () => clock.now });
-  const signedIn = { issuer: ISSUER, clientId: CLIENT, userId: 'usr_1', sessionId: 's1', accountId: 'acct_1', grantId: 'g1', scopes: ['orders:read'], tokenExpiresAt: NOW + 3_600_000, sessionVersion: 1, issuerGeneration: initial.generation };
+  const signedIn = { issuer: ISSUER, clientId: CLIENT, userId: '', sessionId: '', accountId: 'acct_1', grantId: 'g1', scopes: ['orders:read'], tokenExpiresAt: NOW + 3_600_000, sessionVersion: 0, issuerGeneration: initial.generation };
   const { accountId, grantId, ...signedOut } = { ...signedIn, scopes: [] };
   const accepted = (principal:Principal, revocationPolicy:WorkRevocationPolicy = 'stop-account-work') => ({ principal, acceptedAt: NOW, revocationPolicy });
   return { clock, store, coordinator, issuer, policy: issuer.authority.policy, signedIn, signedOut, accepted };
@@ -43,8 +43,6 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
     issuer: { issuer: 'https://other.test' },
     generation: { issuerGeneration: 'old' },
     noGeneration: { issuerGeneration: undefined },
-    session: { sessionId: 'nope' },
-    sessionUser: { userId: 'usr_2' },
     sessionClient: { clientId: 'https://agent.test/other.json' },
     unknownGrant: { grantId: 'g2' },
     accountWithoutGrant: { grantId: undefined },
@@ -55,7 +53,7 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
     await assert.rejects(t.policy.withCurrent({ ...t.signedIn, ...change }, [], action), { code: 'invalid_token', status: 401 }, name);
   }
   const invalidStates: ((state: ReturnType<typeof initialIssuerState>) => void)[] = [
-    state => { state.sessions.s1.expiresAt = NOW; },
+    state => { state.grants.g1.clientId = 'https://foreign.example/client'; },
     state => { state.grants.g1.expiresAt = NOW; },
     state => { state.grants.g1.revoked = true; },
     state => { state.generation = 'after-reset'; },
@@ -66,7 +64,7 @@ test('withCurrent rejects stale or foreign principals and missing scopes without
   }
   const scope = await t.policy.withCurrent(t.signedIn, ['orders:read', 'orders:write'], action).catch(error => error);
   assert.ok(scope instanceof AuthorityError);
-  assert.deepEqual([scope.code, scope.status, scope.headers.get('www-authenticate')], ['insufficient_scope', 403, 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256"']);
+  assert.deepEqual([scope.code, scope.status, scope.headers.get('www-authenticate')], ['insufficient_scope', 403, 'DPoP error="insufficient_scope", scope="orders:read orders:write", algs="ES256", Bearer error="insufficient_scope", scope="orders:read orders:write"']);
   await assert.rejects(t.policy.withCurrent(t.signedOut, ['orders:read'], action), { code: 'insufficient_scope' });
   assert.equal(runs, 0);
   assert.equal(t.coordinator.held, false);

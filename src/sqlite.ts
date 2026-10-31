@@ -1,3 +1,6 @@
+import type { BrowserBinding, BrowserCookieStore, BrowserJoin } from './browser.js';
+import { randomUUID } from 'node:crypto';
+import type { SessionRecord, SessionState, SessionAdmission, SessionStore } from './auth/session.js';
 import { DatabaseSync } from 'node:sqlite';
 import { initializeSqlite } from './sqlite-init.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -196,6 +199,45 @@ export class SqliteCompanyDatabase {
       })),
     };
   }
+
+
+  browserCookies(namespace: string): BrowserCookieStore {
+    return {
+      put: (hash,binding) => this.run(async () => { this.put(namespace,'browser_cookies',hash,binding); }),
+      get: hash => this.run(async () => this.one<BrowserBinding & {expiresAt:number}>(namespace,'browser_cookies',hash) ?? null),
+      remove: hash => this.run(async () => { this.db.prepare('DELETE FROM records WHERE ns=? AND kind=? AND id=?').run(namespace,'browser_cookies',hash); }),
+      putJoin: (hash,binding) => this.run(async () => { this.put(namespace,'browser_joins',hash,binding); }),
+      authorizeJoin: (hash,principal,at) => this.run(async () => {
+        const row=this.one<BrowserJoin>(namespace,'browser_joins',hash);
+        if(!row||row.expiresAt<=at||row.principal)return false;
+        row.principal=structuredClone(principal);this.put(namespace,'browser_joins',hash,row);return true;
+      }),
+      consumeJoin: hash => this.run(async () => {
+        const row=this.one<BrowserJoin>(namespace,'browser_joins',hash);
+        if(row)this.db.prepare('DELETE FROM records WHERE ns=? AND kind=? AND id=?').run(namespace,'browser_joins',hash);
+        return row ?? null;
+      }),
+    };
+  }
+  sessions(namespace: string): SessionStore {
+    const load = (clientId: string, sid: string): SessionState => {
+      const meta = this.meta(namespace, 'session_meta', () => ({ version: 1 as const, generation: randomUUID() }));
+      if (meta.version !== 1) throw new Error('unsupported Session state version');
+      return { ...meta, record: this.one<SessionRecord>(namespace, 'resource_sessions', JSON.stringify([clientId, sid])) ?? null };
+    };
+    return {
+      read: (clientId, sid) => this.run(async () => load(clientId, sid)),
+      transaction: (clientId, sid, at, change) => this.run(async () => this.atomic(() => {
+        if (!Number.isFinite(at)) throw new TypeError('Session clock');
+        const counts = this.db.prepare("SELECT count(*) AS n,min(json_extract(body,'$.expiresAt')) AS expiry FROM records WHERE ns=? AND kind='resource_sessions' AND json_extract(body,'$.clientId')=? AND json_extract(body,'$.ended')=0 AND json_extract(body,'$.expiresAt')>?").get(namespace, clientId, at)!;
+        const state: SessionAdmission = { ...load(clientId, sid), activeCount: Number(counts.n), earliestExpiry: counts.expiry === null ? null : Number(counts.expiry) }, generation = state.generation, result = change(state);
+        if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('async Session transaction');
+        if (state.version !== 1 || state.generation !== generation || (state.record && (state.record.clientId !== clientId || state.record.sid !== sid))) throw new TypeError('Session state binding');
+        if (state.record) this.put(namespace, 'resource_sessions', JSON.stringify([clientId, sid]), state.record);
+        return structuredClone(result);
+      })),
+    };
+  }
   issuer(namespace: string): IssuerStore {
     const kinds = ['sessions', 'sessionKeys', 'grants', 'refreshTokens', 'authorizations', 'codes', 'signIns', 'accessTokens', 'replay'] as const;
     const load = (selection: IssuerSelection): IssuerState => {
@@ -227,7 +269,7 @@ export class SqliteCompanyDatabase {
         get('sessions', selection.sessionId);
         get('accessTokens', selection.accessHash);
         for (const key of selection.replayKeys) get('replay', key);
-        const counts = this.db.prepare("SELECT count(*) AS n, sum(CASE WHEN json_extract(body,'$.clientId')=? THEN 1 ELSE 0 END) AS client FROM records WHERE ns=? AND kind='signIns' AND json_extract(body,'$.status') IN ('pending','approved','verifying') AND json_extract(body,'$.expiresAt')>?").get(selection.clientId ?? '', namespace, selection.at)!;
+        const counts = this.db.prepare("SELECT count(*) AS n, sum(CASE WHEN json_extract(body,'$.clientId')=? THEN 1 ELSE 0 END) AS client FROM records WHERE ns=? AND kind='signIns' AND json_extract(body,'$.status') IN ('pending','approved','verifying') AND (json_extract(body,'$.status')='verifying' OR json_extract(body,'$.expiresAt')>?)").get(selection.clientId ?? '', namespace, selection.at)!;
         state.limits = { sessions: 0, earliestSessionExpiry: 0, pending: Number(counts.n), pendingForClient: Number(counts.client ?? 0) };
       }
       if (selection.kind === 'principal') { get('sessions', selection.sessionId); get('grants', selection.grantId); }
@@ -279,7 +321,7 @@ export class SqliteCompanyDatabase {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new TypeError('cleanup limit');
     return this.run(async () => {
       const rows = this.db.prepare(`SELECT kind,id FROM records AS retained WHERE ns=? AND
-        ((kind IN ('authorizations','codes','accessTokens') AND json_extract(body,'$.expiresAt')<=?) OR (kind='signIns' AND json_extract(body,'$.expiresAt')+30000<?) OR (kind='replay' AND CAST(body AS REAL)<?)
+        ((kind IN ('authorizations','codes','accessTokens','browser_cookies','browser_joins','resource_sessions') AND json_extract(body,'$.expiresAt')<=?) OR (kind='signIns' AND coalesce(json_extract(body,'$.status'),'')!='verifying' AND json_extract(body,'$.expiresAt')+30000<?) OR (kind='replay' AND CAST(body AS REAL)<?)
         OR (kind='refreshTokens' AND NOT EXISTS (SELECT 1 FROM records AS lineage WHERE lineage.ns=retained.ns AND lineage.kind='grants' AND lineage.id=json_extract(retained.body,'$') AND json_extract(lineage.body,'$.expiresAt')>? AND json_extract(lineage.body,'$.revoked')=0))) LIMIT ?`).all(namespace, now, now, now, now, limit);
       for (const row of rows) this.db.prepare('DELETE FROM records WHERE ns=? AND kind=? AND id=?').run(namespace, row.kind, row.id);
       return rows.length;

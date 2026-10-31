@@ -23,6 +23,51 @@ export function runIssuerAdapterContract(fixture:IssuerAdapterFixture):void {
   });
 }
 
+export type SessionAdapterFixture = () => Promise<{store:import('./auth/session.js').SessionStore;second:import('./auth/session.js').SessionStore;close():Promise<void>}>;
+export function runSessionAdapterContract(fixture:SessionAdapterFixture):void {
+  test('Session adapter contract: admission counts, concurrent writers, detached snapshots and rollback',async()=>{
+    const f=await fixture(),at=1790900000000,client='https://agent.example/client',sid='session_a';
+    try {
+      const empty=await f.store.read(client,sid);assert.equal(empty.record,null);
+      assert.equal((await f.second.read(client,sid)).generation,empty.generation);
+      await Promise.all(Array.from({length:8},(_,i)=>(i%2?f.store:f.second).transaction(client,sid,at,state=>{
+        assert.equal(state.activeCount,state.record?1:0);
+        state.record??={instanceId:'instance_a',clientId:client,sid,userId:'user_a',createdAt:at,expiresAt:at+1000,ended:false};
+        state.record.expiresAt++;
+      })));
+      const snapshot=await f.second.read(client,sid);assert.equal(snapshot.record!.expiresAt,at+1008);
+      snapshot.record!.userId='detached';assert.equal((await f.store.read(client,sid)).record!.userId,'user_a');
+      await assert.rejects(f.store.transaction(client,sid,at,state=>{state.record!.userId='rollback';throw new Error('rollback');}),/rollback/);
+      await assert.rejects(f.store.transaction(client,sid,at,async state=>{state.record!.userId='async';}));
+      assert.equal((await f.second.read(client,sid)).record!.userId,'user_a');
+      await f.second.transaction(client,'absent',at,state=>{assert.equal(state.activeCount,1);assert.equal(state.earliestExpiry,at+1008);});
+      await f.store.transaction(client,'absent',at+1008,state=>{assert.equal(state.activeCount,0);assert.equal(state.earliestExpiry,null);});
+      assert.equal((await f.store.read('https://other.example/client',sid)).record,null);
+    }finally{await f.close();}
+  });
+}
+export type BrowserCookieAdapterFixture = () => Promise<{store:import('./browser.js').BrowserCookieStore;second:import('./browser.js').BrowserCookieStore;close():Promise<void>}>;
+export function runBrowserCookieAdapterContract(fixture:BrowserCookieAdapterFixture):void {
+  test('browser adapter contract: one authorization and consumption across handles, fixed detached cookies',async()=>{
+    const f=await fixture(),at=1790900000000,principal:Principal={issuer:'https://company.example',clientId:'https://agent.example/client',userId:'user_a',sessionId:'session_a',sessionVersion:1,scopes:['read'],tokenExpiresAt:at+1000};
+    try{
+      await f.store.putJoin('code',{cookieHash:'cookie',expiresAt:at+1000});
+      const authorized=await Promise.all([f.store.authorizeJoin('code',principal,at),f.second.authorizeJoin('code',principal,at)]);
+      assert.deepEqual(authorized.sort(),[false,true]);
+      const consumed=await Promise.all([f.store.consumeJoin('code'),f.second.consumeJoin('code')]);
+      assert.equal(consumed.filter(Boolean).length,1);assert.deepEqual(consumed.find(Boolean)!.principal,principal);
+      await f.store.putJoin('expired',{cookieHash:'cookie',expiresAt:at-1});
+      assert.equal(await f.second.authorizeJoin('expired',principal,at),false);
+      assert.ok(await f.second.consumeJoin('expired'));assert.equal(await f.store.consumeJoin('expired'),null);
+      const binding={clientId:principal.clientId,userId:principal.userId,sessionId:principal.sessionId,principal,expiresAt:at+1000};
+      await f.store.put('browser',binding);principal.scopes.push('write');
+      const cookie=await f.second.get('browser');assert.deepEqual(cookie!.principal!.scopes,['read']);cookie!.principal!.scopes.push('admin');
+      assert.deepEqual((await f.store.get('browser'))!.principal!.scopes,['read']);
+      await f.second.remove('browser');assert.equal(await f.store.get('browser'),null);
+    }finally{await f.close();}
+  });
+}
+
 type Store = ConversationOptions['store'] & { inspect(): Promise<import('./conversation/service.js').ConversationStoreState>; adminTransaction<T>(change: (draft: import('./conversation/service.js').ConversationStoreState) => T): Promise<T> };
 export type ConversationAdapterFixture = () => Promise<{ store: Store; second: Store; close(): Promise<void> }>;
 

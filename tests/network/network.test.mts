@@ -10,7 +10,7 @@ import tls from 'node:tls';
 import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { createNodeTransport, isPublicAddress } from '../../dist/network/transport.js';
-import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl, signInMethods } from '../../dist/network/discovery.js';
+import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl, signInMethods, companyIdentifier } from '../../dist/network/discovery.js';
 import * as wire from '../../dist/protocol/wire.js';
 import { parseClientMetadata } from '../../dist/network/discovery.js';
 import { registeredRedirect } from '../../dist/network/redirect.js';
@@ -81,6 +81,7 @@ test('six-field pages and narrow null cursor preserve replay position', () => {
   const page = { ...state, events: [event], cursor: 'e1', has_more: false }; assert.deepEqual(wire.parseEventPage(page), page);
   for (const key of Object.keys(page)) { const bad:Record<string,unknown> = { ...page }; delete bad[key]; assert.throws(() => wire.parseEventPage(bad), key); }
   wire.parseEventPage({ ...state, events: [], cursor: null, has_more: false });
+  assert.throws(()=>wire.parseEventPage({...state,events:[],cursor:'invented',has_more:false}));
   assert.throws(() => wire.parseEventPage({ ...page, cursor: null }));
   assert.throws(() => wire.parseEventPage({ ...page, events: [], cursor: null }, 'before'));
   assert.throws(() => wire.parseEventPage({ ...page, cursor: 'wrong' }));
@@ -90,7 +91,7 @@ test('six-field pages and narrow null cursor preserve replay position', () => {
 test('token/error/retry codecs enforce semantic minimums without logging secret payload', () => {
   const token = { access_token: 'secret', token_type: 'DPoP', expires_in: 30, scope: '', session_id: 'session', signed_in: false };
   assert.deepEqual(wire.parseTokenResponse(token), token);
-  assert.throws(() => wire.parseTokenResponse({ ...token, expires_in: 0 }), error => error instanceof Error && !error.message.includes('secret'));
+  assert.throws(() => wire.parseTokenResponse({ ...token, expires_in: -1 }), error => error instanceof Error && !error.message.includes('secret'));
   assert.throws(() => wire.parseProtocolError({ error: 'extension_required' }));
   wire.parseProtocolError({ error: 'extension_required', extension: 'future' });
   assert.equal(wire.retryAfterMilliseconds('12', 0), 12000); assert.equal(wire.retryAfterMilliseconds('Mon, 19 Oct 2026 00:00:00 GMT', Date.parse('2026-10-18T23:59:59Z')), 1000); assert.equal(wire.retryAfterMilliseconds('-1', 0), undefined);
@@ -103,7 +104,7 @@ test('discovery enforces version, reciprocal issuer, algorithms, capability and 
   parseAuthorizationMetadata(authorization, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json'));
   assert.equal(authorizationMetadataUrl('https://auth.example/tenant'), 'https://auth.example/.well-known/oauth-authorization-server/tenant');
   for (const bad of [{ ...document, protocol_version: '0.2' }, { ...document, organization: { name: 'Shop', domain: 'other.example' } }, { protocol_version: '0.3', organization: document.organization, feedback: { endpoint: 'https://shop.example/feedback' } }]) assert.throws(() => parsePoppyDocument(bad, 'https://shop.example/.well-known/poppy.json'));
-  for (const bad of [{ ...authorization, issuer: 'https://auth.example/other' }, { ...authorization, protected_resources: ['https://other.example'] }, { ...authorization, dpop_signing_alg_values_supported: ['RS256'] }]) assert.throws(() => parseAuthorizationMetadata(bad, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));
+  for (const bad of [{ ...authorization, issuer: 'https://auth.example/other' }, { ...authorization, protected_resources: ['https://other.example'] }]) assert.throws(() => parseAuthorizationMetadata(bad, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));
   for (const bad of ['https://client.example', 'https://client.example/a/../client', 'https://client.example/%2e/client', 'https://user@client.example/client', 'http://client.example/client']) assert.throws(() => validateClientId(bad));
   validateClientId('https://client.example/');
 });
@@ -114,6 +115,7 @@ test('metadata client no redirects, invalid uncached, JWKS refresh bounded, doma
     calls.push([request.url, expectValue(options).mode]);
     if (request.url.endsWith('/client')) return Response.json(client, { status: clientStatus, headers: { 'cache-control': 'max-age=300' } });
     if (request.url.endsWith('/keys')) return Response.json({ keys: [{ kty: 'EC', crv: 'P-256', x: 'x', y: 'y' }] });
+    if (request.url.includes('oauth-protected-resource')) return Response.json({ resource: 'https://shop.example', authorization_servers: [authorization.issuer] });
     if (request.url.includes('oauth-authorization-server')) return Response.json(authorization);
     return Response.json(document);
   } });
@@ -123,16 +125,17 @@ test('metadata client no redirects, invalid uncached, JWKS refresh bounded, doma
   await resolver.resolveJwks(client.jwks_uri, { refresh: true }); await assert.rejects(resolver.resolveJwks(client.jwks_uri, { refresh: true }));
   assert.equal(expectValue((await resolver.resolveCompany('shop.example')).authorization).issuer, authorization.issuer);
 });
-test('issuer auth consistency is checked across cached domains and errors never enter cache', async () => {
+test('shared issuers permit per-domain descriptions and unknown auth fields while errors never enter cache', async () => {
   let bad = true; let requests = 0;
   const resolver = createMetadataResolver({ async fetch(request) {
     requests++;
+    if (request.url.includes('oauth-protected-resource')) return Response.json({ resource: new URL(request.url).origin, authorization_servers: [authorization.issuer] });
     if (request.url.includes('oauth-authorization-server')) return Response.json({ ...authorization, protected_resources: ['https://shop.example', 'https://other.example'] }, { headers: { 'cache-control': 'max-age=300' } });
     const other = request.url.includes('other.example');
     return Response.json({ ...document, protocol_version: bad ? 'wrong' : '0.3', organization: { name: 'Shop', domain: other ? 'other.example' : 'shop.example' }, auth: other ? { ...document.auth, unknown: 'changed' } : document.auth }, { headers: { 'cache-control': 'max-age=300' } });
   } });
-  await assert.rejects(resolver.resolveCompany('shop.example')); bad = false; await resolver.resolveCompany('shop.example'); assert.equal(requests, 3);
-  await assert.rejects(resolver.resolveCompany('other.example'), /auth.consistency/);
+  await assert.rejects(resolver.resolveCompany('shop.example')); bad = false; await resolver.resolveCompany('shop.example'); assert.equal(requests, 4);
+  assert.equal((await resolver.resolveCompany('other.example')).authorization?.issuer, authorization.issuer);
 });
 test('address policy rejects private, mapped, transition and alternate numeric URLs', async () => {
   for (const address of ['127.0.0.1', '10.0.0.1', '172.31.0.1', '192.168.1.1', '169.254.1.1', '100.64.0.1', '::1', '::ffff:127.0.0.1', 'fc00::1', 'fe80::1', '2001:db8::1', '2002:7f00:1::']) assert.equal(isPublicAddress(address), false, address);
@@ -315,26 +318,38 @@ test('rate-limited refresh does not burn the refresh slot', async () => {
   release(); await x;
   await resolver.resolveJwks('https://y.example/k', { refresh: true }); // same clock time: only a burned slot would block this
 });
-test('authDocuments inner and outer maps are bounded; live entries still conflict', async () => {
-  const issuers:Record<string,string> = { 'a1.example': 'i1', 'a2.example': 'i2', 'a3.example': 'i3', 'a4.example': 'i1', 'b1.example': 'j', 'b2.example': 'j', 'b3.example': 'j', 'b4.example': 'j' };
-  const scopesFor:Record<string,string[]> = {}; // domain -> direct scopes
-  const make = (clock:{t:number},extra:MetadataOptions = {}) => createMetadataResolver({ async fetch(request) {
-    const url = new URL(request.url); const headers = { 'cache-control': `max-age=${url.hostname === 'b1.example' ? 300 : 100}` };
-    if (url.pathname.includes('oauth-authorization-server')) return Response.json({ ...authorization, issuer: `https://${url.hostname}`, protected_resources: Object.keys(issuers).map(domain => `https://${domain}`), scopes_supported: ['x','y'] }, { headers });
-    const domain = url.hostname;
-    return Response.json({ ...document, organization: { name: 'S', domain }, auth: { issuer: `https://${issuers[domain]}.example`, scopes: {x:"Permission x",y:"Permission y"}, fixture_policy: scopesFor[domain] } }, { headers });
-  } }, { now: () => clock.t, maxFetchesPerMinute: 1000, ...extra });
-  Object.assign(scopesFor, { 'a1.example': ['x'], 'a2.example': ['x'], 'a3.example': ['x'], 'a4.example': ['y'] });
-  const full = make({ t: 0 }); for (const d of ['a1', 'a2', 'a3']) await full.resolveCompany(`${d}.example`);
-  await assert.rejects(full.resolveCompany('a4.example'), /auth.consistency/); // live entry conflicts
-  const clock = { t: 0 }; const outer = make(clock, { maxEntries: 2 });
-  for (const d of ['a1', 'a2', 'a3']) await outer.resolveCompany(`${d}.example`);
-  await outer.resolveCompany('a4.example'); // issuer i1 was evicted from the outer map
-  Object.assign(scopesFor, { 'b1.example': ['x'], 'b2.example': ['x'], 'b3.example': ['x'], 'b4.example': ['y'] });
-  const inner = make(clock, { maxEntries: 2 }); clock.t = 0;
-  for (const d of ['b1', 'b2', 'b3']) await inner.resolveCompany(`${d}.example`); // b1 (300 s) evicted from inner map, b2/b3 live 100 s
-  await assert.rejects(inner.resolveCompany('b4.example'), /auth.consistency/);
-  clock.t = 150000; await inner.resolveCompany('b4.example'); // b2/b3 expired, evicted b1 no longer conflicts
+test('issuerless discovery requires explicit absence and fails closed on malformed or failed metadata', async () => {
+  const doc = { protocol_version: '0.3', organization: { name: 'Shop', domain: 'shop.example' }, agent: { protocols: [{ type: 'poppy', endpoint: 'https://shop.example/conversations' }] } };
+  for (const response of [new Response(null, { status: 404 }), Response.json({resource:'https://shop.example'}), Response.json({resource:'https://shop.example',authorization_servers:[]})]) {
+    const resolver = createMetadataResolver({ async fetch(request) { return request.url.endsWith('poppy.json') ? Response.json(doc) : response.clone(); } });
+    const result = await resolver.resolveCompany('shop.example');
+    assert.equal(result.authorization, undefined); assert.equal(companyIdentifier(result), 'https://shop.example');
+  }
+  for (const response of [new Response(null,{status:500}), new Response('bad JSON'), Response.json(null), Response.json({}), Response.json({resource:'https://other.example'}), Response.json({resource:'https://shop.example',authorization_servers:'not-an-array'})]) {
+    const resolver = createMetadataResolver({ async fetch(request) { return request.url.endsWith('poppy.json') ? Response.json(doc) : response.clone(); } });
+    await assert.rejects(resolver.resolveCompany('shop.example'));
+  }
+  const failed = createMetadataResolver({ async fetch(request) { if(request.url.endsWith('poppy.json')) return Response.json(doc); throw new Error('timeout'); } });
+  await assert.rejects(failed.resolveCompany('shop.example'));
+  for (const extra of [{auth:{issuer:authorization.issuer}}, {agent:{protocols:[{type:'poppy',endpoint:'https://shop.example/conversations',access:'signed_in'}]}}]) {
+    const resolver = createMetadataResolver({ async fetch(request) { return request.url.endsWith('poppy.json') ? Response.json({...doc,...extra}) : new Response(null,{status:404}); } });
+    await assert.rejects(resolver.resolveCompany('shop.example'), {field:'issuer'});
+  }
+});
+
+test('one issuer is implicit; multiple issuers require an exact explicit choice and reciprocal trust', async () => {
+  for (const servers of [[authorization.issuer], [authorization.issuer,'https://employee.example/issuer']]) {
+    for (const selection of [undefined, authorization.issuer, 'https://unlisted.example/issuer']) {
+      const doc = {...document,auth:selection ? {...document.auth,issuer:selection} : {scopes:{'poppy:custom':'Company-defined'}}};
+      const resolver = createMetadataResolver({async fetch(request) {
+        if(request.url.endsWith('poppy.json')) return Response.json(doc);
+        if(request.url.includes('oauth-protected-resource')) return Response.json({resource:'https://shop.example',authorization_servers:servers});
+        return Response.json({...authorization,grant_types_supported:['refresh_token','authorization_code']});
+      }});
+      if(selection==='https://unlisted.example/issuer' || (!selection && servers.length>1)) await assert.rejects(resolver.resolveCompany('shop.example'),{field:'issuer'});
+      else assert.equal((await resolver.resolveCompany('shop.example')).authorization?.issuer,authorization.issuer);
+    }
+  }
 });
 
 test('parseJson rejects duplicate member names at any depth and accepts look-alikes', () => {
@@ -503,19 +518,22 @@ test('close during DNS prevents a resumed lookup from opening any connection',as
 });
 
 // Independent peer literals: no reference issuer or publisher helper supplies this contract.
-test('0.3 peer grants select methods and require described company scopes and endpoints', () => {
+test('independent current peer uses OAuth grants, optional recommendations and extension-mediated sign-in', () => {
   const doc = parsePoppyDocument(document, 'https://shop.example/.well-known/poppy.json');
-  const grants = ['urn:ietf:params:oauth:grant-type:jwt-bearer', 'refresh_token'];
-  const peer = { ...authorization, grant_types_supported: [...grants, 'authorization_code', 'urn:ietf:params:oauth:grant-type:device_code'], device_authorization_endpoint: 'https://auth.example/device' };
-  const parsed = parseAuthorizationMetadata(peer, doc);
-  assert.deepEqual(signInMethods({ document: doc, authorization: parsed, url: 'https://shop.example/.well-known/poppy.json' }), [{method:'direct',scopes:['orders:read']},{method:'device',scopes:['orders:read']}]);
-  assert.deepEqual(signInMethods({ document: doc, authorization: parseAuthorizationMetadata({...peer,grant_types_supported:grants},doc), url:'' }), [], 'endpoints and old auth.direct/device fields alone never select a method');
-  for (const changes of [{grant_types_supported:undefined},{grant_types_supported:['refresh_token']},{grant_types_supported:[grants[0]]},{authorization_endpoint:undefined},{device_authorization_endpoint:undefined},{scopes_supported:undefined},{scopes_supported:['poppy:read']},{scopes_supported:['bad scope']}]) assert.throws(()=>parseAuthorizationMetadata({...peer,...changes},doc));
-  assert.throws(()=>parseAuthorizationMetadata({...peer,scopes_supported:['unexplained']},doc),{field:'auth.scopes'});
-  assert.throws(()=>parsePoppyDocument({...document,auth:{...document.auth,scopes:{'poppy:future':'Reserved'}}},'https://shop.example/.well-known/poppy.json'),{field:'scopes'});
-  const mediated = parsePoppyDocument({...document,auth:{...document.auth,mediated:{endpoint:'https://auth.example/sign-in',scopes:['orders:read'],fields:[{name:'password',label:'Password',secret:true}]}}},'https://shop.example/.well-known/poppy.json');
-  assert.throws(()=>parseAuthorizationMetadata({...peer,scopes_supported:[]},mediated),{field:'mediated.scopes'});
-  assert.equal(signInMethods({document:mediated,authorization:parsed,url:''})[2].method,'mediated');
+  const peer = {...authorization,grant_types_supported:['refresh_token','authorization_code','urn:ietf:params:oauth:grant-type:device_code'],device_authorization_endpoint:'https://auth.example/device'};
+  assert.deepEqual(signInMethods({document:doc,authorization:parseAuthorizationMetadata(peer,doc),url:''}),[{method:'direct',scopes:['orders:read']},{method:'device',scopes:['orders:read']}]);
+  for(const changes of [{scopes_supported:undefined},{scopes_supported:['poppy:read']},{scopes_supported:['unexplained']}]) {
+    const input: Record<string,unknown> = {...peer,...changes}; if(changes.scopes_supported===undefined) delete input.scopes_supported;
+    parseAuthorizationMetadata(input,doc);
+  }
+  for(const changes of [{grant_types_supported:undefined},{grant_types_supported:['authorization_code']},{authorization_endpoint:undefined},{device_authorization_endpoint:undefined},{scopes_supported:['bad scope']}]) assert.throws(()=>parseAuthorizationMetadata({...peer,...changes},doc));
+  parsePoppyDocument({...document,auth:{scopes:{'poppy:future':'Company-defined'}}},'https://shop.example/.well-known/poppy.json');
+  const mediated = {version:'1',scopes:['extension:only'],fields:[{name:'password',label:'Password',secret:true}]};
+  const withExtension = parsePoppyDocument({...document,extensions:{'mediated-sign-in':mediated}},'https://shop.example/.well-known/poppy.json');
+  assert.throws(()=>parseAuthorizationMetadata(peer,withExtension),{field:'mediated.grant'});
+  const parsed = parseAuthorizationMetadata({...peer,grant_types_supported:[...peer.grant_types_supported,'https://personalagentprotocol.org/grant/mediated-sign-in']},withExtension);
+  assert.deepEqual(signInMethods({document:withExtension,authorization:parsed,url:''})[2],{method:'mediated',scopes:['extension:only']});
+  for(const name of ['grant_type','scope','resource','client_id','client_secret','client_assertion','client_assertion_type','sign_in_id','one_time_code']) assert.throws(()=>parsePoppyDocument({...document,extensions:{'mediated-sign-in':{...mediated,fields:[{name,label:'Reserved',secret:true}]}}},'https://shop.example/.well-known/poppy.json'),{field:'field.name'});
 });
 
 test('reciprocal resources compare host case only and issuer character for character', () => {
@@ -528,7 +546,7 @@ test('reciprocal resources compare host case only and issuer character for chara
 test('final well-known path is checked before use, cache and 304 revalidation', async () => {
   let now=0,calls=0,finalUrl='https://shop.example/.well-known/poppy.json',status=200;
   const resolver=createMetadataResolver({async fetch(request){
-    calls++; if(request.url.includes('oauth-authorization-server')) return Response.json(authorization);
+    calls++; if(request.url.includes('oauth-protected-resource')) return Response.json({resource:'https://shop.example',authorization_servers:[authorization.issuer]}); if(request.url.includes('oauth-authorization-server')) return Response.json(authorization);
     const response=status===304?new Response(null,{status,headers:{'cache-control':'max-age=1'}}):Response.json(document,{headers:{'cache-control':'max-age=1',etag:'peer-v1'}});
     Object.defineProperty(response,'url',{value:finalUrl}); return response;
   }},{now:()=>now});
@@ -541,4 +559,77 @@ test('final well-known path is checked before use, cache and 304 revalidation', 
   now=1001;status=304;finalUrl='https://shop.example/uploads/claim.json?x=1';
   await assert.rejects(resolver.resolveCompany('www.shop.example'),{field:'discovery.url'});
   finalUrl='https://shop.example/.well-known/poppy.json';assert.equal((await resolver.resolveCompany('www.shop.example')).url,finalUrl);
+});
+
+test('unknown conversation values use conservative fallbacks and OAuth expiry is optional', () => {
+  assert.deepEqual(wire.parseConversationState({conversation_id:'c1',status:'future',responder:'future',extra:1}),{conversation_id:'c1',status:'working',responder:'human',extra:1});
+  const value = wire.parseEvent({...event,type:'state',status:'future',responder:'future'});
+  assert.equal(value.status,'working');assert.equal(value.responder,'human');
+  for(const status of [null,3,{},'']) assert.throws(()=>wire.parseConversationState({conversation_id:'c1',status,responder:'agent'}));
+  assert.deepEqual(wire.parseTokenResponse({access_token:'opaque',token_type:'bearer'}),{access_token:'opaque',token_type:'Bearer'});
+  assert.equal(wire.parseTokenResponse({access_token:'opaque',token_type:'DPoP',expires_in:0}).expires_in,0);
+  for(const expires_in of [-1,1.5,'60',null]) assert.throws(()=>wire.parseTokenResponse({access_token:'opaque',token_type:'Bearer',expires_in}));
+  assert.throws(()=>wire.parseMessage({id:'operation_only',author:{type:'agent'},operation:{}}),{field:'message.content'});
+  assert.throws(()=>wire.parseMessage({id:'approval_only',author:{type:'agent'},approval:{}}),{field:'message.content'});
+});
+
+test('protected-resource domain ownership ignores host case but rejects URI normalization', async () => {
+  for (const resource of ['https://SHOP.Example','https://shop.example','https://shop.example/','https://shop.example:443','https://shop.example?','https://shop.example/path']) {
+    const resolver=createMetadataResolver({async fetch(request) {
+      if(request.url.endsWith('poppy.json'))return Response.json({...document,organization:{name:'Shop',domain:'SHOP.Example'},auth:{scopes:{}}});
+      if(request.url.includes('oauth-protected-resource'))return Response.json({resource});
+      throw new Error('issuerless discovery must not fetch an issuer');
+    }});
+    if(resource==='https://SHOP.Example'||resource==='https://shop.example') assert.equal(companyIdentifier(await resolver.resolveCompany('shop.example')),'https://shop.example');
+    else await assert.rejects(resolver.resolveCompany('shop.example'),{field:'resource'});
+  }
+});
+
+// An independent peer constructs JWTs directly; no SDK signer supplies the claims or headers.
+for (const rootAlgorithm of ['ES256', 'PS384']) test(`delegated Session verification binds identity, audience, method, URL and optional account token (${rootAlgorithm})`, async () => {
+  const { generateKeyPair, exportJWK, CompactSign } = await import('jose');
+  const { verifySessionJwt } = await import('../../dist/protocol/session.js');
+  const root = await generateKeyPair(rootAlgorithm), delegated = await generateKeyPair('ES256');
+  const jwk = await exportJWK(delegated.publicKey), rootJwk = { ...await exportJWK(root.publicKey), kid: 'root' };
+  const clientId = 'https://independent.example/client.json', companyId = 'https://shop.example', seconds = 1790900000;
+  const kid = await (await import('jose')).calculateJwkThumbprint(jwk);
+  const metadata = {
+    async resolveCompany(): Promise<never> { throw new Error('not part of Session verification'); },
+    async resolveClient(id: string) { assert.equal(id, clientId); return {client_id:clientId,client_name:'Independent',jwks_uri:'https://independent.example/keys',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt' as const}; },
+    async resolveJwks() { return {keys:[rootJwk]}; },
+  };
+  const sign = (claims: Record<string,unknown>, header: import('jose').CompactJWSHeaderParameters, key: CryptoKey) => new CompactSign(new TextEncoder().encode(JSON.stringify(claims))).setProtectedHeader(header).sign(key);
+  const delegationClaims = {iss:clientId,cnf:{jwk},iat:seconds-30,exp:seconds+3600,jti:'delegation-random-id-1234'};
+  const claims = {iss:clientId,aud:companyId,sid:'session_random_1234',sub:'user-random-1234',htm:'POST',htu:'https://shop.example/api',iat:seconds,jti:'request-random-id-1234'};
+  const make = async (changes: Record<string,unknown> = {}, delegationChanges: Record<string,unknown> = {}, headerChanges: Record<string,unknown> = {}) => {
+    const delegation = await sign({...delegationClaims,...delegationChanges},{alg:rootAlgorithm,typ:'pap-delegation+jwt',kid:'root'},root.privateKey);
+    return sign({...claims,...changes},{alg:'ES256',typ:'poppy-session+jwt',kid,pap_dlg:delegation,...headerChanges},delegated.privateKey);
+  };
+  const expected = {companyId,method:'POST',url:'https://shop.example/api?query=allowed',nowMs:seconds*1000,metadata};
+  assert.equal((await verifySessionJwt(await make(),expected)).sid,claims.sid);
+  const accessToken = 'independent-account-token'; const ath = (await import('node:crypto')).createHash('sha256').update(accessToken).digest('base64url');
+  await verifySessionJwt(await make({ath}),{...expected,accessToken,tokenClientId:clientId});
+  await assert.rejects(verifySessionJwt(await make({ath}),expected));
+  await assert.rejects(verifySessionJwt(await make(),{...expected,accessToken,tokenClientId:clientId}));
+  await assert.rejects(verifySessionJwt(await make({ath}),{...expected,accessToken,tokenClientId:'https://other.example/client'}));
+  await assert.rejects(verifySessionJwt(await make({ath}),{...expected,accessToken:'different',tokenClientId:clientId}));
+  for (const changes of [{aud:'https://other.example'}, {aud:[companyId]}, {htm:'GET'}, {htu:'https://shop.example/elsewhere'}, {htu:'https://shop.example/api?query=forbidden'}, {iat:seconds-61}, {iat:seconds+31}, {sub:''}, {sid:'bad/id'}]) await assert.rejects(verifySessionJwt(await make(changes),expected));
+  for (const changes of [{exp:seconds-1}, {iat:seconds-30,exp:seconds+86401}, {iss:'https://other.example/client'}, {cnf:{jwk:{...jwk,d:'private'}}}, {cnf:{jwk:{...jwk,k:'symmetric'}}}]) await assert.rejects(verifySessionJwt(await make({},changes),expected));
+  for(const changes of [{typ:'JWT'},{kid:'wrong-thumbprint'},{pap_dlg:'not-a-delegation'}]) await assert.rejects(verifySessionJwt(await make({}, {},changes),expected));
+  const rootSigned = await sign(claims,{alg:rootAlgorithm,typ:'poppy-session+jwt',kid:'root'},root.privateKey);
+  await assert.rejects(verifySessionJwt(rootSigned,expected));
+  await assert.rejects(verifySessionJwt(null,expected));
+  const next = await generateKeyPair('ES256'), nextJwk = await exportJWK(next.publicKey);
+  const nextDelegation = await sign({...delegationClaims,cnf:{jwk:nextJwk}},{alg:rootAlgorithm,typ:'pap-delegation+jwt',kid:'root'},root.privateKey);
+  const rotated = await sign(claims,{alg:'ES256',typ:'poppy-session+jwt',kid:await (await import('jose')).calculateJwkThumbprint(nextJwk),pap_dlg:nextDelegation},next.privateKey);
+  assert.equal((await verifySessionJwt(rotated,expected)).sid,claims.sid,'key rotation does not change Session identity');
+});
+
+test('retired resource hints are unknown data and unsupported DPoP algorithms do not block discovery',()=>{
+  for(const resource of [null,7,{},['opaque']]){
+    const doc={...document,agent:{protocols:[{type:'poppy',endpoint:'https://shop.example/conversations',resource}]},apis:[{type:'mcp',url:'https://shop.example/mcp',description:'Tools',resource}]};
+    const parsed=parsePoppyDocument(doc,'https://shop.example/.well-known/poppy.json');
+    assert.equal(parsed.agent!.protocols[0]!.resource,resource);assert.equal(parsed.apis![0]!.resource,resource);
+    assert.deepEqual(parseAuthorizationMetadata({...authorization,dpop_signing_alg_values_supported:['ES384']},parsed).dpop_signing_alg_values_supported,['ES384']);
+  }
 });

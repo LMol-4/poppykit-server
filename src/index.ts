@@ -7,9 +7,12 @@ export type { ConversationStore, ConversationSelection, ConversationNotification
 
 export { createConversationNotifications } from './conversation/store.js';
 export { createBrowserSessions } from './browser.js';
-export type { BrowserBinding, BrowserSession, BrowserSessionAuthority, BrowserCookieStore } from './browser.js';
+export type { BrowserBinding, BrowserCookieStore, BrowserJoin } from './browser.js';
 export { createFeedbackHandler } from './feedback.js';
 export type { FeedbackReport } from './feedback.js';
 export { mcpResourceMetadata, mcpAuthorizationError } from './mcp.js';
 
 export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest, ConversationState, ConversationEvent, KnownEvent, EventPage } from './protocol/wire.js';
+
+export { createSessionAuthority } from './auth/session.js';
+export type { SessionRecord, SessionState, SessionAdmission, SessionStore, SessionAuthority } from './auth/session.js';

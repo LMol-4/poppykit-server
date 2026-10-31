@@ -278,7 +278,7 @@ export function createConversationService(options: ConversationOptions): Convers
     const accountId = own(state.bindings, conversation.bindingId)?.accountId;
     if (accountId === undefined ? conversation.userId === principal.userId : principal.accountId === accountId) return conversation;
     // Spec 7.11: the same User not signed in to the bound account (signed out or another account) is told to sign in; anyone else learns nothing.
-    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError('insufficient_scope', { scope: historyScopes.join(' ') });
+    if (accountId !== undefined && conversation.userId === principal.userId) throw new AuthorityError(principal.accountId ? 'insufficient_scope' : 'account_required', { scope: historyScopes.join(' ') });
     throw notFound();
   }
 
@@ -551,7 +551,7 @@ export function createConversationService(options: ConversationOptions): Convers
         if (error instanceof HttpError) return json(error.status, error.body, error.headers);
         if (error instanceof ValidationError) return json(400, { error: 'invalid_request' });
         // Status/code/headers only, never the raw message.
-        if (error instanceof AuthorityError) return json(error.status, { error: error.code }, error.headers);
+        if (error instanceof AuthorityError) return error.code === 'account_required' || error.code === 'invalid_session' ? error.response() : json(error.status, { error: error.code }, error.headers);
         throw error;
       }
     },

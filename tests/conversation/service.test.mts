@@ -87,7 +87,7 @@ test('retry reauthenticates and is denied when current policy denies', async () 
   const unauthenticated = await t.start(hello, { as: 'nobody' });
   assert.equal(unauthenticated.status, 401);
   assert.deepEqual(unauthenticated.body, { error: 'invalid_token' });
-  assert.equal(unauthenticated.headers.get('www-authenticate'), 'DPoP error="invalid_token", algs="ES256"');
+  assert.equal(unauthenticated.headers.get('www-authenticate'), 'DPoP error="invalid_token", algs="ES256", Bearer error="invalid_token"');
   t.policy.deny = new AuthorityError('invalid_token');
   const denied = await t.start(hello);
   assert.equal(denied.status, 401);
@@ -105,7 +105,7 @@ test('foreign user or client cannot read, send to, or learn of a conversation', 
   assert.equal((await t.read('constructor')).status, 404);
 });
 
-test('account-bound conversation: same account reads with orders:read; same User signed out or on another account gets insufficient_scope; others 404', async () => {
+test('account-bound conversation: same account reads with orders:read; same User signed out is challenged, another account gets insufficient_scope; others 404', async () => {
   const t = setup();
   const { body } = await t.start(hello);
   t.store.set(state => { state.bindings[body.conversation_id].accountId = 'acct_1'; });
@@ -113,8 +113,8 @@ test('account-bound conversation: same account reads with orders:read; same User
   assert.equal(ok.status, 200);
   assert.deepEqual(t.calls.at(-1), { kind: 'current', userId: 'u_alice', scopes: ['orders:read'] });
   const signedOut = await t.read(body.conversation_id);
-  assert.equal(signedOut.status, 403);
-  assert.deepEqual(signedOut.body, { error: 'insufficient_scope' });
+  assert.equal(signedOut.status, 401);
+  assert.deepEqual(signedOut.body, {});
   // Spec 7.11 and 4.2: the same User on account B is not signed in to account A.
   const otherAccount = await t.read(body.conversation_id, { as: 'aliceOtherAccount' });
   assert.deepEqual([otherAccount.status, otherAccount.body], [403, { error: 'insufficient_scope' }]);
@@ -128,7 +128,7 @@ test('account-bound conversation: same account reads with orders:read; same User
   assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'aliceOtherAccount' })).status, 403);
   assert.equal((await t.start({ ...hello, text: 'changed' }, { as: 'bobOtherAccount' })).status, 201, 'message IDs are per User');
   // Retrying the original first message on a now-bound conversation is checked against current ownership too.
-  assert.equal((await t.start(hello)).status, 403);
+  assert.equal((await t.start(hello)).status, 401);
 });
 
 test('ownership moves from User ID to account once bound (spec 7.2)', async () => {
@@ -153,9 +153,9 @@ test('ownership moves from User ID to account once bound (spec 7.2)', async () =
   assert.deepEqual(await t.read(id, { as: 'otherClientNoScopes' }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
   assert.deepEqual(await t.read('cnv_unknown', { as: 'otherClientNoScopes' }).then(r => [r.status, r.body]), [404, { error: 'conversation_not_found' }]);
   const signedOut = await t.read(id);
-  assert.deepEqual([signedOut.status, signedOut.body], [403, { error: 'insufficient_scope' }]);
-  assert.equal(signedOut.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read", algs="ES256"');
-  assert.equal((await t.send(id, next('a2'))).status, 403);
+  assert.deepEqual([signedOut.status, signedOut.body], [401, {}]);
+  assert.equal(signedOut.headers.get('www-authenticate'), 'Bearer scope="orders:read", DPoP scope="orders:read"');
+  assert.equal((await t.send(id, next('a2'))).status, 401);
 });
 
 test('multi-page idle history uses real cursors and six-field pages', async () => {
@@ -290,16 +290,17 @@ test('only AuthorityError becomes an auth response; other errors are re-thrown',
   t.policy.deny = new AuthorityError('insufficient_scope', { scope: 'orders:read' });
   const denied = await t.start(hello);
   assert.deepEqual([denied.status, denied.body], [403, { error: 'insufficient_scope' }]);
-  assert.equal(denied.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read", algs="ES256"');
+  assert.equal(denied.headers.get('www-authenticate'), 'DPoP error="insufficient_scope", scope="orders:read", algs="ES256", Bearer error="insufficient_scope", scope="orders:read"');
   assert.equal((await t.store.read()).work.length, 0);
 });
 
 test('construction rejects invalid options', () => {
   const store = memoryStore(initialConversationState());
   const base={historyScopes:['orders:read'],endpoint,store,authenticator:{async authenticate(){return principals.alice;}},policy:setup().policy,clock:{now:()=>0}};
-  for (const historyScopes of [undefined, [], ['poppy:read'], ['bad scope']]) assert.throws(() => createConversationService({ ...base, historyScopes: historyScopes as string[] }));
-  assert.throws(() => createConversationService({ ...base, supportedScopes: ['poppy:read'] }));
-  assert.throws(() => createConversationService({ ...base, directScopes: ['poppy:write'] }));
+  for (const historyScopes of [undefined, [], ['bad scope']]) assert.throws(() => createConversationService({ ...base, historyScopes: historyScopes as string[] }));
+  assert.throws(() => createConversationService({ ...base, supportedScopes: ['bad scope'] }));
+  assert.throws(() => createConversationService({ ...base, directScopes: ['bad scope'] }));
+  assert.doesNotThrow(() => createConversationService({ ...base, historyScopes: ['poppy:read'], supportedScopes: ['poppy:read'], directScopes: ['poppy:write'] }));
   assert.throws(() => createConversationService({ ...base, pageSize: 0 }), TypeError);
   assert.throws(() => createConversationService({ ...base, leaseMs: -1 }), TypeError);
   assert.throws(() => createConversationService({ ...base, finishedWorkLimit: 0 }), TypeError);
@@ -440,7 +441,7 @@ test('requireAccount binds the shared parent/child ownership once and checks the
   assert.deepEqual(await t.service.requireAccount(expectValue(claim), []), { accountId: 'acct_1' });
   for (const id of [parent, child]) {
     assert.equal((await t.read(id, { as: 'carolSameAccount' })).status, 200);
-    assert.equal((await t.read(id)).status, 403);
+    assert.equal((await t.read(id)).status, 401);
     assert.equal((await t.read(id, { as: 'aliceOtherAccount' })).status, 403);
     assert.equal((await t.read(id, { as: 'bobOtherAccount' })).status, 404);
   }
@@ -505,7 +506,8 @@ test('account use committed between a read and its transaction: the read sees th
   const childClaim = await t.service.claim();
   // The signed-out read snapshots an unbound child, then the child's worker binds before the read commits.
   t.store.afterRead = () => t.service.requireAccount(expectValue(childClaim), []);
-  assert.deepEqual((await t.read(child)).body, { error: 'insufficient_scope' });
+  const signedOut = await t.read(child);
+  assert.deepEqual([signedOut.status, signedOut.body], [401, {}]);
   // A different account's message racing the binding is refused and leaves no trace.
   t.store.afterRead = null;
   const before = (await t.store.read()).conversations[parent].events.length;

@@ -3,7 +3,8 @@
 Request paths use targeted domain selections, not whole-state rewrites. Node 24.x, at least 24.21.0, is required.
 The optional `@poppykit/server/sqlite` entry point exports `SqliteCompanyDatabase`.
 The core and reference issuer entry points do not import SQLite. Consumers can
-implement `ConversationStore`, `IssuerStore` and `AuthorityCoordinator` themselves.
+implement `ConversationStore`, `IssuerStore`, `SessionStore`, `BrowserCookieStore`
+and `AuthorityCoordinator` themselves.
 The tested Node 24.21.0 runtime marks `node:sqlite` experimental.
 
 ```ts
@@ -71,7 +72,8 @@ its own idempotency key (such as the stable work ID), or the application must re
 an uncertain result for reconciliation. Never claim universal exactly-once execution.
 
 `cleanup(namespace, now, limit)` bounds deletion to at most 1000 expired short-lived
-codes, authorizations, access tokens, replay entries or expired/revoked/orphaned
+codes, authorizations, access tokens, browser cookies/join codes, expired resource
+Sessions, replay entries or expired/revoked/orphaned
 Account Token hashes. Every used hash for a live lineage remains replay-detectable
 through its fixed expiry; retained size follows rotation volume. It does not delete grants,
 work intent, message receipts or conversation events. Receipt identity remains
@@ -94,8 +96,8 @@ Session proves it; conflicting or missing associations remain unresolved. Unknow
 earlier versions fail closed. Custom issuer adapters must upgrade the complete
 namespace under their writer lock before normal targeted reads.
 
-This record upgrade prepares OAuth account access to be independent of Poppy
-Sessions. It does not itself implement the remaining wire migration. Keep uncertain
+OAuth account access is independent of resource Sessions. The record upgrade does
+not replay or reinterpret old pending requests. Keep uncertain
 work and encrypted delivery references for reconciliation; do not reset a store or
 reinterpret an unresolved record as a fresh request.
 
@@ -198,3 +200,34 @@ never a production migration command.
 `runIssuerAdapterContract` joins the existing reusable conversation contract in
 `@poppykit/server/adapter-contract`. Run both against two fresh shared handles;
 process death, lock ordering and DB durability still require backend-specific tests.
+
+
+## Resource Sessions and browser cookies
+
+Use database.sessions(companyId) and database.browserCookies(companyId), also for
+issuerless Companies. Resource Session records and their namespace generation are
+separate from legacy issuer Sessions and account grants. No applied SQL history is
+rewritten; these records use the existing namespaced JSON table and indexes.
+
+SessionStore.read(clientId,sid) returns version, generation and the stored record.
+transaction(clientId,sid,at,change) must serialize admission across all sids for that
+client, including absent records, and supply SessionAdmission.activeCount and
+earliestExpiry for non-ended records with expiresAt > at. Counts and record commit
+are one transaction. Callbacks are synchronous/detached; rollback and binding checks
+apply. PostgreSQL takes client-before-sid advisory locks, SQLite its writer lock.
+The default authority cap is 10,000 live Sessions per client, lifetime one day.
+Expired records may be explicitly forgotten by bounded cleanup; a recreated sid
+has a fresh instanceId, distinct from its prior resource Session. Operations v2
+must preserve this distinction when defining signed-out approval ownership.
+
+BrowserCookieStore stores opaque hashes and immutable approved Principal snapshots.
+authorizeJoin(codeHash,principal) conditionally authorizes one live join;
+consumeJoin atomically removes/returns it, including expired entries. remove deletes
+a superseded browser-cookie hash. The host must implement these atomic operations
+across replicas and use current account/Session policy when serving cookies.
+Uncertain mediated verifying records are excluded from expiry cleanup and remain
+in pending capacity counts until host reconciliation; never delete them to free quota.
+
+Custom Session/browser adapters can run runSessionAdapterContract and
+runBrowserCookieAdapterContract from @poppykit/server/adapter-contract against two
+shared handles. See [legacy retirement](migrations/RETIREMENT.md) before any deletion.
