@@ -81,3 +81,7 @@ The optional allow hook returning false yields 429 with Retry-After:60. Malforme
 reports are 400; successful acceptance is 202 with no body. The client also supports
 a Company's 200 alternative response. Hosts own report retention, privacy filtering
 and downstream effect handling; feedback has no deduplication identifier.
+
+## Operations v2
+
+[OPERATIONS.md](OPERATIONS.md) defines API403/Poppy-Approval, MCP structuredContent/_meta and conversation operation/approval integration. Publish support only after all interfaces in use have trusted consent and durable effect recovery. Ordinary MCP clients retain their OAuth flow; one unsupported tool returns a tool error. No v1 extension endpoint is added.

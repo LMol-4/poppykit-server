@@ -94,3 +94,5 @@ state; SQLite/PostgreSQL reject version 1. Stop old writers and clear history,
 receipts, cursor identities, work, client outboxes and retry handles together.
 Preserve required configuration. No historical conversion or dual wire format is
 provided. An accepted request's fingerprint is never rewritten.
+
+Business-operation retries use the operation ID and approved revision, independently of message/work IDs. A conversation acceptance is not proof the action completed. [Operations v2](OPERATIONS.md) preserves uncertain claims/attempts through timeout, process death, expiry and restart. A different operation returned on retry does not establish the earlier outcome.

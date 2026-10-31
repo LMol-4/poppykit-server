@@ -23,7 +23,8 @@
     "tests/auth/session.test.mts",
     "tests/auth/account-grants.test.mts",
     "tests/browser.test.mts",
-    "tests/session-adapter-contract.test.mts"
+    "tests/session-adapter-contract.test.mts",
+    "tests/operations.test.mts"
   ],
   "integration": [
     "tests/integrations.test.mts",

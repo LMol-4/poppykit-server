@@ -243,3 +243,22 @@ export function runConversationAdapterContract(fixture: ConversationAdapterFixtu
     assert.equal((await call(a, `/${id}/events`, 'signedOut')).status, 404);
   }));
 }
+
+export type BusinessOperationAdapterFixture = () => Promise<{ store: import('./operations.js').BusinessOperationStore; second: import('./operations.js').BusinessOperationStore; close(): Promise<void> }>;
+export function runBusinessOperationAdapterContract(fixture: BusinessOperationAdapterFixture): void {
+  test('business operation adapter contract: absent-row races, rollback, detached snapshots and version fences', async () => {
+    const f = await fixture();
+    try {
+      await Promise.all(Array.from({ length: 10 }, (_, n) => (n % 2 ? f.store : f.second).transaction('action', async slot => {
+        slot.record ??= { version: 1, id: 'action', owner: {companyId:'https://company.example',clientId:'https://agent.example/client',userId:'user',sessionId:'sid',sessionInstanceId:'instance',sessionGeneration:'generation'}, scopes: [], revisions: {} };
+        slot.record.scopes.push(String(n));
+      })));
+      const read = () => f.store.transaction('action', async slot => slot.record!);
+      const record = await read(); assert.equal(record.scopes.length, 10); record.scopes.length = 0;
+      await assert.rejects(f.second.transaction('action', async slot => { slot.record!.scopes = []; throw Error('rollback'); }), /rollback/);
+      assert.equal((await read()).scopes.length, 10);
+      await assert.rejects(f.store.transaction('action', async slot => { Object.assign(slot.record!, { version: 99 }); }), /binding|version/);
+      assert.equal((await read()).version, 1);
+    } finally { await f.close(); }
+  });
+}

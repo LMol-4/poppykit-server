@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@agentsig/structured-fields':
+        specifier: 0.1.1
+        version: 0.1.1
       jose:
         specifier: 6.2.12
         version: 6.2.12
@@ -26,6 +29,10 @@ importers:
         version: 5.9.3
 
 packages:
+
+  '@agentsig/structured-fields@0.1.1':
+    resolution: {integrity: sha512-GUMMmtGYynOhri3BM8ChHHdFWm1mpujo17IG35lBJ3SEp1rMPl7I4ZVZZSr9JPzw0DtPmgq0/ecpfbswmxNZ3w==}
+    engines: {node: '>=20'}
 
   '@types/node@24.10.0':
     resolution: {integrity: sha512-qzQZRBqkFsYyaSWXuEHc2WR9c0a0CXwiE5FWUvn7ZM+vdy1uZLfCunD38UzhuB7YN/J11ndbDBcTmOdxJo9Q7A==}
@@ -103,6 +110,8 @@ packages:
     engines: {node: '>=0.4'}
 
 snapshots:
+
+  '@agentsig/structured-fields@0.1.1': {}
 
   '@types/node@24.10.0':
     dependencies:

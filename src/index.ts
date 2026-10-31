@@ -16,3 +16,6 @@ export type { Author, AuthorType, Message, RecordedMessage, ConversationRequest,
 
 export { createSessionAuthority } from './auth/session.js';
 export type { SessionRecord, SessionState, SessionAdmission, SessionStore, SessionAuthority } from './auth/session.js';
+
+export * from './operations.js';
+export * from './protocol/operations.js';

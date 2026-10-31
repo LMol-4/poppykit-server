@@ -231,3 +231,7 @@ in pending capacity counts until host reconciliation; never delete them to free 
 Custom Session/browser adapters can run runSessionAdapterContract and
 runBrowserCookieAdapterContract from @poppykit/server/adapter-contract against two
 shared handles. See [legacy retirement](migrations/RETIREMENT.md) before any deletion.
+
+## Business operation persistence
+
+[Operations storage contracts](OPERATIONS.md#store-contract-retention-and-migration) are separate from authentication lifecycle operations and message receipts. BusinessOperationStore uses an asynchronous transaction for same-database effects, unlike synchronous issuer/conversation callbacks. SQLite and PostgreSQL use the separate business_operations record kind. Use the same company database instance for policy, operation storage and local effects. No existing SQL history, credentials or uncertain work is deleted. Unknown versions fail closed. External effects require a durable downstream idempotency/reconciliation contract. Never prune or release an uncertain business claim after a worker deadline.

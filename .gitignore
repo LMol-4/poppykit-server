@@ -108,3 +108,8 @@ coverage/
 
 /tests/session-adapter-contract.test.mjs
 /tests/session-adapter-contract.test.mjs.map
+
+/tests/operations.test.mjs
+/tests/operations.test.mjs.map
+/test-support/operation-worker.mjs
+/test-support/operation-worker.mjs.map

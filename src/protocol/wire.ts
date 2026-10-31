@@ -1,9 +1,11 @@
+import { parseBusinessOperation, parseOperationApproval } from './operations.js';
+import type { BusinessOperation, OperationApproval } from './operations.js';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type JsonObject = { [key: string]: Json };
 export type AuthorType = 'agent' | 'human';
 export interface Author { type: AuthorType; id?: string; name?: string; image?: string; [key: string]: unknown }
 export type Status = 'working' | 'idle' | 'queued' | 'closed';
-export interface Message { id: string; author: Author; text?: string; data?: JsonObject; context?: JsonObject; [key: string]: unknown }
+export interface Message { id: string; author: Author; text?: string; data?: JsonObject; context?: JsonObject; operation?: BusinessOperation; approval?: OperationApproval; [key: string]: unknown }
 export interface RecordedMessage extends Message { role: 'user' | 'company' }
 export interface ConversationRequest { message: Message; parent_conversation_id?: string; [key: string]: unknown }
 export interface ConversationState { conversation_id: string; status: Status; responder: AuthorType; [key: string]: unknown }
@@ -52,7 +54,7 @@ export function id(value: unknown, field: string): string {
 function positive(value: unknown, field: string): void {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) throw new ValidationError(field);
 }
-export function parseMessage(value: unknown, options: { recorded?: boolean; company?: boolean } = {}): Message | RecordedMessage {
+export function parseMessage(value: unknown, options: { recorded?: boolean; company?: boolean; operations?: boolean } = {}): Message | RecordedMessage {
   const message = { ...object(value, 'message') };
   id(message.id, 'message.id');
   const author = object(message.author, 'message.author');
@@ -66,7 +68,10 @@ export function parseMessage(value: unknown, options: { recorded?: boolean; comp
     try { const url = new URL(author.image as string); if (url.protocol !== 'https:' || url.username || url.password) throw 0; }
     catch { throw new ValidationError('message.author.image'); }
   }
-  if (!['text', 'data', 'context'].some(key => key in message)) throw new ValidationError('message.content');
+  const company = options.company || (options.recorded && message.role === 'company');
+  if ('operation' in message) { if (!company || !options.operations) throw new ValidationError('message.operation'); message.operation = parseBusinessOperation(message.operation); }
+  if ('approval' in message) { if (company || !options.operations) throw new ValidationError('message.approval'); message.approval = parseOperationApproval(message.approval); }
+  if (!['text', 'data', 'context', ...(options.operations ? [company ? 'operation' : 'approval'] : [])].some(key => key in message)) throw new ValidationError('message.content');
   if ('text' in message) string(message.text, 'message.text', false);
   if ('data' in message) object(message.data, 'message.data');
   if (options.recorded) member(message.role, ['user', 'company'], 'message.role'); else delete message.role;
@@ -86,10 +91,10 @@ export function parseMessage(value: unknown, options: { recorded?: boolean; comp
   }
   return message as Message;
 }
-export function parseConversationRequest(value: unknown): ConversationRequest {
+export function parseConversationRequest(value: unknown, operations = false): ConversationRequest {
   const request = object(value);
   if ('parent_conversation_id' in request) id(request.parent_conversation_id, 'parent_conversation_id');
-  return { ...request, message: parseMessage(request.message) };
+  return { ...request, message: parseMessage(request.message, { operations }) };
 }
 export function parseConversationState(value: unknown): ConversationState {
   const state = object(value); id(state.conversation_id, 'conversation_id');
@@ -98,7 +103,7 @@ export function parseConversationState(value: unknown): ConversationState {
   if (!['agent', 'human'].includes(state.responder as string)) state.responder = 'human';
   return state as ConversationState;
 }
-export function parseEvent(value: unknown): ConversationEvent {
+export function parseEvent(value: unknown, operations = false): ConversationEvent {
   const event = object(value, 'event'); id(event.id, 'event.id'); string(event.type, 'event.type');
   const date = string(event.created_at, 'event.created_at');
   const parts = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/.exec(date);
@@ -107,7 +112,7 @@ export function parseEvent(value: unknown): ConversationEvent {
   const days = new Date(`${year}-${month}-01T00:00:00Z`); days.setUTCMonth(days.getUTCMonth() + 1); days.setUTCDate(0);
   if (+month < 1 || +month > 12 || +day < 1 || +day > days.getUTCDate() || +hour > 23 || +minute > 59 || +second > 60 || +offsetHour > 23 || +offsetMinute > 59) throw new ValidationError('event.created_at');
   switch (event.type) {
-    case 'message': parseMessage(event.message, { recorded: true }); break;
+    case 'message': parseMessage(event.message, { recorded: true, operations }); break;
     case 'state': {
       const state = parseConversationState({ conversation_id: 'state', status: event.status, responder: event.responder });
       event.status = state.status; event.responder = state.responder; break;
@@ -121,10 +126,10 @@ export function parseEvent(value: unknown): ConversationEvent {
   }
   return event as ConversationEvent;
 }
-export function parseEventPage(value: unknown, requestCursor?: string): EventPage {
+export function parseEventPage(value: unknown, requestCursor?: string, operations = false): EventPage {
   const page = parseConversationState(value);
   if (!Array.isArray(page.events)) throw new ValidationError('events');
-  page.events.forEach(parseEvent); member(page.has_more, [true, false], 'has_more');
+  page.events.forEach(event => parseEvent(event, operations)); member(page.has_more, [true, false], 'has_more');
   if (page.cursor === null) {
     if (requestCursor !== undefined || page.events.length || page.has_more) throw new ValidationError('cursor');
   } else {

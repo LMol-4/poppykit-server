@@ -1,3 +1,4 @@
+import type { BusinessOperationStore, BusinessOperationRecord } from './operations.js';
 import type { BrowserBinding, BrowserCookieStore, BrowserJoin } from './browser.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord, SessionState, SessionAdmission, SessionStore } from './auth/session.js';
@@ -99,6 +100,26 @@ export class SqliteCompanyDatabase {
     const found = this.one<T>(ns, kind, 'meta');
     if (found) return found;
     const value = initial(); this.put(ns, kind, 'meta', value); return value;
+  }
+  businessOperations(namespace: string): BusinessOperationStore {
+    return { transaction: (operationId, action) => this.run(async () => {
+      const name = 'operation_' + ++this.savepoint; this.db.exec('SAVEPOINT ' + name);
+      try {
+        const slot = { record: this.one<BusinessOperationRecord>(namespace, 'business_operations', operationId) };
+        if (slot.record && slot.record.version !== 1) throw new Error('unsupported business operation version');
+        const result = await action(slot);
+        if (slot.record) { if (slot.record.version !== 1 || slot.record.id !== operationId) throw new TypeError('business operation binding'); this.put(namespace, 'business_operations', operationId, slot.record); }
+        this.db.exec('RELEASE ' + name); return structuredClone(result);
+      } catch (error) { this.db.exec('ROLLBACK TO ' + name); this.db.exec('RELEASE ' + name); throw error; }
+    }) };
+  }
+  /** Same-database business effects only. The callback and operation receipt share the outer transaction. */
+  withTransaction<T>(action: (connection: { run(sql: string, values?: (string | number | null)[]): void; get(sql: string, values?: (string | number | null)[]): Record<string, unknown> | undefined }) => Promise<T>): Promise<T> {
+    return this.run(async () => {
+      const context = this.inside.getStore()!;
+      const check = () => { if (!context.active || this.inside.getStore() !== context) throw new Error('expired SQLite transaction'); };
+      return action({ run: (sql, values = []) => { check(); this.db.prepare(sql).run(...values); }, get: (sql, values = []) => { check(); return this.db.prepare(sql).get(...values); } });
+    });
   }
   conversations(namespace: string): ConversationStore {
     const load = (selection: ConversationSelection): ConversationStoreState => {

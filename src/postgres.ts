@@ -1,3 +1,4 @@
+import type { BusinessOperationStore, BusinessOperationRecord } from './operations.js';
 import type { BrowserBinding, BrowserCookieStore, BrowserJoin } from './browser.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord, SessionState, SessionAdmission, SessionStore } from './auth/session.js';
@@ -40,7 +41,17 @@ export class PostgresCompanyDatabase {
     const raced = await this.one<T>(ns, kind, 'meta'); if (raced) return raced;
     const value = initial(); await this.put(ns, kind, 'meta', value); return value;
   }
-    conversations(namespace: string): ConversationStore {
+    businessOperations(namespace: string): BusinessOperationStore {
+    return { transaction: (operationId, action) => this.run(async () => {
+      await this.db.lock(JSON.stringify([namespace, 'business_operations', operationId]));
+      const slot = { record: await this.one<BusinessOperationRecord>(namespace, 'business_operations', operationId) };
+      if (slot.record && slot.record.version !== 1) throw new Error('unsupported business operation version');
+      const result = await action(slot);
+      if (slot.record) { if (slot.record.version !== 1 || slot.record.id !== operationId) throw new TypeError('business operation binding'); await this.put(namespace, 'business_operations', operationId, slot.record); }
+      return structuredClone(result);
+    }) };
+  }
+  conversations(namespace: string): ConversationStore {
         const load = async (selection: ConversationSelection): Promise<ConversationStoreState> => {
             const state: ConversationStoreState = { ...await this.meta(namespace, 'conversation_meta', () => { const { version, generation } = initialConversationState(); return { version, generation }; }), conversations: {}, bindings: {}, messages: {}, work: [] };
             if (state.version !== 2) throw new Error('conversation reset required for draft 0.3');

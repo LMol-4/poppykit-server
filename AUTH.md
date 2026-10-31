@@ -51,7 +51,7 @@ and live account policy immediately before protected work. `withAccepted` preser
 the accepted scope ceiling and explicit work-revocation policy while allowing an
 admission token to expire. A database coordinator orders authorization with writes;
 a process mutex alone is insufficient across replicas. External effects still need
-host idempotency and reconciliation. Operations v2 is not yet implemented or advertised.
+host idempotency and reconciliation. [Operations v2](OPERATIONS.md) provides separate durable business mechanics with explicit host effect contracts.
 
 Authority errors expose response(): invalid_session is JSON/400; missing account
 authority is an errorless Bearer/DPoP challenge/401 with scope; insufficient_scope
@@ -118,3 +118,5 @@ are removed. Browser joining uses resource Sessions and fixed approval snapshots
 mediated grants use token(). Retained legacy records remain available through
 explicit storage reads for reconciliation.
 See [STORAGE.md](STORAGE.md). Earlier unsupported versions fail closed.
+
+Authentication lifecycle OperationRecord/operationId values never approve business operations. OAuth access consent, provider enrollment and mediated credential collection cannot supply business consent. [Operations v2](OPERATIONS.md) binds each actual user answer to the exact revision and request, and rechecks current Session/account authority for execution and protected replay.

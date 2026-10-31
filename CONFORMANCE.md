@@ -11,7 +11,7 @@ re-fetched and matched their initial snapshots byte for byte. SHA-256 identities
 
 The workspace requirement matrix and exact commands, tree hashes and focused test
 receipts live in jobs/protocol-migration. Focused checks do not certify an installed
-release or any deployed service. Operations v2 is reserved for the next block;
+release or any deployed service. Operations v2 SDK mechanics are implemented with opt-in host contracts;
 full candidate, native and cross-package release gates remain separate.
 
 ## Host contracts and recommendations
@@ -67,3 +67,5 @@ mechanics; hosts retain the following responsibilities:
 See [AUTH.md](AUTH.md), [STORAGE.md](STORAGE.md) and [INTEGRATIONS.md](INTEGRATIONS.md)
 for the concrete callback/store contracts. A host integration must validate these
 boundaries in its real browser, issuer, vault, gateway and deployment environment.
+
+Operations source re-fetch: 2026-10-31, HTML SHA256 e69ade54433ece3fb2bd1ff6c441fecd11acc749eb6bac8b33939420d1f2b9eb, unchanged from block1. Core and guide hashes are unchanged as well. [Business Operations](OPERATIONS.md) defines trusted UI/business semantics, durable adapters and external idempotency/reconciliation obligations. Focused SQLite/PostgreSQL and process-crash evidence belongs to block2; full stable-candidate/package/platform gates remain block3. No deployed host or arbitrary network exactly-once claim is made.

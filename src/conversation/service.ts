@@ -1,3 +1,6 @@
+import { supportsOperations, parseOperationApproval } from '../protocol/operations.js';
+import type { OperationApproval, OperationRequest } from '../protocol/operations.js';
+import type { MetadataResolver } from '../network/discovery.js';
 import { companyScopes } from '../network/discovery.js';
 import { randomBytes } from 'node:crypto';
 import { createConversationNotifications } from './store.js';
@@ -11,6 +14,7 @@ import type { AcceptedAuthority, AuthorityPolicy, Principal, RequestAuthenticato
 
 export interface ConversationRecord {
   id: string; issuer: string; clientId: string; userId: string; bindingId: string;
+  operationApprovals?: string[];
   lastUserMessage?: Message;
   status: Status; responder: AuthorType; context: JsonObject; events: ConversationEvent[];
   eventWindow?: { invalid?: boolean; expired?: boolean; hasMore: boolean };
@@ -36,6 +40,8 @@ export interface ConversationStoreState {
   work: WorkRecord[];
 }
 export interface ConversationOptions {
+  /** Enable only with durable business execution and published Company v2 capability. Unsupported clients are refused. */
+  operations?: MetadataResolver;
   endpoint: string;
   store: ConversationStore;
   authenticator: RequestAuthenticator;
@@ -66,6 +72,7 @@ export interface ConversationService {
   /** Protocol errors become responses; anything else is re-thrown, so hosts must catch it and answer 500. */
   handle(request: Request): Promise<Response>;
   claim(): Promise<WorkClaim | null>;
+  operationContext(work: WorkRef): Promise<{ principal: Principal; request: OperationRequest; approval?: OperationApproval }>;
   renew(work: WorkRef): Promise<void>;
   /** Conversation history for a model or handler; account-bound history needs the bound account and configured historyScopes. */
   history(work: WorkRef): Promise<ConversationEvent[]>;
@@ -255,7 +262,7 @@ export function createConversationService(options: ConversationOptions): Convers
     }
     const events: ConversationEvent[] = [];
     let bytes = 1024; // Worst-case IDs, status, responder, cursor and JSON envelope.
-    for (const stored of conversation.events.slice(start, start + pageSize)) { const event = parseEvent(stored); const size = Buffer.byteLength(JSON.stringify(event)) + 1; if (bytes + size > maxPageBytes) break; events.push(event); bytes += size; }
+    for (const stored of conversation.events.slice(start, start + pageSize)) { const event = parseEvent(stored, !!options.operations); const size = Buffer.byteLength(JSON.stringify(event)) + 1; if (bytes + size > maxPageBytes) break; events.push(event); bytes += size; }
     if (!events.length && (conversation.events.length > start || conversation.eventWindow?.hasMore)) throw new ValidationError('page.size');
     return {
       conversation_id: conversation.id, events: events as unknown as JsonObject[], cursor: events.at(-1)?.id ?? cursor ?? null,
@@ -302,7 +309,8 @@ export function createConversationService(options: ConversationOptions): Convers
   async function accept(request: Request, principal: Principal, url: URL, conversationId?: string): Promise<Response> {
     const read = parseReadOptions(url, maxWaitSeconds);
     const waiting = url.searchParams.has('wait');
-    const body: ConversationRequest = parseConversationRequest(await readJson(request));
+    const body: ConversationRequest = parseConversationRequest(await readJson(request), !!options.operations);
+    if (body.message.approval && conversationId === undefined) throw new ValidationError('message.approval');
     const parentId = conversationId === undefined ? body.parent_conversation_id : undefined;
     // A Direct Conversation carries the User's own words (7.10).
     if (parentId !== undefined && directWords(body.message)) throw new ValidationError('message.author.type');
@@ -355,6 +363,15 @@ export function createConversationService(options: ConversationOptions): Convers
         if (read.cursor !== undefined) page(conversation, read.cursor, draft.cursorStatus);
         conversation.authority = authority;
       }
+      if (body.message.approval) {
+        const approved = parseOperationApproval(body.message.approval);
+        const approvalKey = canonical([approved.operation_id, approved.revision]);
+        if (conversation.operationApprovals?.includes(approvalKey)) {
+          const result = { status: 202, body: ack(conversation) };
+          draft.messages[key] = { conversationId: conversation.id, fingerprint, receipt: result }; return result;
+        }
+        conversation.operationApprovals = [...(conversation.operationApprovals ?? []), approvalKey];
+      }
       pruneWork(draft);
       const message = body.message;
       conversation.lastUserMessage = message;
@@ -362,7 +379,7 @@ export function createConversationService(options: ConversationOptions): Convers
       addEvent(conversation, { type: 'message', message: { ...message, role: 'user' } as JsonObject });
       // A context-only message asks nothing. Work always records this message's own accepted authority; while queued
       // for or answered by a person it is held for them and reaches automation only if they never answer it.
-      if ('text' in message || 'data' in message) {
+      if ('text' in message || 'data' in message || 'approval' in message) {
         const held = conversation.responder === 'human' || conversation.status === 'queued';
         draft.work.push({ id: randomId('wrk_'), conversationId: conversation.id, message, authority, phase: held ? 'held' : 'pending', outputs: {} });
         if (!held && conversation.status === 'idle') setState(conversation, 'working');
@@ -466,6 +483,7 @@ export function createConversationService(options: ConversationOptions): Convers
     const method = match?.[2] === 'events' ? 'GET' : 'POST';
     if (request.method !== method) throw new HttpError(405, { error: 'method_not_allowed' }, { Allow: method });
     const principal = await authenticator.authenticate(request);
+    if (options.operations && !supportsOperations(await options.operations.resolveClient(principal.clientId))) throw new HttpError(403, {error:'extension_required',extension:'operations'}, {'WWW-Authenticate':'Bearer error="extension_required", extension="operations"'});
     if (!match) return accept(request, principal, url);
     const [, id, action] = match;
     if (action === 'messages') return accept(request, principal, url, id);
@@ -570,7 +588,7 @@ export function createConversationService(options: ConversationOptions): Convers
           work.phase = 'claimed';
           work.fence = newFence(draft);
           work.leaseUntil = now + leaseMs;
-          return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: parseMessage(work.message), context: conversation.context };
+          return { workId: work.id, fence: work.fence, conversationId: work.conversationId, message: parseMessage(work.message, { operations: !!options.operations }), context: conversation.context };
         }
         return null;
       });
@@ -587,7 +605,7 @@ export function createConversationService(options: ConversationOptions): Convers
       return publish(ref, (state, work) => boundAccount(state, work) === undefined ? [] : historyScopes, (draft, work, conversation) => {
         const accountId = boundAccount(draft, work);
         if (accountId !== undefined && work.authority.principal.accountId !== accountId) throw new AuthorityError('insufficient_scope', { scope: historyScopes.join(' ') });
-        return linkedHistory(draft, conversation).map(parseEvent);
+        return linkedHistory(draft, conversation).map(event => parseEvent(event, !!options.operations));
       }, never, true);
     },
 
@@ -602,8 +620,22 @@ export function createConversationService(options: ConversationOptions): Convers
       });
     },
 
+    operationContext(ref) {
+      if (!options.operations) throw new TypeError('operations not configured');
+      return publish(ref, noScopes, (_draft, work, conversation) => ({
+        principal: structuredClone(work.authority.principal),
+        request: { channel: 'conversation' as const, endpoint: options.endpoint, conversationId: conversation.id },
+        ...(work.message.approval ? { approval: parseOperationApproval(work.message.approval) } : {}),
+      }));
+    },
+
     async reply(ref, outputId, message) {
-      const parsed = parseMessage(message, { company: true });
+      if (message.operation) {
+        const state = await store.read({ workId: ref.workId });
+        const work = state.work.find(row => row.id === ref.workId);
+        if (!work || !options.operations || !supportsOperations(await options.operations.resolveClient(work.authority.principal.clientId))) throw new ValidationError('message.operation');
+      }
+      const parsed = parseMessage(message, { company: true, operations: !!options.operations });
       const payload = canonical({ reply: parsed });
       await publish(ref, noScopes, (draft, work, conversation) => {
         if (parsed.author.type !== conversation.responder) throw new ValidationError('message.author.type');
@@ -667,7 +699,7 @@ export function createConversationService(options: ConversationOptions): Convers
         const last = conversation.events.findLast(event => event.type === 'message' && (event.message as Message).role === 'user');
         const source = conversation.lastUserMessage ?? last?.message as Message | undefined;
         if (!source) throw new PublicationError('stale_work');
-        const { role: _role, ...message } = parseMessage(source);
+        const { role: _role, ...message } = parseMessage(source, { operations: !!options.operations });
         const work: WorkRecord = { id: randomId('wrk_'), conversationId, message, authority, phase: 'claimed', fence: newFence(draft), leaseUntil: clock.now() + operatorLeaseMs, human: true, outputs: {} };
         conversation.humanUntil = work.leaseUntil;
         draft.work.push(work);

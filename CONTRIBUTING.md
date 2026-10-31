@@ -2,8 +2,8 @@
 
 Follow the live draft 0.3 [specification](https://personalagentprotocol.org/docs/0.3/spec)
 and [guides](https://personalagentprotocol.org/docs/0.3/guides). Tests/snapshots are
-supporting evidence. Core protocol and Mediated Sign-In v1 are in scope. Operations v2
-is required in the next migration block and is not implemented or advertised here.
+supporting evidence. Core protocol, Mediated Sign-In v1 and [Operations v2](OPERATIONS.md) are in scope.
+Operations capability publication requires complete host consent/effect integration.
 Application business workflows remain host responsibilities. Source fingerprints and
 recommendation boundaries are in [CONFORMANCE.md](CONFORMANCE.md).
 Code is [MIT](LICENSE); confirm rights for third-party contributions.

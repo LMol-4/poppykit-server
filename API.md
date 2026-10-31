@@ -30,3 +30,9 @@ Run the [quickstart](examples/quickstart.mjs) without a listener or external ser
 The optional Postgres entry point ships its adapters, `createPostgresPool`,
 `postgresMigration`, `migratePostgres` and schema-version export; see [storage](STORAGE.md).
 TypeScript Postgres consumers also install `@types/pg@8.23.1` as a development dependency.
+
+## Business Operations v2
+
+See [OPERATIONS.md](OPERATIONS.md) for the complete consent/effect contract. Root exports include `BusinessOperation`, `OperationApproval`, `OperationRequest`, `operationsV2`, `supportsOperations`, `parseBusinessOperation`, `parseOperationApproval`, `parseApprovalHeader`, `approvalHeader`, `mcpApproval`, `approvalMetaKey`, `captureApiOperationRequest`, `operationExpiry`, `operationRequiredResponse` and `operationToolError`.
+
+Server exports `createBusinessOperations`, `BusinessOperationError`, `operationApiResponse`, `operationMcpResponse`, `operationPendingResponse`, `BusinessOwner`, `OperationRevision`, `BusinessOperationRecord`, `BusinessOperationStore`, `OperationInput`, `OperationOutcome` and `ExternalOperationEffect`. Both company databases expose `businessOperations(namespace)` and scoped `withTransaction`; the adapter-contract subpath exports `runBusinessOperationAdapterContract`. Conversation options accept `operations:metadata`, and `operationContext(work)` returns its accepted binding/approval.

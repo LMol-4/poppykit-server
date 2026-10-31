@@ -1,5 +1,7 @@
 # Changelog
 
+Local migration block2 adds Operations v2 codecs, negotiated API/MCP/conversation mechanics and durable revision ownership, execution claims, local atomic effects and host external reconciliation. See [OPERATIONS.md](OPERATIONS.md). This is a local SDK checkpoint, not full CLI integration or package publication.
+
 ## Unreleased — current-spec core migration
 
 Separate delegated resource Sessions from OAuth account grants; discover issuers and

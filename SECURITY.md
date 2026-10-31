@@ -11,3 +11,5 @@ impact and the trust boundary involved. These draft packages have no promised
 support window or response SLA. Custom vaults, issuers, browser controllers,
 proxy routing and deployment policy remain operator responsibilities. Redaction
 and scoped authority do not isolate an unrestricted same-user program.
+
+Business-operation approval requires the trusted per-operation UI described in [OPERATIONS.md](OPERATIONS.md). Keep Company/model text separate from user consent. Local effects must share the receipt transaction; arbitrary network effects require host idempotency and reconciliation. Retain uncertain claims until the actual outcome is known.

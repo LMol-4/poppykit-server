@@ -52,6 +52,8 @@ try {
 
 ## Guides
 
+- [Business operations](OPERATIONS.md): exact per-operation approval, durable retries and effect contracts.
+
 - [Authentication](AUTH.md): external/reference issuers, consent and revocation.
 - [Storage](STORAGE.md): shared authority coordinator, cross-process transactions and reset.
 - [Delivery](DELIVERY.md): workers, streaming, cursors, retention and effect idempotency.

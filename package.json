@@ -43,7 +43,8 @@
     "examples",
     "LICENSE",
     "migrations",
-    "CONFORMANCE.md"
+    "CONFORMANCE.md",
+    "OPERATIONS.md"
   ],
   "exports": {
     ".": {
@@ -68,6 +69,7 @@
     }
   },
   "dependencies": {
+    "@agentsig/structured-fields": "0.1.1",
     "jose": "6.2.12"
   },
   "license": "MIT",

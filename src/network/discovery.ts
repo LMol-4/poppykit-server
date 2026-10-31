@@ -8,7 +8,7 @@ import type { ExcludedTask } from './tasks.js';
 export interface ScopeHint { changes: 'none' | 'reversible' | 'irreversible'; personal_data: boolean }
 export interface PoppyDocument { protocol_version: '0.3'; organization: { name: string; domain: string }; auth?: { issuer?: string; scopes?: Record<string, string>; scope_hints?: Record<string, ScopeHint>; [key: string]: unknown }; agent?: { protocols: { type: string; endpoint: string; [key: string]: unknown }[] }; apis?: { type: string; url: string; description: string; [key: string]: unknown }[]; web?: { browser_session_endpoint?: string; [key: string]: unknown }; excluded_tasks?: { url: string }; feedback?: { endpoint: string; [key: string]: unknown }; extensions?: Record<string, { version: string; endpoint?: string; [key: string]: unknown }>; [key: string]: unknown }
 export interface AuthorizationMetadata { issuer: string; token_endpoint: string; revocation_endpoint: string; protected_resources: string[]; grant_types_supported: string[]; scopes_supported?: string[]; authorization_endpoint?: string; device_authorization_endpoint?: string; dpop_signing_alg_values_supported?: string[]; client_id_metadata_document_supported?: boolean; [key: string]: unknown }
-export interface ClientMetadata { client_id: string; client_name: string; jwks_uri: string; redirect_uris: string[]; token_endpoint_auth_method: 'private_key_jwt'; [key: string]: unknown }
+export interface ClientMetadata { client_id: string; client_name: string; jwks_uri: string; redirect_uris: string[]; token_endpoint_auth_method: 'private_key_jwt'; extensions?: Record<string, { version: string; [key: string]: unknown }>; [key: string]: unknown }
 export interface CompanyMetadata { document: PoppyDocument; authorization?: AuthorizationMetadata; url: string }
 export interface MetadataResolver { resolveCompany(domain: string): Promise<CompanyMetadata>; resolveResource?(resource: string, options?: { metadataUrl?: string; refresh?: boolean }): Promise<ProtectedResourceMetadata | null>; resolveClient(clientId: string): Promise<ClientMetadata>; resolveJwks(uri: string, options?: { refresh?: boolean }): Promise<JsonObject>; resolveExcludedTasks?(document: PoppyDocument): Promise<ExcludedTask[]>; invalidate?(target?: string): void }
 function url(value: unknown, field: string): string { const valueString = string(value, field); secureUrl(valueString); return valueString; }
@@ -133,6 +133,7 @@ export function parseClientMetadata(value: unknown, clientId: string): ClientMet
   string(metadata.client_name, 'client_name'); member(metadata.token_endpoint_auth_method, ['private_key_jwt'], 'token_endpoint_auth_method');
   const redirects = strings(metadata.redirect_uris, 'redirect_uris', true);
   if (secureUrl(url(metadata.jwks_uri, 'jwks_uri')).hostname !== parsed.hostname || redirects.some(endpoint => !validRedirect(endpoint, clientId))) throw new ValidationError('client_endpoint_domain');
+  if ('extensions' in metadata) for (const extension of Object.values(object(metadata.extensions))) string(object(extension).version, 'extension.version');
   if ('logo_uri' in metadata) url(metadata.logo_uri, 'logo_uri');
   return metadata as unknown as ClientMetadata;
 }
