@@ -2,7 +2,7 @@
 
 Local migration block2 adds Operations v2 codecs, negotiated API/MCP/conversation mechanics and durable revision ownership, execution claims, local atomic effects and host external reconciliation. See [OPERATIONS.md](OPERATIONS.md). This is a local SDK checkpoint, not full CLI integration or package publication.
 
-## Unreleased — current-spec core migration
+## 0.5.0 — current-spec core migration
 
 Separate delegated resource Sessions from OAuth account grants; discover issuers and
 service resources independently; support issuerless Companies, Bearer/DPoP tokens,
@@ -10,7 +10,7 @@ current mediated grants, code-only browser joining, current errors and feedback.
 Client auth records upgrade to v3; reference issuer records upgrade to v5 without
 resetting credentials or pending/recovery records. Stop old writers before opening
 upgraded stores. Retired public APIs are removed; see [AUTH.md](AUTH.md) and
-[STORAGE.md](STORAGE.md). This checkpoint is not package-release acceptance.
+[STORAGE.md](STORAGE.md). Breaking local migration candidate; publication requires the recorded release gates.
 
 ## 0.4.0 — 2026-10-28
 

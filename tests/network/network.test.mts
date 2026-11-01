@@ -569,8 +569,8 @@ test('unknown conversation values use conservative fallbacks and OAuth expiry is
   assert.deepEqual(wire.parseTokenResponse({access_token:'opaque',token_type:'bearer'}),{access_token:'opaque',token_type:'Bearer'});
   assert.equal(wire.parseTokenResponse({access_token:'opaque',token_type:'DPoP',expires_in:0}).expires_in,0);
   for(const expires_in of [-1,1.5,'60',null]) assert.throws(()=>wire.parseTokenResponse({access_token:'opaque',token_type:'Bearer',expires_in}));
-  assert.throws(()=>wire.parseMessage({id:'operation_only',author:{type:'agent'},operation:{}}),{field:'message.content'});
-  assert.throws(()=>wire.parseMessage({id:'approval_only',author:{type:'agent'},approval:{}}),{field:'message.content'});
+  assert.throws(()=>wire.parseMessage({id:'operation_only',author:{type:'agent'},operation:{}}),{field:'message.operation'});
+  assert.throws(()=>wire.parseMessage({id:'approval_only',author:{type:'agent'},approval:{}}),{field:'message.approval'});
 });
 
 test('protected-resource domain ownership ignores host case but rejects URI normalization', async () => {

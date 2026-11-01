@@ -1,3 +1,4 @@
+import {randomUUID} from 'node:crypto';
 import baseTest from 'node:test';
 import assert from 'node:assert/strict';
 import { PostgresCompanyDatabase, migratePostgres, createPostgresPool } from '../dist/postgres.js';
@@ -9,7 +10,7 @@ baseTest('Postgres pool rejects TLS downgrade through pg connection-string overr
   assert.throws(()=>createPostgresPool({ssl:{rejectUnauthorized:false}}),/verification/);
 });
 test('Postgres lifecycle: savepoints, escaped handles, explicit schema versions and caller pool ownership',{timeout:15000},async()=>{
-  const pool=testPool(), db=new PostgresCompanyDatabase(pool),ns=(process.env.D1_NAMESPACE??'d1')+':lifecycle';
+  const pool=testPool(), db=new PostgresCompanyDatabase(pool),ns=(process.env.D1_NAMESPACE??'d1')+':lifecycle:'+randomUUID();
   let rollbackWindow:(()=>Promise<void>)|undefined;
   pool.on('connect',client=>{
     client.query=new Proxy(client.query,{apply(query,receiver,args:unknown[]){
@@ -72,12 +73,17 @@ test('Postgres lifecycle: savepoints, escaped handles, explicit schema versions 
       });
       assert.deepEqual((await connection.query('SELECT id FROM poppy_server.records WHERE ns=$1 ORDER BY id',[ns])).rows.map(row=>row.id),['outer','outer-after-catch','recursive']);
     });
-    await pool.query('UPDATE poppy_server.schema_version SET version=2');
+    // Keep schema fault injection in its own disposable database so parallel contracts retain their schema.
+    const name='poppy_schema_contract_'+randomUUID().replaceAll('-','');
+    await pool.query('CREATE DATABASE "'+name+'"');
+    const isolated=testPool(3000,name);
+    const versionDb=new PostgresCompanyDatabase(isolated);
     try {
-      await assert.rejects(db.run(async()=>{}),/unsupported.*version/);
-      await assert.rejects(migratePostgres(pool,'poppy_server'),/unsupported.*version/);
-    } finally {await pool.query('UPDATE poppy_server.schema_version SET version=1');}
-    await migratePostgres(pool,'poppy_server');
+      await migratePostgres(isolated,'poppy_server');
+      await isolated.query('UPDATE poppy_server.schema_version SET version=2');
+      await assert.rejects(versionDb.run(async()=>{}),/unsupported.*version/);
+      await assert.rejects(migratePostgres(isolated,'poppy_server'),/unsupported.*version/);
+    } finally {await versionDb.close();await isolated.end();await pool.query('DROP DATABASE "'+name+'"');}
     await db.close(); await assert.rejects(db.run(async()=>{}),/closed/);
     assert.equal((await pool.query('SELECT 1 AS n')).rows[0].n,1,'adapter close must leave caller pool usable');
     assert.throws(()=>createPostgresPool({ssl:{rejectUnauthorized:false}}),/verification/);

@@ -69,3 +69,5 @@ for the concrete callback/store contracts. A host integration must validate thes
 boundaries in its real browser, issuer, vault, gateway and deployment environment.
 
 Operations source re-fetch: 2026-10-31, HTML SHA256 e69ade54433ece3fb2bd1ff6c441fecd11acc749eb6bac8b33939420d1f2b9eb, unchanged from block1. Core and guide hashes are unchanged as well. [Business Operations](OPERATIONS.md) defines trusted UI/business semantics, durable adapters and external idempotency/reconciliation obligations. Focused SQLite/PostgreSQL and process-crash evidence belongs to block2; full stable-candidate/package/platform gates remain block3. No deployed host or arbitrary network exactly-once claim is made.
+
+Source revalidation on 2026-11-01 found all six core/current/changelog/Operations/mediated/guides pages byte-identical to the 2026-10-31 snapshots. A numbered draft URL remains mutable. Final candidate verification and external platform limits are recorded in the workspace migration STATUS; package publication is established only by its release receipt.
