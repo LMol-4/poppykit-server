@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — remediation job 2
+
+- Nested SQLite `run`/`withTransaction` callbacks use savepoints. A caught child
+  failure rolls back child writes; outer work can still commit. Handles expire
+  with their own callback and cannot outlive an ancestor. Await nested work
+  sequentially: overlapping children and unawaited descendants reject, matching
+  the Postgres contract. Callers relying on joined or concurrent nested scopes
+  must update their sequencing.
+- Client metadata may omit `redirect_uris`; the public type is optional. Treat
+  omission as no registered callbacks (`redirect_uris ?? []`). Direct Sign-In
+  still rejects unregistered callbacks; supplied arrays remain validated.
+
+No SQL migration, reset, configuration or dependency change. Existing namespaces,
+credentials, receipts and unresolved work remain intact. Stop old writers when
+upgrading; this entry describes local source, not a published version.
+
 Local migration block2 adds Operations v2 codecs, negotiated API/MCP/conversation mechanics and durable revision ownership, execution claims, local atomic effects and host external reconciliation. See [OPERATIONS.md](OPERATIONS.md). This is a local SDK checkpoint, not full CLI integration or package publication.
 
 ## 0.5.1 — 2026-11-01

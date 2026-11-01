@@ -163,7 +163,9 @@ test('targeted reads and writes do not grow with unrelated conversations', async
       Object.assign(state.bindings[state.conversations[first].bindingId],{invalid:undefined});
     }), /non-JSON/);
     assert.deepEqual((await store.read({ conversationId: first })).conversations[first].context, {});
-    await Promise.all([store.read({ conversationId: first }), store.read({ conversationId: first })]);
+    const reading = store.read({ conversationId: first });
+    await assert.rejects(store.read({ conversationId: first }), /concurrent nested/);
+    await reading;
   });
 });
 test('bounded SQLite cleanup isolates namespaces and retains grants, work, receipts and events', async t => {
@@ -245,4 +247,73 @@ test('durable issuer rotates and revokes atomically; authority and conversation 
   const rotated = await env.send({ grant_type: 'refresh_token', assertion: undefined, refresh_token: signed.body.refresh_token });
   assert.equal(rotated.body.error, 'invalid_grant');
   assert.deepEqual((await db.issuer('https://other.test').read({ kind: 'principal', sessionId:'' })).sessions, {});
+});
+
+test('SQLite nested scopes roll back independently and expire their own handles', async t => {
+  const db = new SqliteCompanyDatabase(await fixture()); t.after(()=>db.close());
+  type Connection = Parameters<Parameters<typeof db.withTransaction>[0]>[0];
+  let escaped: Connection | undefined, outer: Connection | undefined;
+  await db.withTransaction(async connection => {
+    outer = connection;
+    connection.run('CREATE TABLE effects (id TEXT PRIMARY KEY)');
+    connection.run('INSERT INTO effects VALUES (?)',['outer']);
+    await assert.rejects(db.withTransaction(async nested => {
+      escaped = nested; nested.run('INSERT INTO effects VALUES (?)',['inner']); throw new Error('abort inner');
+    }), /abort inner/);
+    assert.ok(escaped); assert.throws(()=>escaped!.get('SELECT 1'),/expired/);
+    assert.equal(connection.get('SELECT count(*) AS n FROM effects')!.n,1);
+    await db.run(async()=>{await db.withTransaction(async nested=>{escaped=nested;nested.run('INSERT INTO effects VALUES (?)',['recursive']);});});
+    assert.throws(()=>escaped!.run('INSERT INTO effects VALUES (?)',['escaped']),/expired/);
+    connection.run('INSERT INTO effects VALUES (?)',['after']);
+  });
+  assert.throws(()=>outer!.get('SELECT 1'),/expired/);
+  await db.withTransaction(async connection=>assert.equal(connection.get('SELECT count(*) AS n FROM effects')!.n,3));
+  await assert.rejects(db.run(async()=>{await db.withTransaction(async connection=>{connection.run('INSERT INTO effects VALUES (?)',['outer-aborted']);});throw new Error('abort outer');}),/abort outer/);
+  await db.withTransaction(async connection=>assert.equal(connection.get('SELECT count(*) AS n FROM effects')!.n,3));
+});
+
+test('SQLite rejects overlapping and unawaited scopes without allowing late writes', async t => {
+  const db = new SqliteCompanyDatabase(await fixture()); t.after(()=>db.close());
+  await db.withTransaction(async connection=>connection.run('CREATE TABLE effects (id TEXT PRIMARY KEY)'));
+  await db.withTransaction(async outer=>{
+    let release!:()=>void; const gate=new Promise<void>(resolve=>{release=resolve;});
+    const first=db.withTransaction(async child=>{child.run('INSERT INTO effects VALUES (?)',['overlap']);await gate;throw new Error('abort overlap');});
+    await assert.rejects(db.withTransaction(async()=>{}),/concurrent nested/);
+    assert.throws(()=>outer.get('SELECT 1'),/concurrent/);
+    release();await assert.rejects(first,/abort overlap/);
+    outer.run('INSERT INTO effects VALUES (?)',['outer']);
+  });
+  let late: Promise<void> | undefined, release!:()=>void, entered!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;}), ready=new Promise<void>(resolve=>{entered=resolve;});
+  await assert.rejects(db.run(async()=>{
+    await db.withTransaction(async()=>{
+      late=db.withTransaction(async child=>{child.run('INSERT INTO effects VALUES (?)',['late-before']);entered();await gate;child.run('INSERT INTO effects VALUES (?)',['late-after']);});
+      await ready;
+    });
+  }),/unawaited nested/);
+  release();assert.ok(late);await assert.rejects(late,/expired/);
+  await db.withTransaction(async connection=>assert.equal(connection.get('SELECT count(*) AS n FROM effects')!.n,1));
+});
+
+test('SQLite delayed operation callbacks cannot persist after an ancestor terminates', async t => {
+  const db=new SqliteCompanyDatabase(await fixture());t.after(()=>db.close());
+  for (const outerActive of [false,true]) {
+    const namespace='delayed-'+outerActive, store=db.businessOperations(namespace);
+    let release!:()=>void,entered!:()=>void,late:Promise<unknown>|undefined;
+    const gate=new Promise<void>(resolve=>{release=resolve;}),ready=new Promise<void>(resolve=>{entered=resolve;});
+    const terminate=()=>db.run(async()=>{
+      late=store.transaction('late',async slot=>{
+        slot.record={version:1,id:'late',owner:{companyId:'company',clientId:'client',userId:'user',accountId:'account'},scopes:[],revisions:{}};
+        entered();await gate;
+      }).then(()=>null,error=>error as unknown);
+      await ready;
+    });
+    const verify=async()=>{
+      release();assert.ok(late);const error=await late;
+      assert.equal(await store.transaction('late',async slot=>slot.record),undefined,'expired callback must leave no receipt');
+      assert.ok(error instanceof Error);assert.match(error.message,/expired/);
+    };
+    if (outerActive) await db.run(async()=>{await assert.rejects(terminate(),/unawaited nested/);await verify();});
+    else {await assert.rejects(terminate(),/unawaited nested/);await verify();}
+  }
 });

@@ -185,7 +185,9 @@ wins before mutation. The host must still validate ownership, payload digests,
 current business revisions and its own idempotency receipts. Issuer namespace
 metadata and per-conversation binding/message locks use transaction-scoped advisory
 locks, including absent keys; no process mutex or session lock substitutes for them.
-Nested mutations use savepoints. Await nested mutations sequentially: overlapping
+SQLite and Postgres nested `run`/`withTransaction` scopes use savepoints. A caught
+child failure rolls back that child while outer work may commit. Handles expire
+with their own callback, including when an ancestor ends. Await nested mutations sequentially: overlapping
 siblings reject explicitly, while recursion is supported. Escaped query handles
 reject after their scope ends. External model/network/KMS calls belong outside this
 boundary. Fences do not make arbitrary external effects exactly-once.

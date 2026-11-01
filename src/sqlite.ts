@@ -15,6 +15,11 @@ import type { IssuerState } from './reference-auth/index.js';
 import type { IssuerStore, IssuerSelection } from './reference-auth/store.js';
 
 type Row = { id: string; body: string };
+type TransactionContext = { active: boolean; childActive: boolean; parent?: TransactionContext };
+function scopeActive(context: TransactionContext): boolean {
+  for (let scope: TransactionContext | undefined = context; scope; scope = scope.parent) if (!scope.active) return false;
+  return true;
+}
 function json(value: unknown): string {
   return JSON.stringify(value, (_key, item) => {
     if (item === undefined || typeof item === 'function' || typeof item === 'bigint' || (typeof item === 'number' && !Number.isFinite(item))) throw new TypeError('non-JSON record');
@@ -25,7 +30,7 @@ function json(value: unknown): string {
 /** Share this instance between issuer and conversations so authorization and mutation commit together. */
 export class SqliteCompanyDatabase {
   private readonly db: DatabaseSync;
-  private readonly inside = new AsyncLocalStorage<{ active: boolean }>();
+  private readonly inside = new AsyncLocalStorage<TransactionContext>();
   private queue: Promise<unknown> = Promise.resolve();
   private savepoint = 0;
   readonly metrics = { rowsRead: 0, rowsWritten: 0 };
@@ -50,8 +55,27 @@ export class SqliteCompanyDatabase {
   }
   close(): void { this.db.close(); }
   /** Required SQLite writer serialization, not an application-wide lock or network-call boundary. */
-  run<T>(action: () => Promise<T>): Promise<T> {
-    if (this.inside.getStore()?.active) return action();
+  async run<T>(action: () => Promise<T>): Promise<T> {
+    const parent = this.inside.getStore();
+    if (parent) {
+      if (!scopeActive(parent)) throw new Error('expired SQLite transaction');
+      if (parent.childActive) throw new Error('concurrent nested SQLite transactions are unsupported; await each mutation');
+      parent.childActive = true;
+      const name = `nested_${++this.savepoint}`, context: TransactionContext = { active: true, childActive: false, parent };
+      let started = false;
+      try {
+        this.db.exec(`SAVEPOINT ${name}`); started = true;
+        const result = await this.inside.run(context, action);
+        if (!scopeActive(context)) throw new Error('expired SQLite transaction');
+        if (context.childActive) throw new Error('unawaited nested SQLite transaction');
+        context.active = false;
+        this.db.exec(`RELEASE ${name}`); return result;
+      } catch (error) {
+        context.active = false;
+        if (started && scopeActive(parent)) this.db.exec(`ROLLBACK TO ${name}; RELEASE ${name}`);
+        throw error;
+      } finally { context.active = false; parent.childActive = false; }
+    }
     const run = this.queue.then(async () => {
       const deadline = Date.now() + 5000;
       for (;;) {
@@ -61,9 +85,10 @@ export class SqliteCompanyDatabase {
           await sleep(10);
         }
       }
-      const context = { active: true };
+      const context: TransactionContext = { active: true, childActive: false };
       try {
         const result = await this.inside.run(context, action);
+        if (context.childActive) throw new Error('unawaited nested SQLite transaction');
         this.db.exec('COMMIT'); return result;
       } catch (error) { this.db.exec('ROLLBACK'); throw error; }
       finally { context.active = false; }
@@ -103,21 +128,21 @@ export class SqliteCompanyDatabase {
   }
   businessOperations(namespace: string): BusinessOperationStore {
     return { transaction: (operationId, action) => this.run(async () => {
-      const name = 'operation_' + ++this.savepoint; this.db.exec('SAVEPOINT ' + name);
-      try {
-        const slot = { record: this.one<BusinessOperationRecord>(namespace, 'business_operations', operationId) };
-        if (slot.record && slot.record.version !== 1) throw new Error('unsupported business operation version');
-        const result = await action(slot);
-        if (slot.record) { if (slot.record.version !== 1 || slot.record.id !== operationId) throw new TypeError('business operation binding'); this.put(namespace, 'business_operations', operationId, slot.record); }
-        this.db.exec('RELEASE ' + name); return structuredClone(result);
-      } catch (error) { this.db.exec('ROLLBACK TO ' + name); this.db.exec('RELEASE ' + name); throw error; }
+      const context = this.inside.getStore()!;
+      const slot = { record: this.one<BusinessOperationRecord>(namespace, 'business_operations', operationId) };
+      if (slot.record && slot.record.version !== 1) throw new Error('unsupported business operation version');
+      const result = await action(slot);
+      if (!scopeActive(context)) throw new Error('expired SQLite transaction');
+      if (context.childActive) throw new Error('unawaited nested SQLite transaction');
+      if (slot.record) { if (slot.record.version !== 1 || slot.record.id !== operationId) throw new TypeError('business operation binding'); this.put(namespace, 'business_operations', operationId, slot.record); }
+      return structuredClone(result);
     }) };
   }
   /** Same-database business effects only. The callback and operation receipt share the outer transaction. */
   withTransaction<T>(action: (connection: { run(sql: string, values?: (string | number | null)[]): void; get(sql: string, values?: (string | number | null)[]): Record<string, unknown> | undefined }) => Promise<T>): Promise<T> {
     return this.run(async () => {
       const context = this.inside.getStore()!;
-      const check = () => { if (!context.active || this.inside.getStore() !== context) throw new Error('expired SQLite transaction'); };
+      const check = () => { if (!scopeActive(context) || this.inside.getStore() !== context) throw new Error('expired SQLite transaction'); if (context.childActive) throw new Error('concurrent SQLite transaction use is unsupported; await each mutation'); };
       return action({ run: (sql, values = []) => { check(); this.db.prepare(sql).run(...values); }, get: (sql, values = []) => { check(); return this.db.prepare(sql).get(...values); } });
     });
   }
