@@ -9,9 +9,10 @@ re-fetched and matched their initial snapshots byte for byte. SHA-256 identities
 - Mediated v1: 68074a6178bf4c78f09b2a88313a4067fa9e4143a338f205a63d2d884ca09f94
 - Guides: fe10657eca0b464c19cc198f3876d30f5055d8a5cb423cd147affe805206ecdd
 
-The workspace requirement matrix and exact commands, tree hashes and focused test
-receipts live in jobs/protocol-migration. Focused checks do not certify an installed
-release or any deployed service. Operations v2 SDK mechanics are implemented with opt-in host contracts;
+The earlier workspace migration job records were retired at the owner's request.
+The [assessment](../../assessment-report.md) and [current remediation baseline](../../jobs/assessment-remediation/BASELINE.md)
+summarize retained evidence and its limits; deleted raw receipts are not available
+verification. Focused checks do not certify an installed release or deployed service. Operations v2 SDK mechanics are implemented with opt-in host contracts;
 full candidate, native and cross-package release gates remain separate.
 
 ## Host contracts and recommendations
@@ -70,4 +71,4 @@ boundaries in its real browser, issuer, vault, gateway and deployment environmen
 
 Operations source re-fetch: 2026-10-31, HTML SHA256 e69ade54433ece3fb2bd1ff6c441fecd11acc749eb6bac8b33939420d1f2b9eb, unchanged from block1. Core and guide hashes are unchanged as well. [Business Operations](OPERATIONS.md) defines trusted UI/business semantics, durable adapters and external idempotency/reconciliation obligations. Focused SQLite/PostgreSQL and process-crash evidence belongs to block2; full stable-candidate/package/platform gates remain block3. No deployed host or arbitrary network exactly-once claim is made.
 
-Source revalidation on 2026-11-01 found all six core/current/changelog/Operations/mediated/guides pages byte-identical to the 2026-10-31 snapshots. A numbered draft URL remains mutable. Final candidate verification and external platform limits are recorded in the workspace migration STATUS; package publication is established only by its release receipt.
+Source revalidation on 2026-11-01 found all six core/current/changelog/Operations/mediated/guides pages byte-identical to the 2026-10-31 snapshots. A numbered draft URL remains mutable. The old migration STATUS and raw release receipts were retired at the owner's request. Retained historical facts and limits are summarized in the [remediation baseline](../../jobs/assessment-remediation/BASELINE.md); future publication claims require fresh registry and workflow evidence.
