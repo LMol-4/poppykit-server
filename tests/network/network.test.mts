@@ -643,7 +643,7 @@ test('independent redirect-free client metadata resolves without registering a D
   assert.deepEqual(resolved, document);
   assert.equal(registeredRedirect('https://independent.example/callback', resolved.redirect_uris ?? [], clientId), false);
   assert.deepEqual(parseClientMetadata({ ...document, redirect_uris: [] }, clientId).redirect_uris, []);
-  for (const redirects of [undefined, null, '', {}, [null], [''], ['https://other.example/callback'], ['https://independent.example/callback#fragment'], ['http://localhost/callback']]) {
+  for (const redirects of [undefined, null, '', {}, [null], [''], ['https://other.example/callback'], ['https://independent.example/callback#fragment'], ['https://independent.example/callback#'], ['http://127.0.0.1/callback#'], ['http://localhost/callback']]) {
     assert.throws(() => parseClientMetadata({ ...document, redirect_uris: redirects }, clientId));
   }
 });

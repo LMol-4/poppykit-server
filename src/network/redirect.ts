@@ -7,7 +7,7 @@ export function loopbackRedirect(value: string): boolean {
 }
 
 export function validRedirect(value: string, clientId: string): boolean {
-  if (/[\\\s\x00-\x1f]/.test(value)) return false;
+  if (/[#\\\s\x00-\x1f]/.test(value)) return false;
   if (loopbackRedirect(value)) return true;
   try { return secureUrl(value).hostname === secureUrl(clientId).hostname; } catch { return false; }
 }
