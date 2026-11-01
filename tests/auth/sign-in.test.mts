@@ -465,3 +465,10 @@ test('retrying the previous Account Token after a lost rotation response signs t
   expectError(await env.refresh(t3, { client_id: OTHER_CLIENT, client_assertion: await env.clientAssertion({ iss: OTHER_CLIENT, sub: OTHER_CLIENT }) }), 'invalid_grant');
   assert.equal((await env.refresh(t4)).status, 200);
 });
+
+test('redirect-free clients have no registered Direct Sign-In callback', async () => {
+  const env=await setup(),resolve=env.metadata.resolveClient;
+  env.metadata.resolveClient=async id=>{const {redirect_uris,...document}=await resolve(id);return document;};
+  await assert.rejects(env.issuer.beginAuthorization(authorizeRequest(), BINDING), error=>error instanceof AuthorizationError && error.code==='invalid_request' && error.redirectTo===undefined);
+  assert.deepEqual(env.store.state.authorizations,{});
+});

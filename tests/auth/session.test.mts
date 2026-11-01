@@ -26,7 +26,7 @@ for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres
     let at = 1790900000000, revoked = false;
     const metadata = {
       async resolveCompany(): Promise<never> { throw new Error('Sessions do not require an issuer'); },
-      async resolveClient(id: string) { assert.equal(id, clientId); return {client_id:clientId,client_name:'Independent peer',jwks_uri:'https://independent.example/jwks',redirect_uris:[],token_endpoint_auth_method:'private_key_jwt' as const}; },
+      async resolveClient(id: string) { assert.equal(id, clientId); return {client_id:clientId,client_name:'Independent peer',jwks_uri:'https://independent.example/jwks',token_endpoint_auth_method:'private_key_jwt' as const}; },
       async resolveJwks() { return {keys:[rootJwk]}; },
     };
     const accountPolicy: AuthorityPolicy = {

@@ -580,7 +580,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
       const { generation } = await read();
       let client;
       try { client = await metadata.resolveClient(clientId); } catch { throw new AuthorizationError('invalid_client'); }
-      if (!registeredRedirect(redirectUri, client.redirect_uris, clientId)) throw new AuthorizationError('invalid_request');
+      if (!registeredRedirect(redirectUri, client.redirect_uris ?? [], clientId)) throw new AuthorizationError('invalid_request');
       const state = params.get('state');
       const fail = (code: string) => new AuthorizationError(code, new URL(callback(redirectUri, { error: code, ...(state ? { state } : {}), iss: issuer })));
       if (params.get('response_type') !== 'code') throw fail('unsupported_response_type');

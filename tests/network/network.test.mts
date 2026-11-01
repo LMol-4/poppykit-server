@@ -12,6 +12,7 @@ import { EventEmitter } from 'node:events';
 import { createNodeTransport, isPublicAddress } from '../../dist/network/transport.js';
 import { createMetadataResolver, parsePoppyDocument, parseAuthorizationMetadata, validateClientId, authorizationMetadataUrl, signInMethods, companyIdentifier } from '../../dist/network/discovery.js';
 import * as wire from '../../dist/protocol/wire.js';
+import type { ClientMetadata } from '../../dist/network/discovery.js';
 import { parseClientMetadata } from '../../dist/network/discovery.js';
 import { registeredRedirect } from '../../dist/network/redirect.js';
 
@@ -631,5 +632,18 @@ test('retired resource hints are unknown data and unsupported DPoP algorithms do
     const parsed=parsePoppyDocument(doc,'https://shop.example/.well-known/poppy.json');
     assert.equal(parsed.agent!.protocols[0]!.resource,resource);assert.equal(parsed.apis![0]!.resource,resource);
     assert.deepEqual(parseAuthorizationMetadata({...authorization,dpop_signing_alg_values_supported:['ES384']},parsed).dpop_signing_alg_values_supported,['ES384']);
+  }
+});
+
+test('independent redirect-free client metadata resolves without registering a Direct callback', async () => {
+  const clientId = 'https://independent.example/agent.json';
+  const document: ClientMetadata = { client_id: clientId, client_name: 'Independent device agent', jwks_uri: 'https://independent.example/keys', token_endpoint_auth_method: 'private_key_jwt' };
+  const resolver = createMetadataResolver({ async fetch(request) { assert.equal(request.url, clientId); return Response.json(document); } });
+  const resolved = await resolver.resolveClient(clientId);
+  assert.deepEqual(resolved, document);
+  assert.equal(registeredRedirect('https://independent.example/callback', resolved.redirect_uris ?? [], clientId), false);
+  assert.deepEqual(parseClientMetadata({ ...document, redirect_uris: [] }, clientId).redirect_uris, []);
+  for (const redirects of [undefined, null, '', {}, [null], [''], ['https://other.example/callback'], ['https://independent.example/callback#fragment'], ['http://localhost/callback']]) {
+    assert.throws(() => parseClientMetadata({ ...document, redirect_uris: redirects }, clientId));
   }
 });
