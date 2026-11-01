@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import {randomUUID} from 'node:crypto';
 import baseTest from 'node:test';
 import assert from 'node:assert/strict';
@@ -88,4 +89,39 @@ test('Postgres lifecycle: savepoints, escaped handles, explicit schema versions 
     assert.equal((await pool.query('SELECT 1 AS n')).rows[0].n,1,'adapter close must leave caller pool usable');
     assert.throws(()=>createPostgresPool({ssl:{rejectUnauthorized:false}}),/verification/);
   } finally {await db.close();await pool.end();}
+});
+
+
+test('Postgres socket loss while checked out rejects and rolls back without an uncaught error',{timeout:15000},async()=>{
+  const {PostgresRuntime}=await import('../dist/postgres-runtime.js');
+  const {migratePostgres}=await import('../dist/postgres.js');
+  const owned=testPool(),admin=testPool(),schema='poppy_server' as const,namespace='disconnect-'+crypto.randomUUID();
+  const runtime=new PostgresRuntime(owned,schema);
+  let ended!:()=>void;const disconnected=new Promise<void>(resolve=>{ended=resolve;});
+  owned.on('connect',client=>client.once('end',ended));
+  try{
+    await migratePostgres(admin,schema);
+    await assert.rejects(runtime.run(async()=>{
+      const tx=runtime.connection();
+      await tx.query('INSERT INTO '+schema+'.records(ns,kind,id,body) VALUES($1,$2,$3,$4)',[namespace,'test','before-loss','{}']);
+      const pid=(await tx.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      await admin.query('SELECT pg_terminate_backend($1)',[pid]);await disconnected;
+      await tx.query('SELECT 1');
+    }),/expired|terminated|not queryable|active Postgres/);
+    assert.equal((await admin.query('SELECT count(*)::int AS n FROM '+schema+'.records WHERE ns=$1',[namespace])).rows[0].n,0);
+    await runtime.run(async()=>{assert.equal((await runtime.connection().query('SELECT 1 AS n')).rows[0].n,1);});
+  }finally{await runtime.close();await owned.end();await admin.end();}
+});
+
+baseTest('Postgres migration preserves the original failure when rollback loses the connection',async()=>{
+  const {migratePostgres}=await import('../dist/postgres.js');
+  const original=new Error('begin failed'),rollback=new Error('connection lost during rollback');
+  let released:unknown;
+  const client=Object.assign(new EventEmitter(),{
+    async query(sql:string):Promise<never>{if(sql==='BEGIN'){client.emit('error',original);throw original;}assert.equal(sql,'ROLLBACK');throw rollback;},
+    release(error:unknown){released=error;},
+  });
+  const pool={connect:async()=>client} as unknown as import('pg').Pool;
+  await assert.rejects(migratePostgres(pool,'poppy_server'),error=>error===original);
+  assert.equal(released,rollback);assert.equal(client.listenerCount('error'),0);
 });

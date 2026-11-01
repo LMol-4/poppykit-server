@@ -2,6 +2,13 @@
 
 Local migration block2 adds Operations v2 codecs, negotiated API/MCP/conversation mechanics and durable revision ownership, execution claims, local atomic effects and host external reconciliation. See [OPERATIONS.md](OPERATIONS.md). This is a local SDK checkpoint, not full CLI integration or package publication.
 
+## 0.5.1 — 2026-11-01
+
+Handle PostgreSQL socket loss while an SDK transaction or migration owns a
+checked-out connection. Invalidate failed transaction handles, discard broken
+connections, and preserve the original migration error when rollback also fails.
+A failed COMMIT still requires durable-state reconciliation before retry.
+
 ## 0.5.0 — current-spec core migration
 
 Separate delegated resource Sessions from OAuth account grants; discover issuers and

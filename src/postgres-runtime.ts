@@ -34,6 +34,9 @@ export async function postgresMigration(schema: PostgresSchema): Promise<string>
 export async function migratePostgres(pool: Pool, schema: PostgresSchema): Promise<void> {
   schemaName(schema);
   const client = await pool.connect();
+  let connectionError: Error | undefined;
+  const onError = (error: Error) => { connectionError = error; };
+  client.on('error', onError);
   try {
     await client.query('BEGIN');
     await client.query("SET LOCAL statement_timeout='5s'");
@@ -44,8 +47,8 @@ export async function migratePostgres(pool: Pool, schema: PostgresSchema): Promi
       if (rows.length !== 1 || rows[0].version !== postgresSchemaVersion) throw new Error('unsupported Postgres schema version');
     } else await client.query(await postgresMigration(schema));
     await client.query('COMMIT');
-  } catch (error) { await client.query('ROLLBACK'); throw error; }
-  finally { client.release(); }
+  } catch (error) { await client.query('ROLLBACK').catch((failure: Error) => { connectionError = failure; }); throw error; }
+  finally { client.release(connectionError); client.removeListener('error', onError); }
 }
 
 type Context = { client: PoolClient; active: boolean; locks: Set<string>; state: { serial: number; active: boolean }; childActive: boolean; parent?: Context };
@@ -83,6 +86,9 @@ export class PostgresRuntime {
       } finally { child.active = false; parent.childActive = false; }
     }
     const client = await this.pool.connect(), context: Context = { client, active: true, locks: new Set(), state: { serial: 0, active: true }, childActive: false };
+    let connectionError: Error | undefined;
+    const onError = (error: Error) => { connectionError = error; context.state.active = false; };
+    client.on('error', onError);
     try {
       await client.query('BEGIN');
       await client.query("SET LOCAL statement_timeout='5s'");
@@ -94,8 +100,8 @@ export class PostgresRuntime {
       const result = await this.context.run(context, action);
       if (context.childActive) throw new Error('unawaited nested Postgres transaction');
       await client.query('COMMIT'); return result;
-    } catch (error) { context.state.active = false; await client.query('ROLLBACK').catch(() => {}); throw error; }
-    finally { context.active = false; context.state.active = false; client.release(); }
+    } catch (error) { context.state.active = false; await client.query('ROLLBACK').catch((failure: Error) => { connectionError = failure; }); throw error; }
+    finally { context.active = false; context.state.active = false; client.release(connectionError); client.removeListener('error', onError); }
   }
   connection(): PostgresConnection {
     const context = this.context.getStore();
