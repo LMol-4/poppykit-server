@@ -8,18 +8,25 @@ and `AuthorityCoordinator` themselves.
 The tested Node 24.21.0 runtime marks `node:sqlite` experimental.
 
 ```ts
+import { createSessionAuthority } from '@poppykit/server';
 import { SqliteCompanyDatabase } from '@poppykit/server/sqlite';
 const database = new SqliteCompanyDatabase('/private/path/company.db');
 const issuer = 'https://company.example/issuer';
 const issuerStore = database.issuer(issuer);
 const conversationStore = database.conversations(issuer);
 // Reference issuer options: store: issuerStore, coordinator: database.
-// Conversation options: store: conversationStore, policy: referenceIssuer.authority.policy.
+// metadata and referenceIssuer are configured as in README/AUTH, using this database.
+const sessions = createSessionAuthority({companyId:issuer,metadata,store:database.sessions(issuer),
+  coordinator:database,accountPolicy:referenceIssuer.authority.policy,now:Date.now});
+// Request authenticator: sessions, authority: referenceIssuer.authority.
+// Conversation options: store: conversationStore, policy: sessions.policy.
 // Close database only after all in-flight requests/work have ended.
 ```
 
-Use the same database instance for the reference issuer, its coordinator, and its
-conversation storage. A policy check and the protected conversation mutation join
+Use the same database instance for the reference issuer, its coordinator, resource Sessions, and
+conversation storage. Use sessions.policy for conversation and protected host writes;
+its accountPolicy composes referenceIssuer.authority.policy (or the external account
+policy) with current resource Session checks. A policy check and the protected conversation mutation join
 one SQLite transaction. Revocation/rotation/acceptance cannot interleave between
 authorization and commit. External issuers still supply their own policy and must
 state revocation latency and how their checks are ordered with protected writes.
@@ -142,6 +149,7 @@ Supported baseline: Node 24.x (at least 24.21.0), PostgreSQL 17, including Supab
 No application, Google login or Supabase Auth dependency is required.
 
 ```ts
+import { createSessionAuthority } from '@poppykit/server';
 import { createPostgresPool, migratePostgres,
   PostgresCompanyDatabase } from '@poppykit/server/postgres';
 const pool = createPostgresPool({ connectionString: process.env.DATABASE_URL });
@@ -151,7 +159,12 @@ const database = new PostgresCompanyDatabase(pool);
 const issuerStore = database.issuer('https://company.example/issuer');
 const conversationStore = database.conversations('https://company.example/issuer');
 // Reference issuer: store: issuerStore, coordinator: database.
-// Conversation service: store: conversationStore, policy: issuer.authority.policy.
+// issuer and metadata are configured as in README/AUTH, using this database.
+const sessions = createSessionAuthority({companyId:'https://company.example/issuer',metadata,
+  store:database.sessions('https://company.example/issuer'),coordinator:database,
+  accountPolicy:issuer.authority.policy,now:Date.now});
+// Request authenticator: sessions, authority: issuer.authority.
+// Conversation service: store: conversationStore, policy: sessions.policy.
 await database.close(); // after in-flight requests end; leaves caller pool open
 await pool.end();
 ```
@@ -160,14 +173,14 @@ Use one database object for issuer/coordinator/conversations. `withTransaction`
 passes a generic query connection to host DB work inside that same transaction:
 
 ```ts
-await issuer.authority.policy.withCurrent(principal, ['records:write'], () =>
+await sessions.policy.withCurrent(principal, ['records:write'], () =>
   database.withTransaction(async connection => {
     await connection.query('UPDATE application.records SET value=$1 WHERE owner=$2',
       [validatedValue, trustedAccountId]);
   }));
 ```
 
-The policy holds the issuer authority fence through commit; revocation waits or
+The combined policy holds the Session and account authority fences through commit; revocation waits or
 wins before mutation. The host must still validate ownership, payload digests,
 current business revisions and its own idempotency receipts. Issuer namespace
 metadata and per-conversation binding/message locks use transaction-scoped advisory

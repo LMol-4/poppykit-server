@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { generateKeyPair, exportJWK, calculateJwkThumbprint, CompactSign } from 'jose';
+import { sessionJwt } from './support.mjs';
+import { setup as referenceSetup, ISSUER, API, CLIENT } from './issuer-support.mjs';
 import type { CompactJWSHeaderParameters } from 'jose';
-import { createSessionAuthority, createRequestAuthenticator, AuthorityError } from '../../dist/index.js';
+import { createSessionAuthority, createRequestAuthenticator, createConversationService, AuthorityError } from '../../dist/index.js';
 import type { Principal, AuthorityPolicy } from '../../dist/index.js';
 import { SqliteCompanyDatabase } from '../../dist/sqlite.js';
 import { PostgresCompanyDatabase } from '../../dist/postgres.js';
@@ -85,3 +87,34 @@ for (const engine of ['SQLite', ...(process.env.D1_POSTGRES === '1' ? ['Postgres
     at+=86400001;await assert.rejects(replacement.authenticate(await request('new_session')),{code:'invalid_session'});
   });
 }
+
+
+test('STORAGE guide combined policy admits signed-out conversations and fences signed-in host writes',async t=>{
+  const database=new SqliteCompanyDatabase(':memory:');t.after(()=>database.close());
+  const env=await referenceSetup({store:database.issuer(ISSUER),coordinator:database,requireDpopNonce:false});
+  const sessions=createSessionAuthority({companyId:ISSUER,metadata:env.metadata,store:database.sessions(ISSUER),
+    coordinator:database,accountPolicy:env.issuer.authority.policy,now:()=>env.clock.now});
+  const authenticator=createRequestAuthenticator({sessions,authority:env.issuer.authority,
+    endpoints:[{origin:new URL(API).origin,pathPrefix:new URL(API).pathname}],now:()=>env.clock.now});
+  const service=createConversationService({endpoint:API,historyScopes:['orders:read'],store:database.conversations(ISSUER),
+    policy:sessions.policy,authenticator,clock:{now:()=>env.clock.now}});
+  const request=async(token?:string)=>new Request(API,{method:'POST',headers:{'content-type':'application/json',
+    'poppy-session':await sessionJwt(env.identity,{issuer:ISSUER,clientId:CLIENT,url:API,sid:'guide_session',sub:'guide_user',at:env.clock.now,...(token?{token}:{})}),
+    ...(token?{authorization:'DPoP '+token,dpop:await env.proof({htu:API,token})}:{})},
+    body:JSON.stringify({message:{id:token?'signed_in':'signed_out',author:{type:'agent'},text:'Guide journey'}})});
+  const signedOut=await authenticator.authenticate(await request());
+  assert.equal((await service.handle(await request())).status,201);
+  await assert.rejects(sessions.policy.withCurrent(signedOut,['orders:write'],async()=>assert.fail('signed-out protected write')),{code:'account_required'});
+  const issued=await env.send();assert.equal(issued.status,200,JSON.stringify(issued.body));const token=issued.body.access_token!;
+  const signedIn=await authenticator.authenticate(await request(token));assert.equal(signedIn.accountId,'fixture-account');
+  assert.equal((await service.handle(await request(token))).status,201);
+  await sessions.policy.withCurrent(signedIn,['orders:write'],()=>database.withTransaction(async connection=>{
+    connection.run('CREATE TABLE guide_records(owner TEXT PRIMARY KEY,value TEXT)');
+    connection.run('INSERT INTO guide_records VALUES(?,?)',[signedIn.accountId!,'saved']);
+  }));
+  await sessions.end(CLIENT,'guide_session');
+  await assert.rejects(sessions.policy.withCurrent(signedIn,['orders:write'],()=>database.withTransaction(async connection=>{
+    connection.run('UPDATE guide_records SET value=?',['unsafe']);
+  })),{code:'invalid_session'});
+  assert.equal(await database.withTransaction(async connection=>connection.get('SELECT value FROM guide_records')?.value),'saved');
+});
