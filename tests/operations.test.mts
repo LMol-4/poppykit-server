@@ -116,7 +116,7 @@ for(const engine of ['SQLite',...(process.env.D1_POSTGRES==='1'?['Postgres']:[])
           const stage=new Promise<string>((resolve,reject)=>{worker.once('message',v=>resolve(String(v)));worker.once('exit',code=>reject(Error('worker exited '+code+': '+errors)));});
           worker.send({engine,path:f.path,ledger:f.ledger,namespace:f.namespace,mode,input:{...input,proposal:undefined,approval}});
           assert.ok(await stage);
-        }finally{const exited=new Promise<void>(resolve=>worker.once('exit',()=>resolve()));worker.kill('SIGKILL');await exited;}
+        }finally{if(worker.exitCode===null&&worker.signalCode===null){const exited=new Promise<void>(resolve=>worker.once('exit',()=>resolve()));worker.kill('SIGKILL');await exited;}}
         if(mode.startsWith('external')){
           let effects=0;const ledger=new DatabaseSync(f.ledger);ledger.exec('PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS effects (id TEXT PRIMARY KEY, body TEXT NOT NULL)');
           const effect:ExternalOperationEffect={execute:async({key})=>{effects++;ledger.prepare('INSERT OR IGNORE INTO effects VALUES (?,?)').run(key,'{"done":true}');return {done:true};},reconcile:async({key})=>ledger.prepare('SELECT 1 FROM effects WHERE id=?').get(key)?{kind:'completed',result:{done:true}}:{kind:'absent'}};
@@ -135,7 +135,7 @@ for(const engine of ['SQLite',...(process.env.D1_POSTGRES==='1'?['Postgres']:[])
         const ready=new Promise<void>((resolve,reject)=>{let error='';child.stderr?.on('data',value=>{error+=String(value);});child.once('message',()=>resolve());child.once('exit',code=>reject(Error('worker '+code+': '+error)));});
         child.send({engine,path:f.path,ledger:f.ledger,namespace:f.namespace,mode:'local-after-publication',input:{...input,proposal:undefined,approval}});return {child,ready};
       });
-      try{await Promise.all(workers.map(row=>row.ready));}finally{await Promise.all(workers.map(({child})=>new Promise<void>(resolve=>{child.once('exit',()=>resolve());child.kill('SIGKILL');})));}
+      try{await Promise.all(workers.map(row=>row.ready));}finally{await Promise.all(workers.map(({child})=>new Promise<void>(resolve=>{if(child.exitCode!==null||child.signalCode!==null){resolve();return;}child.once('exit',()=>resolve());child.kill('SIGKILL');})));}
       assert.equal(await f.count(),1);
     }finally{await f.close();}
   });

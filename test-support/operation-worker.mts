@@ -11,7 +11,7 @@ const pool=message.engine==='Postgres'?testPool():undefined,db=pool?new Postgres
 const policy:AuthorityPolicy={withCurrent:(_p,_s,action)=>db.run(action),withAccepted:(_a,_s,action)=>db.run(action)};
 const metadata={resolveClient:async()=>({extensions:{operations:{version:'2'}}})} as unknown as MetadataResolver;
 const service=createBusinessOperations({companyId:principal.issuer,store:db.businessOperations(message.namespace),policy,metadata,now:()=>Date.parse('2026-10-31T12:00:00Z')});
-const hold=async(stage:string)=>{process.send?.(stage);await new Promise(()=>{});};
+const hold=async(stage:string)=>{process.send?.(stage);await new Promise(()=>{setInterval(()=>{},1000);});};
 const input={...message.input,principal};
 if(message.mode==='before-claim')await hold('before-claim');
 if(message.mode.startsWith('local')){
