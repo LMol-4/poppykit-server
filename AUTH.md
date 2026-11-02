@@ -120,3 +120,11 @@ explicit storage reads for reconciliation.
 See [STORAGE.md](STORAGE.md). Earlier unsupported versions fail closed.
 
 Authentication lifecycle OperationRecord/operationId values never approve business operations. OAuth access consent, provider enrollment and mediated credential collection cannot supply business consent. [Operations v2](OPERATIONS.md) binds each actual user answer to the exact revision and request, and rechecks current Session/account authority for execution and protected replay.
+
+Optional standard OAuth introspection: configure introspectionEndpoint and route
+issuer.introspect(request) there. Metadata advertises RFC7662 with private_key_jwt.
+This bounded policy permits only the authenticated client's current active refresh
+tokens; unknown/foreign/revoked/rotated tokens and access-token queries return only
+active:false. Active responses contain client_id, scope, exp and an opaque
+issuer/client/account-bound sub. Assertions use the issuer audience and existing
+replay fences. No new SQL schema or Poppy extension is needed.

@@ -103,6 +103,8 @@ test('discovery enforces version, reciprocal issuer, algorithms, capability and 
   parsePoppyDocument(document, 'https://shop.example/.well-known/poppy.json');
   parsePoppyDocument({ protocol_version: '0.3', organization: document.organization, web: {} }, 'https://shop.example/.well-known/poppy.json');
   parseAuthorizationMetadata(authorization, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json'));
+  assert.equal(parseAuthorizationMetadata({...authorization,introspection_endpoint:'https://auth.example/introspect'},parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')).introspection_endpoint,'https://auth.example/introspect');
+  assert.throws(()=>parseAuthorizationMetadata({...authorization,introspection_endpoint:'http://127.0.0.1/private'},parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));
   assert.equal(authorizationMetadataUrl('https://auth.example/tenant'), 'https://auth.example/.well-known/oauth-authorization-server/tenant');
   for (const bad of [{ ...document, protocol_version: '0.2' }, { ...document, organization: { name: 'Shop', domain: 'other.example' } }, { protocol_version: '0.3', organization: document.organization, feedback: { endpoint: 'https://shop.example/feedback' } }]) assert.throws(() => parsePoppyDocument(bad, 'https://shop.example/.well-known/poppy.json'));
   for (const bad of [{ ...authorization, issuer: 'https://auth.example/other' }, { ...authorization, protected_resources: ['https://other.example'] }]) assert.throws(() => parseAuthorizationMetadata(bad, parsePoppyDocument(document,'https://shop.example/.well-known/poppy.json')));

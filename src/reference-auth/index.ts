@@ -55,7 +55,7 @@ export interface IssuerState {
   nonces: { value: string; expiresAt: number }[];
 }
 export interface ReferenceIssuerOptions {
-  issuer: string; tokenEndpoint: string; revocationEndpoint: string; authorizationEndpoint?: string;
+  issuer: string; tokenEndpoint: string; revocationEndpoint: string; authorizationEndpoint?: string; introspectionEndpoint?: string;
   protectedResources: string[]; supportedScopes: string[];
   resources?: string[]; // exact supported resource identifiers; absent resource means default
   mcpResources?: { url: string; dpop: boolean }[];
@@ -79,6 +79,7 @@ export type AuthorizationDecision = { accountId: string; scopes: string[] } | { 
 export interface ReferenceIssuer {
   token(request: Request): Promise<Response>;
   revoke(request: Request): Promise<Response>;
+  introspect(request: Request): Promise<Response>;
   beginAuthorization(request: Request, browserBinding: string): Promise<AuthorizationView>;
   completeAuthorization(id: string, browserBinding: string, decision: AuthorizationDecision): Promise<URL>;
   deviceAuthorization(request: Request): Promise<Response>;
@@ -195,6 +196,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   if (options.device) { secureUrl(options.device.endpoint); const url = secureUrl(options.device.verificationUri); const hosts = [new URL(issuer).hostname, ...options.protectedResources.map(resource => new URL(resource).hostname)];
     if (!hosts.some(host => url.hostname === host || url.hostname.endsWith(`.${host}`))) throw new TypeError('verificationUri'); }
   if (options.mediated) parseMediatedSignIn({version:'1',fields:options.mediated.fields,scopes:options.mediated.scopes});
+  if (options.introspectionEndpoint) secureUrl(options.introspectionEndpoint);
   const deviceIntervalMs = positive(options.device?.intervalSeconds, 5, 'intervalSeconds') * 1000;
   const maxCodeAttempts = positive(options.mediated?.maxCodeAttempts, 5, 'maxCodeAttempts');
   const maxAttempts = positive(options.mediated?.maxAttemptsPerMinute, 5, 'maxAttemptsPerMinute');
@@ -495,6 +497,23 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     return new Response(null, { status: 200, headers: { 'cache-control': 'no-store' } });
   }
 
+  // RFC 7662: this client-authenticated profile permits only the caller's current refresh tokens.
+  async function introspectToken(request: Request): Promise<Response> {
+    if (!options.introspectionEndpoint || new URL(request.url).href !== options.introspectionEndpoint) throw new TokenError('invalid_request');
+    const params = await readParams(request), { clientId, clientAssertion } = clientCredentials(params), token = params.get('token');
+    if (!token) throw new TokenError('invalid_request');
+    const { generation } = await read(), { client } = await authenticateClient(clientId, clientAssertion);
+    const replayKey = `assertion ${clientId} ${client.jti}`, hash = tokenHash(token);
+    const result = await commit({ kind: 'revoke', refreshHash: hash, replayKey }, draft => {
+      if (draft.generation !== generation || !current(client) || (own(draft.replay, replayKey) ?? 0) > now()) throw new TokenError('invalid_client');
+      consumeReplay(draft, replayKey, client.exp * 1000);
+      const id = own(draft.refreshTokens, hash), grant = id ? own(draft.grants, id) : undefined;
+      if (!grant || !grantLive(grant, now()) || grant.clientId !== clientId || grant.refreshHash !== hash) return { active: false };
+      return { active: true, client_id: clientId, sub: tokenHash(JSON.stringify([issuer, clientId, grant.accountId])), scope: grant.scopes.join(' '), exp: Math.floor(grant.expiresAt / 1000) };
+    });
+    return json(200, result);
+  }
+
   async function respond(request: Request, handler: (request: Request) => Promise<Response>): Promise<Response> {
     try { return await handler(request); } catch (error) {
       // Early rejects leave the body unread; release the stream instead of leaving it open.
@@ -538,6 +557,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
   return {
     token: request => respond(request, issue),
     revoke: request => respond(request, revokeToken),
+    introspect: request => respond(request, introspectToken),
     deviceAuthorization: request => respond(request, startDevice),
     async beginDeviceAuthorization(userCode, browserBinding) {
       if (!options.device || typeof userCode !== 'string' || typeof browserBinding !== 'string' || browserBinding.length < 22) throw new AuthorizationError('invalid_request');
@@ -644,6 +664,7 @@ export function createReferenceIssuer(options: ReferenceIssuerOptions): Referenc
     authorizationMetadata() {
       return {
         issuer, token_endpoint: options.tokenEndpoint, revocation_endpoint: options.revocationEndpoint,
+        ...(options.introspectionEndpoint ? { introspection_endpoint: options.introspectionEndpoint, introspection_endpoint_auth_methods_supported: ['private_key_jwt'], introspection_endpoint_auth_signing_alg_values_supported: [...ASSERTION_ALGORITHMS] } : {}),
         ...(options.authorizationEndpoint ? { authorization_endpoint: options.authorizationEndpoint, response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] } : {}),
         ...(options.device ? { device_authorization_endpoint: options.device.endpoint } : {}),
         dpop_signing_alg_values_supported: ['ES256'], token_endpoint_auth_signing_alg_values_supported: [...ASSERTION_ALGORITHMS], client_id_metadata_document_supported: true,

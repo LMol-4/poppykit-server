@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased — remediation job 4
+
+- Offer optional standard OAuth introspection for current own-client refresh grants, with client assertion/replay enforcement and opaque account subjects.
+
 ## Unreleased — remediation job 2
 
 - Nested SQLite `run`/`withTransaction` callbacks use savepoints. A caught child

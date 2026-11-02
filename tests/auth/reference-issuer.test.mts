@@ -10,7 +10,7 @@ import { createMetadataResolver, createReferenceIssuer, initialIssuerState } fro
 import { createRequestAuthenticator } from '../../dist/index.js';
 import { NOW, keyPair, proof } from './support.mjs';
 import { memoryCoordinator } from '../conversation/support.mjs';
-import { API, CLIENT, ISSUER, JWKS_URI, RESOURCE, TOKEN_ENDPOINT, expectError, setup } from './issuer-support.mjs';
+import { API, CLIENT, OTHER_CLIENT, ISSUER, JWKS_URI, RESOURCE, TOKEN_ENDPOINT, expectError, setup } from './issuer-support.mjs';
 
 test('issues independent OAuth account credentials after a nonce challenge', async () => {
   const env = await setup(), challenge = await env.challenge();
@@ -280,4 +280,26 @@ test('PS384 root client assertions authenticate independent OAuth grants',async(
   const issued=await env.send({client_assertion});assert.equal(issued.status,200);
   assert.equal((await env.issuer.authority.introspect(expectValue(issued.body.access_token))).principal.clientId,CLIENT);
   expectError(await env.send({client_assertion}),'invalid_client');
+});
+
+
+test('standard introspection reveals only current own-client refresh subjects and enforces authentication/replay', async()=>{
+  const endpoint=ISSUER+'/oauth/introspect',env=await setup({requireDpopNonce:false,introspectionEndpoint:endpoint});
+  const issued=await env.send(),token=String(issued.body.refresh_token);
+  assert.equal(env.issuer.authorizationMetadata().introspection_endpoint,endpoint);
+  async function inspect(value:string,assertion?:string){
+    return env.issuer.introspect(new Request(endpoint,{method:'POST',body:new URLSearchParams({token:value,token_type_hint:'refresh_token',client_id:CLIENT,client_assertion_type:'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',client_assertion:assertion??await env.clientAssertion()})}));
+  }
+  const assertion=await env.clientAssertion(),first=await inspect(token,assertion),body=await first.json();
+  assert.equal(first.status,200);assert.equal(body.active,true);assert.equal(body.client_id,CLIENT);assert.equal(typeof body.sub,'string');assert.notEqual(body.sub,'fixture-account');
+  assert.equal((await inspect(token,assertion)).status,401);
+  assert.deepEqual(await(await inspect('unknown')).json(),{active:false});
+  assert.deepEqual(await(await inspect(String(issued.body.access_token))).json(),{active:false},'endpoint policy does not permit access-token introspection');
+  const foreign=await env.clientAssertion({iss:OTHER_CLIENT,sub:OTHER_CLIENT});
+  const response=await env.issuer.introspect(new Request(endpoint,{method:'POST',body:new URLSearchParams({token,client_id:OTHER_CLIENT,client_assertion_type:'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',client_assertion:foreign})}));
+  assert.deepEqual(await response.json(),{active:false});
+  const rotated=await env.send({grant_type:'refresh_token',refresh_token:token});
+  assert.deepEqual(await(await inspect(token)).json(),{active:false});
+  const next=await(await inspect(String(rotated.body.refresh_token))).json();assert.equal(next.sub,body.sub);
+  await env.issuer.disconnect(CLIENT,'fixture-account');assert.deepEqual(await(await inspect(String(rotated.body.refresh_token))).json(),{active:false});
 });

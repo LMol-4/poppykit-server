@@ -74,6 +74,7 @@ export function parseAuthorizationMetadata(value: unknown, document: PoppyDocume
   if (!grants.includes('refresh_token')) throw new ValidationError('grant_types_supported');
   for (const key of ['token_endpoint', 'revocation_endpoint']) url(metadata[key], key);
   for (const [key, grant] of [['authorization_endpoint', 'authorization_code'], ['device_authorization_endpoint', 'urn:ietf:params:oauth:grant-type:device_code']] as const) if (grants.includes(grant) || key in metadata) url(metadata[key], key);
+  if ('introspection_endpoint' in metadata) url(metadata.introspection_endpoint, 'introspection_endpoint');
   if ('pushed_authorization_request_endpoint' in metadata) url(metadata.pushed_authorization_request_endpoint, 'pushed_authorization_request_endpoint');
   if ('scopes_supported' in metadata) companyScopes(metadata.scopes_supported, true);
   const mediated = mediatedSignIn(document);
