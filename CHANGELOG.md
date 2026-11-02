@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.2 — 2026-11-02
+## 0.5.3 — 2026-11-02
 
 Use combined Session/account authority in storage examples and preserve atomic operation callback lifetimes.
 

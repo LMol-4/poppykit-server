@@ -10,9 +10,8 @@ re-fetched and matched their initial snapshots byte for byte. SHA-256 identities
 - Guides: fe10657eca0b464c19cc198f3876d30f5055d8a5cb423cd147affe805206ecdd
 
 The earlier workspace migration job records were retired at the owner's request.
-The [assessment](../../assessment-report.md) and [current remediation baseline](../../jobs/assessment-remediation/BASELINE.md)
-summarize retained evidence and its limits; deleted raw receipts are not available
-verification. Focused checks do not certify an installed release or deployed service. Operations v2 SDK mechanics are implemented with opt-in host contracts;
+The workspace assessment and remediation baseline summarize historical evidence
+and its limits; deleted raw receipts are not available verification. Focused checks do not certify an installed release or deployed service. Operations v2 SDK mechanics are implemented with opt-in host contracts;
 full candidate, native and cross-package release gates remain separate.
 
 ## Host contracts and recommendations
@@ -71,4 +70,4 @@ boundaries in its real browser, issuer, vault, gateway and deployment environmen
 
 Operations source re-fetch: 2026-10-31, HTML SHA256 e69ade54433ece3fb2bd1ff6c441fecd11acc749eb6bac8b33939420d1f2b9eb, unchanged from block1. Core and guide hashes are unchanged as well. [Business Operations](OPERATIONS.md) defines trusted UI/business semantics, durable adapters and external idempotency/reconciliation obligations. Historical focused SQLite/PostgreSQL and process-crash evidence is separate from each release’s mandatory stable-candidate/package/platform gates. No deployed host or arbitrary network exactly-once claim is made.
 
-Source revalidation on 2026-11-01 found all six core/current/changelog/Operations/mediated/guides pages byte-identical to the 2026-10-31 snapshots. A numbered draft URL remains mutable. The old migration STATUS and raw release receipts were retired at the owner's request. Retained historical facts and limits are summarized in the [remediation baseline](../../jobs/assessment-remediation/BASELINE.md); future publication claims require fresh registry and workflow evidence.
+Source revalidation on 2026-11-01 found all six core/current/changelog/Operations/mediated/guides pages byte-identical to the 2026-10-31 snapshots. A numbered draft URL remains mutable. The old migration STATUS and raw release receipts were retired at the owner's request. Retained historical facts and limits are summarized in the workspace remediation baseline; future publication claims require fresh registry and workflow evidence.
