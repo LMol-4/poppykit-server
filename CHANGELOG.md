@@ -2,7 +2,7 @@
 
 ## 0.5.2 — 2026-11-02
 
-Reject reflected company credentials before persistence and exposure; preserve owner-scoped recovery and uncertainty.
+Use combined Session/account authority in storage examples and preserve atomic operation callback lifetimes.
 
 ### Consent and approval
 
