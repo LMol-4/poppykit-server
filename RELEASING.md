@@ -90,4 +90,4 @@ Windows GNU tar is given archive basename plus directory cwd to avoid drive-colo
 remote parsing. Failure logs retain seven days. Expired/missing artifacts require a
 new full run, not relabeling old results. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The local Operations SDK checkpoint does not satisfy release acceptance. Complete the block3 CLI business-approval experience and stable all-tests/package/native gates before publication. Operations metadata must remain opt-in to fully configured hosts. Include OPERATIONS.md and both operation examples in candidate archives.
+Operations releases require the protected candidate, native and cross-package gates above. Operations metadata must remain opt-in to fully configured hosts. Include OPERATIONS.md and both operation examples in candidate archives.

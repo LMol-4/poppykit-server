@@ -6,7 +6,7 @@ Verify requests and serve conversations using your accounts, agent and business 
 ## Install
 
 ```sh
-npm install @poppykit/server
+pnpm add @poppykit/server
 ```
 
 ## Configure a service

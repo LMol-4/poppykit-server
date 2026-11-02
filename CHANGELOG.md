@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased — remediation job 4
+## 0.5.2 — 2026-11-02
+
+Reject reflected company credentials before persistence and exposure; preserve owner-scoped recovery and uncertainty.
+
+### Consent and approval
 
 - Offer optional standard OAuth introspection for current own-client refresh grants, with client assertion/replay enforcement and opaque account subjects.
 
-## Unreleased — remediation job 2
+### Correctness and interoperability
 
 - Nested SQLite `run`/`withTransaction` callbacks use savepoints. A caught child
   failure rolls back child writes; outer work can still commit. Handles expire
